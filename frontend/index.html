@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Atlas v2.0 — Trading Terminal</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="terminal">
+    <!-- Header -->
+    <header class="header">
+      <div class="header-left">
+        <h1 class="logo">ATLAS</h1>
+        <span class="version">v2.0</span>
+        <span class="header-sep"></span>
+        <span class="header-symbol" id="hdrSymbol">BTCUSDT</span>
+      </div>
+      <div class="header-center">
+        <span class="header-price" id="hdrPrice">--</span>
+        <span class="header-change" id="hdrChange">--</span>
+      </div>
+      <div class="header-right">
+        <div class="tf-selector" id="tfSelector">
+          <button class="tf-btn" data-tf="5m">5m</button>
+          <button class="tf-btn" data-tf="15m">15m</button>
+          <button class="tf-btn" data-tf="30m">30m</button>
+          <button class="tf-btn active" data-tf="1h">1H</button>
+          <button class="tf-btn" data-tf="4h">4H</button>
+          <button class="tf-btn" data-tf="12h">12H</button>
+          <button class="tf-btn" data-tf="24h">24H</button>
+        </div>
+        <span class="header-sep"></span>
+        <div class="status-indicator">
+          <span class="status-dot" id="statusDot"></span>
+          <span id="statusText">Connecting...</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Market Overview Strip -->
+    <section class="overview-strip" id="overviewStrip">
+      <div class="ov-item"><span class="ov-label">Volume 24h</span><span class="ov-value" id="ovVolume">--</span></div>
+      <div class="ov-item"><span class="ov-label">24h Change</span><span class="ov-value" id="ovChange">--</span></div>
+      <div class="ov-item"><span class="ov-label">Last Update</span><span class="ov-value" id="ovUpdate">--</span></div>
+      <div class="ov-item"><span class="ov-label">Candles</span><span class="ov-value" id="ovCandles">--</span></div>
+      <div class="ov-item"><span class="ov-label">Confluence</span><span class="ov-value" id="ovConfluence">--</span></div>
+      <div class="ov-item"><span class="ov-label">Signal</span><span class="ov-value" id="ovSignal">--</span></div>
+    </section>
+
+    <!-- Chart -->
+    <section class="chart-section">
+      <div class="chart-panel">
+        <div class="chart-body">
+          <div class="chart-container" id="chartContainer"></div>
+          <div class="chart-waiting" id="chartWaiting">
+            <div class="chart-waiting-inner">
+              <div class="chart-waiting-spinner"></div>
+              <div class="chart-waiting-text">Loading candles...</div>
+              <div class="chart-waiting-sub" id="chartWaitingCount">0 / 20</div>
+            </div>
+          </div>
+          <div class="chart-crosshair-info" id="crosshairInfo">
+            <span class="ch-label">O</span><span class="ch-val" id="chOpen">--</span>
+            <span class="ch-label">H</span><span class="ch-val" id="chHigh">--</span>
+            <span class="ch-label">L</span><span class="ch-val" id="chLow">--</span>
+            <span class="ch-label">C</span><span class="ch-val" id="chClose">--</span>
+            <span class="ch-sep"></span>
+            <span class="ch-label">Vol</span><span class="ch-val" id="chVol">--</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Engine Panels Grid -->
+    <section class="engines-grid">
+      <!-- Trend -->
+      <div class="panel" id="panelTrend">
+        <div class="panel-header">
+          <span class="panel-badge trend">T</span>
+          <span class="panel-title">Trend</span>
+          <span class="panel-status" id="trendStatus">--</span>
+        </div>
+        <div class="panel-body">
+          <div class="kv-row"><span class="kv-key">1H</span><span class="kv-val" id="trend1H">--</span></div>
+          <div class="kv-row"><span class="kv-key">4H</span><span class="kv-val" id="trend4H">--</span></div>
+          <div class="kv-row"><span class="kv-key">24H</span><span class="kv-val" id="trend24H">--</span></div>
+          <div class="kv-row"><span class="kv-key">Momentum</span><span class="kv-val" id="trendMom">--</span></div>
+          <div class="kv-row"><span class="kv-key">Confidence</span><span class="kv-val" id="trendConf">--</span></div>
+        </div>
+      </div>
+
+      <!-- Structure -->
+      <div class="panel" id="panelStructure">
+        <div class="panel-header">
+          <span class="panel-badge structure">S</span>
+          <span class="panel-title">Structure</span>
+          <span class="panel-status" id="structureStatus">--</span>
+        </div>
+        <div class="panel-body">
+          <div class="kv-row"><span class="kv-key">Pattern</span><span class="kv-val" id="structPattern">--</span></div>
+          <div class="kv-row"><span class="kv-key">Direction</span><span class="kv-val" id="structDir">--</span></div>
+          <div class="kv-row"><span class="kv-key">BOS</span><span class="kv-val" id="structBOS">--</span></div>
+          <div class="kv-row"><span class="kv-key">Score</span><span class="kv-val" id="structScore">--</span></div>
+          <div class="kv-row"><span class="kv-key">Confidence</span><span class="kv-val" id="structConf">--</span></div>
+        </div>
+      </div>
+
+      <!-- RSI -->
+      <div class="panel" id="panelRSI">
+        <div class="panel-header">
+          <span class="panel-badge rsi">R</span>
+          <span class="panel-title">RSI</span>
+          <span class="panel-status" id="rsiStatus">--</span>
+        </div>
+        <div class="panel-body">
+          <div class="kv-row"><span class="kv-key">Value</span><span class="kv-val" id="rsiValue">--</span></div>
+          <div class="kv-row"><span class="kv-key">State</span><span class="kv-val" id="rsiState">--</span></div>
+          <div class="kv-row"><span class="kv-key">Interpretation</span><span class="kv-val" id="rsiInterp">--</span></div>
+        </div>
+      </div>
+
+      <!-- EMA -->
+      <div class="panel" id="panelEMA">
+        <div class="panel-header">
+          <span class="panel-badge ema">E</span>
+          <span class="panel-title">EMA</span>
+          <span class="panel-status" id="emaStatus">--</span>
+        </div>
+        <div class="panel-body">
+          <div class="kv-row"><span class="kv-key">Trend</span><span class="kv-val" id="emaTrend">--</span></div>
+          <div class="kv-row"><span class="kv-key">Value</span><span class="kv-val" id="emaValue">--</span></div>
+          <div class="kv-row"><span class="kv-key">Interpretation</span><span class="kv-val" id="emaInterp">--</span></div>
+        </div>
+      </div>
+
+      <!-- MACD -->
+      <div class="panel" id="panelMACD">
+        <div class="panel-header">
+          <span class="panel-badge macd">M</span>
+          <span class="panel-title">MACD</span>
+          <span class="panel-status" id="macdStatus">--</span>
+        </div>
+        <div class="panel-body">
+          <div class="kv-row"><span class="kv-key">Trend</span><span class="kv-val" id="macdTrend">--</span></div>
+          <div class="kv-row"><span class="kv-key">Histogram</span><span class="kv-val" id="macdHist">--</span></div>
+          <div class="kv-row"><span class="kv-key">Signal</span><span class="kv-val" id="macdSignal">--</span></div>
+          <div class="kv-row"><span class="kv-key">Interpretation</span><span class="kv-val" id="macdInterp">--</span></div>
+        </div>
+      </div>
+
+      <!-- ATR -->
+      <div class="panel" id="panelATR">
+        <div class="panel-header">
+          <span class="panel-badge atr">A</span>
+          <span class="panel-title">ATR</span>
+          <span class="panel-status" id="atrStatus">--</span>
+        </div>
+        <div class="panel-body">
+          <div class="kv-row"><span class="kv-key">ATR</span><span class="kv-val" id="atrValue">--</span></div>
+          <div class="kv-row"><span class="kv-key">% Range</span><span class="kv-val" id="atrPct">--</span></div>
+          <div class="kv-row"><span class="kv-key">Volatility</span><span class="kv-val" id="atrVol">--</span></div>
+          <div class="kv-row"><span class="kv-key">Trend</span><span class="kv-val" id="atrTrend">--</span></div>
+        </div>
+      </div>
+
+      <!-- Bollinger -->
+      <div class="panel" id="panelBollinger">
+        <div class="panel-header">
+          <span class="panel-badge bollinger">B</span>
+          <span class="panel-title">Bollinger</span>
+          <span class="panel-status" id="bollStatus">--</span>
+        </div>
+        <div class="panel-body">
+          <div class="kv-row"><span class="kv-key">Upper</span><span class="kv-val" id="bollUpper">--</span></div>
+          <div class="kv-row"><span class="kv-key">Middle</span><span class="kv-val" id="bollMid">--</span></div>
+          <div class="kv-row"><span class="kv-key">Lower</span><span class="kv-val" id="bollLower">--</span></div>
+          <div class="kv-row"><span class="kv-key">Position</span><span class="kv-val" id="bollPos">--</span></div>
+          <div class="kv-row"><span class="kv-key">%B</span><span class="kv-val" id="bollPB">--</span></div>
+          <div class="kv-row"><span class="kv-key">Squeeze</span><span class="kv-val" id="bollSqueeze">--</span></div>
+        </div>
+      </div>
+
+      <!-- Confluence -->
+      <div class="panel panel-wide" id="panelConfluence">
+        <div class="panel-header">
+          <span class="panel-badge confluence">C</span>
+          <span class="panel-title">Confluence</span>
+          <span class="panel-status" id="confStatus">--</span>
+        </div>
+        <div class="panel-body">
+          <div class="conf-grid">
+            <div class="conf-score-ring">
+              <svg viewBox="0 0 120 120" class="conf-ring-svg">
+                <circle cx="60" cy="60" r="52" class="conf-ring-bg"/>
+                <circle cx="60" cy="60" r="52" class="conf-ring-fg" id="confRing"/>
+              </svg>
+              <div class="conf-ring-label">
+                <span class="conf-ring-score" id="confScore">--</span>
+                <span class="conf-ring-text">SCORE</span>
+              </div>
+            </div>
+            <div class="conf-details">
+              <div class="kv-row"><span class="kv-key">Bias</span><span class="kv-val" id="confBias">--</span></div>
+              <div class="kv-row"><span class="kv-key">Confidence</span><span class="kv-val" id="confConf">--</span></div>
+              <div class="kv-row"><span class="kv-key">Components</span><span class="kv-val" id="confComps">--</span></div>
+              <div class="kv-row"><span class="kv-key">Missing</span><span class="kv-val" id="confMissing">--</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Risk Engine -->
+      <div class="panel panel-wide" id="panelRisk">
+        <div class="panel-header">
+          <span class="panel-badge risk">!</span>
+          <span class="panel-title">Risk Engine</span>
+          <span class="panel-status" id="riskStatus">--</span>
+        </div>
+        <div class="panel-body">
+          <div class="risk-grid">
+            <div class="risk-left">
+              <div class="kv-row"><span class="kv-key">Direction</span><span class="kv-val" id="riskDir">--</span></div>
+              <div class="kv-row"><span class="kv-key">Entry</span><span class="kv-val" id="riskEntry">--</span></div>
+              <div class="kv-row"><span class="kv-key">Stop Loss</span><span class="kv-val" id="riskSL">--</span></div>
+              <div class="kv-row"><span class="kv-key">Take Profit</span><span class="kv-val" id="riskTP">--</span></div>
+              <div class="kv-row"><span class="kv-key">R:R</span><span class="kv-val" id="riskRR">--</span></div>
+            </div>
+            <div class="risk-right">
+              <div class="risk-verdict" id="riskVerdict">
+                <span class="risk-verdict-icon" id="riskVerdictIcon">--</span>
+                <span class="risk-verdict-text" id="riskVerdictText">Awaiting data</span>
+              </div>
+              <div class="risk-rejection" id="riskRejection"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Signal Inspector -->
+    <section class="bottom-grid">
+      <div class="panel panel-wide" id="panelInspector">
+        <div class="panel-header">
+          <span class="panel-badge inspector">D</span>
+          <span class="panel-title">Signal Inspector</span>
+          <span class="panel-status" id="inspectorStatus">--</span>
+        </div>
+        <div class="panel-body">
+          <div class="inspector-snapshot">
+            <div class="inspector-snap-item"><span class="inspector-snap-label">Price</span><span class="inspector-snap-val" id="inspPrice">--</span></div>
+            <div class="inspector-snap-item"><span class="inspector-snap-label">Bias</span><span class="inspector-snap-val" id="inspBias">--</span></div>
+            <div class="inspector-snap-item"><span class="inspector-snap-label">Score</span><span class="inspector-snap-val" id="inspScore">--</span></div>
+            <div class="inspector-snap-item"><span class="inspector-snap-label">Buy &ge;</span><span class="inspector-snap-val" id="inspBuyThresh">--</span></div>
+            <div class="inspector-snap-item"><span class="inspector-snap-label">Sell &le;</span><span class="inspector-snap-val" id="inspSellThresh">--</span></div>
+            <div class="inspector-snap-item"><span class="inspector-snap-label">Cycle</span><span class="inspector-snap-val" id="inspCycle">--</span></div>
+          </div>
+          <div class="inspector-gates">
+            <div class="inspector-gates-header"><span>Gate</span><span>Status</span><span>Detail</span></div>
+            <div id="inspGates"></div>
+          </div>
+          <div class="inspector-verdict" id="inspVerdict">
+            <div class="inspector-verdict-row">
+              <span class="inspector-verdict-icon" id="inspVerdictIcon">--</span>
+              <span class="inspector-verdict-text" id="inspVerdictText">Awaiting data</span>
+            </div>
+            <div class="inspector-verdict-detail" id="inspVerdictDetail"></div>
+          </div>
+          <div class="inspector-trade" id="inspTrade" style="display:none">
+            <div class="inspector-trade-header">Trade Details</div>
+            <div class="inspector-trade-grid">
+              <div class="inspector-trade-item"><span class="inspector-trade-label">Entry</span><span class="inspector-trade-val" id="inspEntry">--</span></div>
+              <div class="inspector-trade-item"><span class="inspector-trade-label">Stop Loss</span><span class="inspector-trade-val" id="inspSL">--</span></div>
+              <div class="inspector-trade-item"><span class="inspector-trade-label">Take Profit</span><span class="inspector-trade-val" id="inspTP">--</span></div>
+              <div class="inspector-trade-item"><span class="inspector-trade-label">Position Size</span><span class="inspector-trade-val" id="inspPosSize">--</span></div>
+              <div class="inspector-trade-item"><span class="inspector-trade-label">Risk:Reward</span><span class="inspector-trade-val" id="inspRR">--</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Paper Trading + Performance -->
+    <section class="bottom-grid">
+      <!-- Paper Trading Panel -->
+      <div class="panel" id="panelPaper">
+        <div class="panel-header">
+          <span class="panel-badge paper">P</span>
+          <span class="panel-title">Paper Trading</span>
+          <span class="panel-status" id="paperStatus">--</span>
+        </div>
+        <div class="panel-body">
+          <div class="paper-summary">
+            <div class="paper-stat">
+              <span class="paper-stat-val" id="paperTotal">0</span>
+              <span class="paper-stat-label">Total</span>
+            </div>
+            <div class="paper-stat">
+              <span class="paper-stat-val" id="paperOpen">0</span>
+              <span class="paper-stat-label">Open</span>
+            </div>
+            <div class="paper-stat">
+              <span class="paper-stat-val" id="paperWins">0</span>
+              <span class="paper-stat-label">Wins</span>
+            </div>
+            <div class="paper-stat">
+              <span class="paper-stat-val" id="paperLosses">0</span>
+              <span class="paper-stat-label">Losses</span>
+            </div>
+            <div class="paper-stat">
+              <span class="paper-stat-val" id="paperWinRate">0%</span>
+              <span class="paper-stat-label">Win Rate</span>
+            </div>
+            <div class="paper-stat">
+              <span class="paper-stat-val" id="paperBalance">$10,000</span>
+              <span class="paper-stat-label">Balance</span>
+            </div>
+            <div class="paper-stat">
+              <span class="paper-stat-val" id="paperPnl">$0</span>
+              <span class="paper-stat-label">Total PnL</span>
+            </div>
+          </div>
+          <div class="paper-trades-header">
+            <span>Time</span><span>Dir</span><span>Entry</span><span>SL</span><span>TP</span><span>Status</span><span>PnL</span>
+          </div>
+          <div class="paper-trades-list" id="paperTrades">
+            <div class="paper-empty">No trades yet</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Performance Panel -->
+      <div class="panel" id="panelPerformance">
+        <div class="panel-header">
+          <span class="panel-badge perf">X</span>
+          <span class="panel-title">Performance</span>
+          <span class="panel-status" id="perfStatus">--</span>
+        </div>
+        <div class="panel-body">
+          <div class="perf-grid">
+            <div class="perf-stat">
+              <span class="perf-stat-val" id="perfWinRate">0%</span>
+              <span class="perf-stat-label">Win Rate</span>
+            </div>
+            <div class="perf-stat">
+              <span class="perf-stat-val" id="perfProfitFactor">0</span>
+              <span class="perf-stat-label">Profit Factor</span>
+            </div>
+            <div class="perf-stat">
+              <span class="perf-stat-val" id="perfExpectancy">$0</span>
+              <span class="perf-stat-label">Expectancy</span>
+            </div>
+            <div class="perf-stat">
+              <span class="perf-stat-val" id="perfDrawdown">0%</span>
+              <span class="perf-stat-label">Max Drawdown</span>
+            </div>
+            <div class="perf-stat">
+              <span class="perf-stat-val" id="perfReturn">0%</span>
+              <span class="perf-stat-label">Net Return</span>
+            </div>
+            <div class="perf-stat">
+              <span class="perf-stat-val" id="perfStreak">0 None</span>
+              <span class="perf-stat-label">Current Streak</span>
+            </div>
+          </div>
+          <div class="perf-signals-header">
+            <span>Time</span><span>Bias</span><span>Conf</span><span>Entry</span><span>Exit</span><span>Outcome</span>
+          </div>
+          <div class="perf-signals-list" id="perfSignals">
+            <div class="perf-empty">No trade history</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Strategy Replay -->
+    <section class="bottom-grid">
+      <div class="panel panel-wide" id="panelReplay">
+        <div class="panel-header">
+          <span class="panel-badge replay">R</span>
+          <span class="panel-title">Strategy Replay</span>
+          <span class="panel-status" id="replayStatus">--</span>
+          <button class="replay-btn" id="replayBtn" onclick="runReplay()">Run 30D</button>
+        </div>
+        <div class="panel-body">
+          <div class="replay-summary">
+            <div class="replay-stat">
+              <span class="replay-stat-val" id="replayTrades">0</span>
+              <span class="replay-stat-label">Trades</span>
+            </div>
+            <div class="replay-stat">
+              <span class="replay-stat-val" id="replayWinRate">0%</span>
+              <span class="replay-stat-label">Win Rate</span>
+            </div>
+            <div class="replay-stat">
+              <span class="replay-stat-val" id="replayPF">0</span>
+              <span class="replay-stat-label">Profit Factor</span>
+            </div>
+            <div class="replay-stat">
+              <span class="replay-stat-val" id="replayExpectancy">$0</span>
+              <span class="replay-stat-label">Expectancy</span>
+            </div>
+            <div class="replay-stat">
+              <span class="replay-stat-val" id="replayAvgR">0R</span>
+              <span class="replay-stat-label">Avg R</span>
+            </div>
+            <div class="replay-stat">
+              <span class="replay-stat-val" id="replayDD">0%</span>
+              <span class="replay-stat-label">Max Drawdown</span>
+            </div>
+            <div class="replay-stat">
+              <span class="replay-stat-val" id="replayPnl">$0</span>
+              <span class="replay-stat-label">Net PnL</span>
+            </div>
+            <div class="replay-stat">
+              <span class="replay-stat-val" id="replayLongs">0/0</span>
+              <span class="replay-stat-label">Longs (W/L)</span>
+            </div>
+            <div class="replay-stat">
+              <span class="replay-stat-val" id="replayShorts">0/0</span>
+              <span class="replay-stat-label">Shorts (W/L)</span>
+            </div>
+            <div class="replay-stat">
+              <span class="replay-stat-val" id="replayRejections">0</span>
+              <span class="replay-stat-label">Rejections</span>
+            </div>
+          </div>
+          <div class="replay-trades-header">
+            <span>#</span><span>Dir</span><span>Entry</span><span>Exit</span><span>SL</span><span>TP</span><span>R</span><span>Duration</span><span>Outcome</span>
+          </div>
+          <div class="replay-trades-list" id="replayTradesList">
+            <div class="replay-empty">Click "Run 30D" to start replay</div>
+          </div>
+          <div class="replay-rejections-header" id="replayRejectionsHeader" style="display:none">
+            <span onclick="toggleRejections()" class="replay-rejections-toggle">Rejections ▾</span>
+            <span id="replayRejCount"></span>
+          </div>
+          <div class="replay-rejections-list" id="replayRejectionsList" style="display:none"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Log Stream -->
+    <section class="log-panel">
+      <div class="log-header">
+        <span class="log-title">Live Log</span>
+        <span class="log-count" id="logCount">0</span>
+      </div>
+      <div class="log-body" id="logBody">
+        <div class="log-entry log-info">Waiting for connection...</div>
+      </div>
+    </section>
+  </div>
+
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="js/chart/engine.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
