@@ -238,6 +238,55 @@
       </div>
     </section>
 
+    <!-- Market Regime Panel -->
+    <section class="bottom-grid">
+      <div class="panel panel-wide" id="panelMarketRegime">
+        <div class="panel-header">
+          <span class="panel-badge regime">M</span>
+          <span class="panel-title">Market Regime</span>
+          <span class="panel-status" id="regimeStatus">--</span>
+        </div>
+        <div class="panel-body">
+          <div class="regime-grid">
+            <div class="regime-main">
+              <div class="regime-current">
+                <span class="regime-current-label">Current Regime</span>
+                <span class="regime-current-value" id="regimeCurrent">--</span>
+              </div>
+              <div class="regime-gauges">
+                <div class="regime-gauge">
+                  <span class="regime-gauge-label">Confidence</span>
+                  <div class="regime-gauge-bar">
+                    <div class="regime-gauge-fill" id="regimeConfBar"></div>
+                  </div>
+                  <span class="regime-gauge-val" id="regimeConf">--</span>
+                </div>
+                <div class="regime-gauge">
+                  <span class="regime-gauge-label">Trend Score</span>
+                  <div class="regime-gauge-bar">
+                    <div class="regime-gauge-fill" id="regimeTrendBar"></div>
+                  </div>
+                  <span class="regime-gauge-val" id="regimeTrendScore">--</span>
+                </div>
+                <div class="regime-gauge">
+                  <span class="regime-gauge-label">Range Score</span>
+                  <div class="regime-gauge-bar">
+                    <div class="regime-gauge-fill" id="regimeRangeBar"></div>
+                  </div>
+                  <span class="regime-gauge-val" id="regimeRangeScore">--</span>
+                </div>
+              </div>
+            </div>
+            <div class="regime-details">
+              <div class="kv-row"><span class="kv-key">Volatility</span><span class="kv-val" id="regimeVol">--</span></div>
+              <div class="kv-row"><span class="kv-key">Vol Score</span><span class="kv-val" id="regimeVolScore">--</span></div>
+              <div class="kv-row"><span class="kv-key">Reason</span><span class="kv-val" id="regimeReason" style="font-size:10px;max-width:200px;text-align:right">--</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- Signal Inspector -->
     <section class="bottom-grid">
       <div class="panel panel-wide" id="panelInspector">
@@ -254,6 +303,13 @@
             <div class="inspector-snap-item"><span class="inspector-snap-label">Buy &ge;</span><span class="inspector-snap-val" id="inspBuyThresh">--</span></div>
             <div class="inspector-snap-item"><span class="inspector-snap-label">Sell &le;</span><span class="inspector-snap-val" id="inspSellThresh">--</span></div>
             <div class="inspector-snap-item"><span class="inspector-snap-label">Cycle</span><span class="inspector-snap-val" id="inspCycle">--</span></div>
+          </div>
+          <div class="inspector-snapshot" style="margin-top:6px;background:rgba(0,0,0,.08)">
+            <div class="inspector-snap-item"><span class="inspector-snap-label">Regime</span><span class="inspector-snap-val" id="inspRegime">--</span></div>
+            <div class="inspector-snap-item"><span class="inspector-snap-label">Regime Conf</span><span class="inspector-snap-val" id="inspRegimeConf">--</span></div>
+            <div class="inspector-snap-item"><span class="inspector-snap-label">Trend</span><span class="inspector-snap-val" id="inspRegimeTrend">--</span></div>
+            <div class="inspector-snap-item"><span class="inspector-snap-label">Range</span><span class="inspector-snap-val" id="inspRegimeRange">--</span></div>
+            <div class="inspector-snap-item"><span class="inspector-snap-label">Vol</span><span class="inspector-snap-val" id="inspRegimeVol">--</span></div>
           </div>
           <div class="inspector-gates">
             <div class="inspector-gates-header"><span>Gate</span><span>Status</span><span>Detail</span></div>

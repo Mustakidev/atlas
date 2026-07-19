@@ -28,6 +28,7 @@ const { MACDEngine } = require('./macd');
 const { ATREngine } = require('./atr');
 const { BollingerEngine } = require('./bollinger');
 const { RiskEngine } = require('./risk');
+const { RegimeEngine } = require('../market-regime/RegimeEngine');
 
 class StrategyReplayEngine {
   constructor({ logger, symbol, config }) {
@@ -59,6 +60,7 @@ class StrategyReplayEngine {
 
     const trades = [];
     const rejections = [];
+    const regimeHistory = [];
     let tradeCounter = 0;
     let openTrade = null;
 
@@ -105,6 +107,16 @@ class StrategyReplayEngine {
       }
 
       if (openTrade) continue;
+
+      const marketRegime = this._runMarketRegime(window, tf);
+      regimeHistory.push({
+        timestamp: candle.timestamp,
+        regime: marketRegime.regime,
+        confidence: marketRegime.confidence,
+        trendScore: marketRegime.trendScore,
+        rangeScore: marketRegime.rangeScore,
+        volatility: marketRegime.volatility,
+      });
 
       const confluence = this._runConfluence(window, tf);
 
@@ -248,6 +260,7 @@ class StrategyReplayEngine {
       warmup: DEFAULT_WARMUP,
       trades,
       rejections,
+      regimeHistory,
       stats,
       engineVersion: this.version,
       lastUpdated: this.lastUpdated,
@@ -269,6 +282,43 @@ class StrategyReplayEngine {
   // ---------------------------------------------------------------------------
   // Engine Runners (isolated per step — zero look-ahead)
   // ---------------------------------------------------------------------------
+
+  _runMarketRegime(candles, tf) {
+    try {
+      const mockIndicatorRegistry = {
+        get: (name) => ({
+          calculate: (c, t, p) => {
+            if (name === 'EMA') return this._runEMA(c, t);
+            if (name === 'RSI') return this._runRSI(c, t);
+            return { ready: false };
+          },
+        }),
+      };
+      const mockCandleEngine = this._mockCandleEngine(candles, tf);
+      const mockAtrEngine = {
+        calculate: (t, limit) => {
+          const mock = this._mockCandleEngine(candles, t);
+          const { ATREngine } = require('./atr');
+          const engine = new ATREngine({ candleEngine: mock, logger: this.logger, symbol: this.symbol });
+          return engine.calculate(t, limit || candles.length);
+        },
+        getInfo: () => ({ name: 'ATR', implemented: true }),
+      };
+      const mockAnalyzer = { getAnalysis: () => this._synthesizeAnalyzer(candles) };
+      const engine = new RegimeEngine({
+        indicatorRegistry: mockIndicatorRegistry,
+        atrEngine: mockAtrEngine,
+        candleEngine: mockCandleEngine,
+        analyzer: mockAnalyzer,
+        logger: this.logger,
+        config: { get: () => null },
+        symbol: this.symbol,
+      });
+      return engine.calculate(candles, tf);
+    } catch (e) {
+      return { regime: 'UNKNOWN', confidence: 0, trendScore: null, rangeScore: null, volatility: null };
+    }
+  }
 
   _runConfluence(candles, tf) {
     try {

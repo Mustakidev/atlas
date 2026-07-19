@@ -17,11 +17,12 @@ const TOLERANCE = 0.01;
 const SOFT_TOLERANCE = 5.0;
 
 class ValidationEngine {
-  constructor({ analyzer, indicatorRegistry, structureEngine, candleEngine, logger, symbol }) {
+  constructor({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, logger, symbol }) {
     this.analyzer = analyzer;
     this.indicatorRegistry = indicatorRegistry;
     this.structureEngine = structureEngine;
     this.candleEngine = candleEngine;
+    this.regimeEngine = regimeEngine;
     this.logger = logger;
     this.symbol = symbol || 'BTCUSDT';
     this.version = ENGINE_VERSION;
@@ -57,6 +58,7 @@ class ValidationEngine {
     results.analytics = this._validateAnalytics();
     results.paperTrading = this._validatePaperTrading();
     results.risk = this._validateRisk();
+    results.marketRegime = this._validateMarketRegime();
 
     const statuses = Object.values(results).map(r => r.status);
     let overall = 'PASS';
@@ -1140,6 +1142,87 @@ class ValidationEngine {
         return { status: 'FAIL', reason: `Confidence ${signal.confidence} out of range 0-100` };
       }
       return { status: 'PASS', reason: `Engine integrity: bias=${signal.bias}, confidence=${signal.confidence}` };
+    }));
+
+    const executionTime = Date.now() - start;
+    return { tests, executionTime };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Market Regime Validation
+  // ---------------------------------------------------------------------------
+
+  _validateMarketRegime() {
+    const start = Date.now();
+    const tests = [];
+
+    if (!this.regimeEngine) {
+      tests.push({ name: 'MarketRegime Skipped', status: 'WARNING', reason: 'RegimeEngine not provided', executionTime: 0 });
+      return { tests, executionTime: Date.now() - start };
+    }
+
+    tests.push(this._runTest('MarketRegime Always Returned', () => {
+      const candles = this._makeCandles(30, (i) => 100 + i);
+      const result = this.regimeEngine.calculate(candles, 'val_1h');
+      if (!result.regime) {
+        return { status: 'FAIL', reason: 'Regime was not returned' };
+      }
+      return { status: 'PASS', reason: `Regime returned: ${result.regime}` };
+    }));
+
+    tests.push(this._runTest('MarketRegime Confidence Range', () => {
+      const candles = this._makeCandles(30, (i) => 100 + i);
+      const result = this.regimeEngine.calculate(candles, 'val_2h');
+      if (result.confidence < 0 || result.confidence > 100) {
+        return { status: 'FAIL', reason: `Confidence ${result.confidence} outside 0-100` };
+      }
+      return { status: 'PASS', reason: `Confidence ${result.confidence} is in 0-100 range` };
+    }));
+
+    tests.push(this._runTest('MarketRegime TrendScore Range', () => {
+      const candles = this._makeCandles(30, (i) => 100 + Math.sin(i) * 10);
+      const result = this.regimeEngine.calculate(candles, 'val_3h');
+      if (result.trendScore !== null && (result.trendScore < 0 || result.trendScore > 100)) {
+        return { status: 'FAIL', reason: `TrendScore ${result.trendScore} outside 0-100` };
+      }
+      return { status: 'PASS', reason: `TrendScore ${result.trendScore} is valid` };
+    }));
+
+    tests.push(this._runTest('MarketRegime No Undefined', () => {
+      const c = this._makeCandles(30, (i) => 100 + Math.sin(i) * 5);
+      const r = this.regimeEngine.calculate(c, 'val_4h');
+      const check = (obj, path) => {
+        for (const [k, v] of Object.entries(obj)) {
+          if (v === undefined) return path ? `${path}.${k}` : k;
+          if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
+            const n = check(v, path ? `${path}.${k}` : k);
+            if (n) return n;
+          }
+        }
+        return null;
+      };
+      const f = check(r, '');
+      if (f) return { status: 'FAIL', reason: `Field '${f}' is undefined` };
+      return { status: 'PASS', reason: 'No undefined fields' };
+    }));
+
+    tests.push(this._runTest('MarketRegime Determinism', () => {
+      const c = this._makeCandles(60, (i) => 100 + Math.sin(i * 0.2) * 15);
+      const r1 = this.regimeEngine.calculate(c, 'val_5h');
+      const r2 = this.regimeEngine.calculate(c, 'val_5h');
+      if (r1.regime !== r2.regime || r1.confidence !== r2.confidence) {
+        return { status: 'FAIL', reason: `Non-deterministic: ${r1.regime}/${r1.confidence} vs ${r2.regime}/${r2.confidence}` };
+      }
+      return { status: 'PASS', reason: `Deterministic: ${r1.regime} (${r1.confidence})` };
+    }));
+
+    tests.push(this._runTest('MarketRegime Insufficient Data', () => {
+      const c = this._makeCandles(5, (i) => 100 + i);
+      const r = this.regimeEngine.calculate(c, 'val_8h');
+      if (r.regime !== 'UNKNOWN') {
+        return { status: 'WARNING', reason: `Expected UNKNOWN with 5 candles, got ${r.regime}` };
+      }
+      return { status: 'PASS', reason: `Correctly returns UNKNOWN` };
     }));
 
     const executionTime = Date.now() - start;

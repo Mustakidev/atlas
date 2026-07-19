@@ -211,7 +211,23 @@ body{font-family:'SF Mono','Fira Code','Cascadia Code',monospace;background:var(
 .replay-rej-row span:first-child{color:var(--text3);white-space:nowrap}
 .replay-rej-row span:last-child{color:var(--red);opacity:.7}
 
+/* Market Regime */
+.regime-grid{display:flex;gap:16px;padding:12px 14px;align-items:stretch}
+.regime-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:12px}
+.regime-current{text-align:center;padding:10px;background:rgba(0,0,0,.15);border-radius:6px}
+.regime-current-label{display:block;font-size:9px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text3);margin-bottom:4px}
+.regime-current-value{display:block;font-size:20px;font-weight:700;letter-spacing:1px}
+.regime-gauges{display:flex;gap:8px}
+.regime-gauge{flex:1;padding:8px;background:rgba(0,0,0,.08);border-radius:5px;text-align:center}
+.regime-gauge-label{display:block;font-size:8px;text-transform:uppercase;letter-spacing:1px;color:var(--text3);margin-bottom:4px}
+.regime-gauge-bar{height:6px;background:var(--bg3);border-radius:3px;overflow:hidden;margin-bottom:3px}
+.regime-gauge-fill{height:100%;border-radius:3px;transition:width .5s ease,background .3s;width:0%}
+.regime-gauge-val{font-size:12px;font-weight:600;color:var(--text2);font-variant-numeric:tabular-nums}
+.regime-details{flex:0 0 180px;min-width:140px;display:flex;flex-direction:column;justify-content:center}
+@media(max-width:700px){.regime-grid{flex-direction:column}.regime-gauges{flex-direction:column}.regime-details{flex:none}}
+
 /* Signal Inspector */
+.panel-badge.regime{background:linear-gradient(135deg,#b388ff,#448aff)}
 .panel-badge.inspector{background:rgba(255,230,0,.12);color:#ffe600}
 .inspector-snapshot{display:flex;gap:1px;background:rgba(0,0,0,.15);border-radius:6px;overflow:hidden;margin:0 14px 10px}
 .inspector-snap-item{flex:1;min-width:70px;padding:8px 6px;text-align:center}

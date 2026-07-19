@@ -25,6 +25,7 @@ const { AnalyticsEngine } = require('./src/engine/analytics');
 const { PaperTradingEngine } = require('./src/engine/paperTrading');
 const { RiskEngine } = require('./src/engine/risk');
 const { StrategyReplayEngine } = require('./src/engine/strategyReplay');
+const { RegimeEngine } = require('./src/market-regime/RegimeEngine');
 const { createRouter } = require('./src/routes/routes');
 
 const fetch = require('node-fetch');
@@ -42,7 +43,6 @@ const apiManager = new ApiManager(config, retry, cache, logger);
 const indicatorRegistry = createIndicatorRegistry(symbol);
 const structureEngine = new StructureEngine(logger, symbol);
 const confluenceEngine = new ConfluenceEngine({ analyzer, indicatorRegistry, structureEngine, candleEngine, logger, config, symbol });
-const validationEngine = new ValidationEngine({ analyzer, indicatorRegistry, structureEngine, candleEngine, logger, symbol });
 const mtfEngine = new MTFEngine({ confluenceEngine, structureEngine, indicatorRegistry, candleEngine, analyzer, logger, config, symbol });
 const macdEngine = new MACDEngine({ candleEngine, logger, symbol });
 const atrEngine = new ATREngine({ candleEngine, logger, symbol });
@@ -53,13 +53,15 @@ const analyticsEngine = new AnalyticsEngine({ logger, symbol });
 const paperTradeEngine = new PaperTradingEngine({ logger, symbol });
 const riskEngine = new RiskEngine({ logger, symbol });
 const strategyReplayEngine = new StrategyReplayEngine({ logger, symbol, config });
+const regimeEngine = new RegimeEngine({ indicatorRegistry, atrEngine, candleEngine, analyzer, logger, config, symbol });
+const validationEngine = new ValidationEngine({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, logger, symbol });
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../frontend')));
 
-const router = createRouter({ apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, symbol, getLastDecision: () => lastDecision });
+const router = createRouter({ apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, symbol, getLastDecision: () => lastDecision });
 app.use('/api', router);
 
 app.get('/', (req, res) => {
@@ -98,6 +100,7 @@ function runExecutionPipeline(snapshot) {
     thresholds: { bullish: riskThreshold, bearish: bearThreshold },
     gates: {},
     engines: {},
+    marketRegime: null,
     risk: null,
     verdict: { tradeOpened: false, rejectionReason: null, trade: null },
   };
@@ -133,6 +136,16 @@ function runExecutionPipeline(snapshot) {
     console.log(divider);
     return;
   }
+
+  const marketRegime = regimeEngine.calculate(finalized, tf);
+  decision.marketRegime = {
+    regime: marketRegime.regime,
+    confidence: marketRegime.confidence,
+    trendScore: marketRegime.trendScore,
+    rangeScore: marketRegime.rangeScore,
+    volatility: marketRegime.volatility,
+    decisionReason: marketRegime.decisionReason,
+  };
 
   const confluence = confluenceEngine.calculate(finalized, tf);
   decision.confluence = { score: confluence.score, bias: confluence.bias, confidence: confluence.confidence, components: confluence.components };
@@ -199,6 +212,7 @@ function runExecutionPipeline(snapshot) {
     decision.verdict.rejectionReason = `Confluence bias: ${biasReason}`;
     lastDecision = decision;
 
+    console.log(`  Market Regime: ${marketRegime.regime} (conf: ${marketRegime.confidence}) | TrendScore: ${marketRegime.trendScore} | RangeScore: ${marketRegime.rangeScore} | Vol: ${marketRegime.volatility}`);
     console.log(`  Confluence Score: ${confluence.score}`);
     console.log(`  Bias: ${confluence.bias} (bullish threshold: ${riskThreshold}, bearish threshold: ${bearThreshold})`);
     console.log(`  Confidence: ${confluence.confidence}%`);
@@ -227,6 +241,7 @@ function runExecutionPipeline(snapshot) {
   decision.risk = riskResult;
   decision.gates.riskEngine = { pass: riskResult.tradeAllowed, value: riskResult.tradeAllowed ? 'ALLOWED' : 'BLOCKED', detail: riskResult.tradeAllowed ? `ATR-based SL/TP | R:R 1:${riskResult.riskReward}` : riskResult.rejectionReason };
 
+  console.log(`  Market Regime: ${marketRegime.regime} (conf: ${marketRegime.confidence}) | TrendScore: ${marketRegime.trendScore} | RangeScore: ${marketRegime.rangeScore} | Vol: ${marketRegime.volatility}`);
   console.log(`  Confluence Score: ${confluence.score}`);
   console.log(`  Bias: ${confluence.bias}`);
   console.log(`  Confidence: ${confluence.confidence}%`);

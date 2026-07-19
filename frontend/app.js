@@ -322,6 +322,48 @@ async function fetchIndicators() {
   } catch(e) {}
 }
 
+async function fetchMarketRegime() {
+  try {
+    var d = await dedupedFetch('market-regime-' + chartCurrentTF, API + '/api/market-regime?timeframe=' + chartCurrentTF);
+    if (!d || !d.regime) return;
+    console.log('[MarketRegime] API response: regime=' + d.regime + ' conf=' + d.confidence + ' trend=' + d.trendScore + ' range=' + d.rangeScore + ' vol=' + d.volatility);
+    $('regimeStatus').textContent = d.regime ? 'Live' : 'N/A';
+
+    var regimeEl = $('regimeCurrent');
+    regimeEl.textContent = d.regime || '--';
+    regimeEl.className = 'regime-current-value ' + (d.regime === 'TRENDING_BULL' ? 'bullish' : d.regime === 'TRENDING_BEAR' ? 'bearish' : d.regime === 'RANGING' ? 'sideways' : d.regime === 'HIGH_VOLATILITY' ? 'high' : d.regime === 'LOW_VOLATILITY' ? 'low' : '');
+
+    // Confidence gauge
+    var conf = d.confidence != null ? d.confidence : 0;
+    $('regimeConf').textContent = conf + '%';
+    var confBar = $('regimeConfBar');
+    confBar.style.width = conf + '%';
+    confBar.style.background = conf > 60 ? '#00e676' : conf > 30 ? '#ffd740' : '#ff5252';
+
+    // Trend score gauge
+    var ts = d.trendScore != null ? d.trendScore : 0;
+    $('regimeTrendScore').textContent = ts;
+    var tsBar = $('regimeTrendBar');
+    tsBar.style.width = ts + '%';
+    tsBar.style.background = ts > 60 ? '#00e676' : ts > 40 ? '#ffd740' : '#ff5252';
+
+    // Range score gauge
+    var rs = d.rangeScore != null ? d.rangeScore : 0;
+    $('regimeRangeScore').textContent = rs;
+    var rsBar = $('regimeRangeBar');
+    rsBar.style.width = rs + '%';
+    rsBar.style.background = rs > 60 ? '#ffd740' : rs > 30 ? '#448aff' : '#4a5568';
+
+    // Volatility
+    $('regimeVol').textContent = d.volatility || '--';
+    setClass($('regimeVol'), d.volatility === 'HIGH' ? 'high' : d.volatility === 'LOW' ? 'low' : '');
+    $('regimeVolScore').textContent = d.volatilityScore != null ? d.volatilityScore : '--';
+
+    // Reason
+    $('regimeReason').textContent = d.decisionReason || '--';
+  } catch(e) {}
+}
+
 async function fetchConfluence() {
   try {
     var d = await dedupedFetch('confluence-' + chartCurrentTF, API + '/api/confluence?timeframe=' + chartCurrentTF);
@@ -572,6 +614,7 @@ function startPolling() {
   fetchStructure();
   fetchIndicators();
   fetchConfluence();
+  fetchMarketRegime();
   fetchRisk();
   fetchPaperTrades();
   fetchInspector();
@@ -583,6 +626,7 @@ function startPolling() {
     fetchStructure();
     fetchIndicators();
     fetchConfluence();
+    fetchMarketRegime();
     fetchRisk();
     fetchPaperTrades();
     fetchInspector();
@@ -611,6 +655,17 @@ async function fetchInspector() {
     $('inspSellThresh').textContent = d.thresholds ? d.thresholds.bearish : '--';
     $('inspCycle').textContent = '#' + (d.cycle || 0);
 
+    // Market Regime in Inspector
+    if (d.marketRegime) {
+      var mr = d.marketRegime;
+      $('inspRegime').textContent = mr.regime || '--';
+      $('inspRegime').className = 'inspector-snap-val ' + (mr.regime === 'TRENDING_BULL' ? 'bullish' : mr.regime === 'TRENDING_BEAR' ? 'bearish' : mr.regime === 'RANGING' ? 'sideways' : mr.regime === 'HIGH_VOLATILITY' ? 'high' : '');
+      $('inspRegimeConf').textContent = mr.confidence != null ? mr.confidence + '%' : '--';
+      $('inspRegimeTrend').textContent = mr.trendScore != null ? mr.trendScore : '--';
+      $('inspRegimeRange').textContent = mr.rangeScore != null ? mr.rangeScore : '--';
+      $('inspRegimeVol').textContent = mr.volatility || '--';
+    }
+
     var gateNames = ['confluenceBias', 'trend', 'structure', 'rsi', 'ema', 'macd', 'atr', 'bollinger', 'riskEngine'];
     var gateLabels = { confluenceBias: 'Confluence Bias', trend: 'Trend', structure: 'Structure', rsi: 'RSI', ema: 'EMA', macd: 'MACD', atr: 'ATR', bollinger: 'Bollinger', riskEngine: 'Risk Engine' };
     var gatesHtml = '';
@@ -635,6 +690,18 @@ async function fetchInspector() {
     var vIcon = $('inspVerdictIcon');
     var vText = $('inspVerdictText');
     var vDetail = $('inspVerdictDetail');
+
+    // Add market regime context to rejection reason
+    var regimeContext = '';
+    if (d.marketRegime && !v.tradeOpened) {
+      var mr = d.marketRegime;
+      if (mr.regime === 'RANGING') {
+        regimeContext = 'Market is ranging. Trend confidence only ' + (mr.trendScore != null ? mr.trendScore : '--') + '%.';
+      } else if (mr.regime === 'HIGH_VOLATILITY') {
+        regimeContext = 'High volatility regime. Risk controls may block trades.';
+      }
+    }
+
     if (v.tradeOpened) {
       vIcon.textContent = 'TRADE OPENED';
       vIcon.className = 'inspector-verdict-icon v-pass';
@@ -643,7 +710,9 @@ async function fetchInspector() {
     } else {
       vIcon.textContent = 'REJECTED';
       vIcon.className = 'inspector-verdict-icon v-fail';
-      vText.textContent = v.rejectionReason || 'Unknown';
+      var rejectionMsg = v.rejectionReason || 'Unknown';
+      if (regimeContext) rejectionMsg = regimeContext + ' ' + rejectionMsg;
+      vText.textContent = rejectionMsg;
       vText.className = 'inspector-verdict-text';
     }
     vDetail.textContent = '';

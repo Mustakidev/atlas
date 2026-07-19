@@ -1,7 +1,7 @@
 const express = require('express');
 
 function createRouter(deps) {
-  const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, symbol, getLastDecision } = deps;
+  const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, symbol, getLastDecision } = deps;
   const router = express.Router();
 
   router.get('/market', (req, res) => {
@@ -291,6 +291,52 @@ function createRouter(deps) {
       const duration = Date.now() - start;
 
       logger.info('Confluence', `Confluence All | ${Object.keys(results).length} timeframes | ${duration}ms`);
+
+      res.json(results);
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Market Regime — market classification before trading signal evaluation
+  // ---------------------------------------------------------------------------
+  router.get('/market-regime', (req, res) => {
+    if (!regimeEngine) {
+      return res.status(503).json({ error: 'Market Regime engine not available' });
+    }
+
+    const tf = req.query.timeframe ? req.query.timeframe.toLowerCase() : null;
+    const limit = parseInt(req.query.limit) || 500;
+
+    if (tf) {
+      const valid = candleEngine.getAllTimeframes();
+      if (!valid.includes(tf)) {
+        return res.status(400).json({
+          error: 'Invalid timeframe',
+          supported: valid,
+        });
+      }
+
+      const allCandles = candleEngine.getCandles(tf, limit);
+      const active = candleEngine.getActive(tf);
+      let finalized = allCandles;
+      if (active && allCandles.length > 0 &&
+          allCandles[allCandles.length - 1].openTime === active.openTime) {
+        finalized = allCandles.slice(0, -1);
+      }
+
+      const start = Date.now();
+      const result = regimeEngine.calculate(finalized, tf);
+      const duration = Date.now() - start;
+
+      logger.info('MarketRegime', `Market Regime | ${tf} | regime=${result.regime} | conf=${result.confidence} | ${duration}ms`);
+
+      res.json(result);
+    } else {
+      const start = Date.now();
+      const results = regimeEngine.calculateAll(limit);
+      const duration = Date.now() - start;
+
+      logger.info('MarketRegime', `Market Regime All | ${Object.keys(results).length} timeframes | ${duration}ms`);
 
       res.json(results);
     }
@@ -752,6 +798,65 @@ function createRouter(deps) {
       return res.json({ available: false, message: 'No decision data yet — waiting for first pipeline cycle' });
     }
     res.json({ available: true, ...decision });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Market Regine Inspector (dedicated)
+  // ---------------------------------------------------------------------------
+
+  router.get('/market-regime/inspector', (req, res) => {
+    if (!regimeEngine) {
+      return res.status(503).json({ error: 'Market Regime engine not available' });
+    }
+
+    const tf = req.query.timeframe ? req.query.timeframe.toLowerCase() : '1h';
+    const limit = parseInt(req.query.limit) || 500;
+    const valid = candleEngine.getAllTimeframes();
+
+    if (!valid.includes(tf)) {
+      return res.status(400).json({
+        error: 'Invalid timeframe',
+        supported: valid,
+      });
+    }
+
+    const allCandles = candleEngine.getCandles(tf, limit);
+    const active = candleEngine.getActive(tf);
+    let finalized = allCandles;
+    if (active && allCandles.length > 0 &&
+        allCandles[allCandles.length - 1].openTime === active.openTime) {
+      finalized = allCandles.slice(0, -1);
+    }
+
+    const result = regimeEngine.calculate(finalized, tf);
+
+    res.json({
+      available: true,
+      regime: result.regime,
+      confidence: result.confidence,
+      trendScore: result.trendScore,
+      rangeScore: result.rangeScore,
+      volatility: result.volatility,
+      volatilityScore: result.volatilityScore,
+      reason: result.decisionReason,
+      components: {
+        trend: {
+          score: result.components?.trend?.score,
+          reason: result.components?.trend?.reason,
+        },
+        range: {
+          confidence: result.components?.range?.confidence,
+          reason: result.components?.range?.reason,
+        },
+        volatility: {
+          level: result.components?.volatility?.level,
+          reason: result.components?.volatility?.reason,
+        },
+      },
+      timeframe: tf,
+      timestamp: result.timestamp,
+      calculatedAt: result.calculatedAt,
+    });
   });
 
   // ---------------------------------------------------------------------------
