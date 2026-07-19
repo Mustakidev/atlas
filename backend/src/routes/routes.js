@@ -1,7 +1,7 @@
 const express = require('express');
 
 function createRouter(deps) {
-  const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, symbol, getLastDecision } = deps;
+  const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, symbol, getLastDecision } = deps;
   const router = express.Router();
 
   router.get('/market', (req, res) => {
@@ -856,6 +856,51 @@ function createRouter(deps) {
       timeframe: tf,
       timestamp: result.timestamp,
       calculatedAt: result.calculatedAt,
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Regime Decision — regime-aware trade evaluation
+  // ---------------------------------------------------------------------------
+
+  router.get('/regime-decision', (req, res) => {
+    if (!regimeDecisionEngine) {
+      return res.status(503).json({ error: 'Regime Decision engine not available' });
+    }
+
+    const direction = (req.query.direction || 'BUY').toUpperCase();
+    const regime = (req.query.regime || 'TRENDING_BULL').toUpperCase();
+    const confidence = parseFloat(req.query.confidence) || 60;
+    const confluenceScore = parseFloat(req.query.score) || 50;
+
+    if (!['BUY', 'SELL'].includes(direction)) {
+      return res.status(400).json({ error: 'direction must be BUY or SELL' });
+    }
+
+    const decision = regimeDecisionEngine.evaluate({ regime, confidence, direction, confluenceScore });
+
+    res.json({
+      available: true,
+      input: { regime, confidence, direction, confluenceScore },
+      decision,
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Regime Decision Inspector — real-time regime decision breakdown
+  // ---------------------------------------------------------------------------
+
+  router.get('/regime-decision/inspector', (req, res) => {
+    const decision = getLastDecision ? getLastDecision() : null;
+    if (!decision) {
+      return res.json({ available: false, message: 'No decision data yet' });
+    }
+    res.json({
+      available: true,
+      regime: decision.marketRegime || null,
+      regimeDecision: decision.regimeDecision || null,
+      confluence: decision.confluence || null,
+      verdict: decision.verdict || null,
     });
   });
 

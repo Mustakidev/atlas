@@ -666,8 +666,18 @@ async function fetchInspector() {
       $('inspRegimeVol').textContent = mr.volatility || '--';
     }
 
-    var gateNames = ['confluenceBias', 'trend', 'structure', 'rsi', 'ema', 'macd', 'atr', 'bollinger', 'riskEngine'];
-    var gateLabels = { confluenceBias: 'Confluence Bias', trend: 'Trend', structure: 'Structure', rsi: 'RSI', ema: 'EMA', macd: 'MACD', atr: 'ATR', bollinger: 'Bollinger', riskEngine: 'Risk Engine' };
+    // Regime Decision in Inspector
+    if (d.regimeDecision) {
+      var rd = d.regimeDecision;
+      $('inspRegimeDecisionStatus').textContent = rd.allowTrade ? 'ALLOWED' : 'BLOCKED';
+      $('inspRegimeDecisionStatus').className = 'inspector-snap-val ' + (rd.allowTrade ? 'bullish' : 'bearish');
+      $('inspRegimeDecisionPref').textContent = rd.preferredDirection || '--';
+      $('inspRegimeDecisionPenalty').textContent = rd.penalty != null ? '-' + rd.penalty + '%' : '--';
+      $('inspRegimeDecisionReason').textContent = rd.reason || '--';
+    }
+
+    var gateNames = ['confluenceBias', 'regimeDecision', 'trend', 'structure', 'rsi', 'ema', 'macd', 'atr', 'bollinger', 'riskEngine'];
+    var gateLabels = { confluenceBias: 'Confluence Bias', regimeDecision: 'Regime Decision', trend: 'Trend', structure: 'Structure', rsi: 'RSI', ema: 'EMA', macd: 'MACD', atr: 'ATR', bollinger: 'Bollinger', riskEngine: 'Risk Engine' };
     var gatesHtml = '';
     for (var i = 0; i < gateNames.length; i++) {
       var gk = gateNames[i];

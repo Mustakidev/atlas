@@ -29,6 +29,7 @@ const { ATREngine } = require('./atr');
 const { BollingerEngine } = require('./bollinger');
 const { RiskEngine } = require('./risk');
 const { RegimeEngine } = require('../market-regime/RegimeEngine');
+const { RegimeDecisionEngine } = require('../market-regime/RegimeDecisionEngine');
 
 class StrategyReplayEngine {
   constructor({ logger, symbol, config }) {
@@ -207,6 +208,8 @@ class StrategyReplayEngine {
       const riskSize = Math.abs(price - levels.stopLoss);
       const positionSize = riskSize > 0 ? this._round(100 / riskSize) : 0;
 
+      const regimeDecision = this._runRegimeDecision(marketRegime, signalDirection, confluence.score);
+
       openTrade = {
         tradeId: `SR-${tradeCounter}`,
         direction: signalDirection,
@@ -221,6 +224,14 @@ class StrategyReplayEngine {
         confidence: analysis.confidence,
         score: confluence.score,
         bias: confluence.bias,
+        regime: marketRegime.regime,
+        regimeConfidence: marketRegime.confidence,
+        regimeDecision: {
+          allowTrade: regimeDecision.allowTrade,
+          penalty: regimeDecision.penalty,
+          preferredDirection: regimeDecision.preferredDirection,
+          reason: regimeDecision.reason,
+        },
         exit: null,
         exitTime: null,
         exitReason: null,
@@ -317,6 +328,20 @@ class StrategyReplayEngine {
       return engine.calculate(candles, tf);
     } catch (e) {
       return { regime: 'UNKNOWN', confidence: 0, trendScore: null, rangeScore: null, volatility: null };
+    }
+  }
+
+  _runRegimeDecision(marketRegime, direction, confluenceScore) {
+    try {
+      const engine = new RegimeDecisionEngine({ logger: this.logger, symbol: this.symbol });
+      return engine.evaluate({
+        regime: marketRegime.regime,
+        confidence: marketRegime.confidence,
+        direction,
+        confluenceScore,
+      });
+    } catch (e) {
+      return { allowTrade: true, penalty: 0, preferredDirection: direction || 'NEUTRAL', reason: 'Regime decision error' };
     }
   }
 
@@ -654,6 +679,7 @@ class StrategyReplayEngine {
         averageDuration: 0,
         totalRejections: rejections.length,
         rejectionBreakdown: this._rejectionBreakdown(rejections),
+        regime: { byRegime: {}, winRateByRegime: {} },
       };
     }
 
@@ -681,6 +707,19 @@ class StrategyReplayEngine {
     const streaks = this._computeStreaks(trades);
 
     const avgDuration = trades.reduce((s, t) => s + (t.duration || 0), 0) / trades.length;
+
+    const byRegime = {};
+    for (const t of trades) {
+      const r = t.regime || 'UNKNOWN';
+      if (!byRegime[r]) byRegime[r] = { total: 0, wins: 0, losses: 0 };
+      byRegime[r].total++;
+      if (t.win) byRegime[r].wins++;
+      else byRegime[r].losses++;
+    }
+    const winRateByRegime = {};
+    for (const [r, d] of Object.entries(byRegime)) {
+      winRateByRegime[r] = d.total > 0 ? this._round((d.wins / d.total) * 100) : 0;
+    }
 
     return {
       totalTrades: trades.length,
@@ -714,6 +753,7 @@ class StrategyReplayEngine {
       averageDuration: Math.round(avgDuration),
       totalRejections: rejections.length,
       rejectionBreakdown: this._rejectionBreakdown(rejections),
+      regime: { byRegime, winRateByRegime },
     };
   }
 

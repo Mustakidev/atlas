@@ -26,6 +26,7 @@ const { PaperTradingEngine } = require('./src/engine/paperTrading');
 const { RiskEngine } = require('./src/engine/risk');
 const { StrategyReplayEngine } = require('./src/engine/strategyReplay');
 const { RegimeEngine } = require('./src/market-regime/RegimeEngine');
+const { RegimeDecisionEngine } = require('./src/market-regime/RegimeDecisionEngine');
 const { createRouter } = require('./src/routes/routes');
 
 const fetch = require('node-fetch');
@@ -54,14 +55,15 @@ const paperTradeEngine = new PaperTradingEngine({ logger, symbol });
 const riskEngine = new RiskEngine({ logger, symbol });
 const strategyReplayEngine = new StrategyReplayEngine({ logger, symbol, config });
 const regimeEngine = new RegimeEngine({ indicatorRegistry, atrEngine, candleEngine, analyzer, logger, config, symbol });
-const validationEngine = new ValidationEngine({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, logger, symbol });
+const regimeDecisionEngine = new RegimeDecisionEngine({ logger, symbol });
+const validationEngine = new ValidationEngine({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, regimeDecisionEngine, logger, symbol });
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../frontend')));
 
-const router = createRouter({ apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, symbol, getLastDecision: () => lastDecision });
+const router = createRouter({ apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, symbol, getLastDecision: () => lastDecision });
 app.use('/api', router);
 
 app.get('/', (req, res) => {
@@ -212,11 +214,25 @@ function runExecutionPipeline(snapshot) {
     decision.verdict.rejectionReason = `Confluence bias: ${biasReason}`;
     lastDecision = decision;
 
+    const neutralRegimeDecision = regimeDecisionEngine.evaluate({
+      regime: marketRegime.regime,
+      confidence: marketRegime.confidence,
+      direction: null,
+      confluenceScore: confluence.score,
+    });
+    decision.regimeDecision = neutralRegimeDecision;
+    decision.gates.regimeDecision = {
+      pass: true,
+      value: 'NEUTRAL',
+      detail: `[${marketRegime.regime}] ${neutralRegimeDecision.reason}`,
+    };
+
     console.log(`  Market Regime: ${marketRegime.regime} (conf: ${marketRegime.confidence}) | TrendScore: ${marketRegime.trendScore} | RangeScore: ${marketRegime.rangeScore} | Vol: ${marketRegime.volatility}`);
     console.log(`  Confluence Score: ${confluence.score}`);
     console.log(`  Bias: ${confluence.bias} (bullish threshold: ${riskThreshold}, bearish threshold: ${bearThreshold})`);
     console.log(`  Confidence: ${confluence.confidence}%`);
     console.log(`  Components: trend=${confluence.components?.trend?.score ?? '--'} structure=${confluence.components?.structure?.score ?? '--'} momentum=${confluence.components?.momentum?.score ?? '--'} rsi=${confluence.components?.rsi?.score ?? '--'} volatility=${confluence.components?.volatility?.score ?? '--'}`);
+    console.log(`  Regime Decision: SKIP (no direction) | ${neutralRegimeDecision.reason}`);
     console.log(`  Trade Allowed: NO`);
     console.log(`  Execution Triggered: NO`);
     console.log(`  Reason: ${biasReason}`);
@@ -226,6 +242,35 @@ function runExecutionPipeline(snapshot) {
   }
 
   decision.gates.confluenceBias = { pass: true, value: confluence.bias, detail: `Score ${confluence.score} → ${confluence.bias}` };
+
+  const regimeDecision = regimeDecisionEngine.evaluate({
+    regime: marketRegime.regime,
+    confidence: marketRegime.confidence,
+    direction,
+    confluenceScore: confluence.score,
+  });
+  decision.regimeDecision = regimeDecision;
+  decision.gates.regimeDecision = {
+    pass: regimeDecision.allowTrade,
+    value: regimeDecision.allowTrade ? 'ALLOWED' : 'BLOCKED',
+    detail: `[${marketRegime.regime}] ${regimeDecision.reason}`,
+  };
+
+  if (!regimeDecision.allowTrade) {
+    decision.verdict.rejectionReason = `Regime Decision: ${regimeDecision.reason}`;
+    lastDecision = decision;
+    console.log(`  Market Regime: ${marketRegime.regime} (conf: ${marketRegime.confidence}) | TrendScore: ${marketRegime.trendScore} | RangeScore: ${marketRegime.rangeScore} | Vol: ${marketRegime.volatility}`);
+    console.log(`  Confluence Score: ${confluence.score}`);
+    console.log(`  Bias: ${confluence.bias}`);
+    console.log(`  Confidence: ${confluence.confidence}%`);
+    console.log(`  Components: trend=${confluence.components?.trend?.score ?? '--'} structure=${confluence.components?.structure?.score ?? '--'} momentum=${confluence.components?.momentum?.score ?? '--'} rsi=${confluence.components?.rsi?.score ?? '--'} volatility=${confluence.components?.volatility?.score ?? '--'}`);
+    console.log(`  Regime Decision: BLOCKED — ${regimeDecision.reason}`);
+    console.log(`  Trade Allowed: NO`);
+    console.log(`  Execution Triggered: NO`);
+    console.log(divider);
+    paperTradeEngine.evaluateTrades(price);
+    return;
+  }
 
   const riskResult = riskEngine.evaluate({
     symbol,
@@ -246,6 +291,7 @@ function runExecutionPipeline(snapshot) {
   console.log(`  Bias: ${confluence.bias}`);
   console.log(`  Confidence: ${confluence.confidence}%`);
   console.log(`  Components: trend=${confluence.components?.trend?.score ?? '--'} structure=${confluence.components?.structure?.score ?? '--'} momentum=${confluence.components?.momentum?.score ?? '--'} rsi=${confluence.components?.rsi?.score ?? '--'} volatility=${confluence.components?.volatility?.score ?? '--'}`);
+  console.log(`  Regime Decision: ${regimeDecision.allowTrade ? 'ALLOWED' : 'BLOCKED'} | Preferred: ${regimeDecision.preferredDirection} | Penalty: ${regimeDecision.penalty}`);
   console.log(`  Signal: ${direction} (price=$${price})`);
   console.log(`  Trade Allowed: ${riskResult.tradeAllowed ? 'YES' : 'NO'}`);
 

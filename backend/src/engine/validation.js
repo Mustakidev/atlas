@@ -17,12 +17,13 @@ const TOLERANCE = 0.01;
 const SOFT_TOLERANCE = 5.0;
 
 class ValidationEngine {
-  constructor({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, logger, symbol }) {
+  constructor({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, regimeDecisionEngine, logger, symbol }) {
     this.analyzer = analyzer;
     this.indicatorRegistry = indicatorRegistry;
     this.structureEngine = structureEngine;
     this.candleEngine = candleEngine;
     this.regimeEngine = regimeEngine;
+    this.regimeDecisionEngine = regimeDecisionEngine;
     this.logger = logger;
     this.symbol = symbol || 'BTCUSDT';
     this.version = ENGINE_VERSION;
@@ -59,6 +60,7 @@ class ValidationEngine {
     results.paperTrading = this._validatePaperTrading();
     results.risk = this._validateRisk();
     results.marketRegime = this._validateMarketRegime();
+    results.regimeDecision = this._validateRegimeDecision();
 
     const statuses = Object.values(results).map(r => r.status);
     let overall = 'PASS';
@@ -1223,6 +1225,116 @@ class ValidationEngine {
         return { status: 'WARNING', reason: `Expected UNKNOWN with 5 candles, got ${r.regime}` };
       }
       return { status: 'PASS', reason: `Correctly returns UNKNOWN` };
+    }));
+
+    const executionTime = Date.now() - start;
+    return { tests, executionTime };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Regime Decision Validation
+  // ---------------------------------------------------------------------------
+
+  _validateRegimeDecision() {
+    const start = Date.now();
+    const tests = [];
+
+    if (!this.regimeDecisionEngine) {
+      tests.push({ name: 'RegimeDecision Skipped', status: 'WARNING', reason: 'RegimeDecisionEngine not provided', executionTime: 0 });
+      return { tests, executionTime: Date.now() - start };
+    }
+
+    const engine = this.regimeDecisionEngine;
+
+    // Test 1: Bull trend — BUY is allowed with no penalty
+    tests.push(this._runTest('RegimeDecision Bull BUY', () => {
+      const r = engine.evaluate({ regime: 'TRENDING_BULL', confidence: 70, direction: 'BUY', confluenceScore: 60 });
+      if (!r.allowTrade) return { status: 'FAIL', reason: `Bull BUY should be allowed, got block` };
+      if (r.penalty !== 0) return { status: 'FAIL', reason: `Bull BUY should have 0 penalty, got ${r.penalty}` };
+      if (r.preferredDirection !== 'BUY') return { status: 'FAIL', reason: `Bull BUY preferred should be BUY, got ${r.preferredDirection}` };
+      return { status: 'PASS', reason: `Bull BUY: allowed, penalty=0, preferred=BUY` };
+    }));
+
+    // Test 2: Bull trend — SELL is penalized
+    tests.push(this._runTest('RegimeDecision Bull SELL Penalty', () => {
+      const r = engine.evaluate({ regime: 'TRENDING_BULL', confidence: 70, direction: 'SELL', confluenceScore: 60 });
+      if (r.penalty < 5) return { status: 'FAIL', reason: `Bull SELL should have penalty >= 5, got ${r.penalty}` };
+      if (r.preferredDirection !== 'BUY') return { status: 'FAIL', reason: `Preferred should be BUY, got ${r.preferredDirection}` };
+      return { status: 'PASS', reason: `Bull SELL: penalty=${r.penalty}, preferred=BUY` };
+    }));
+
+    // Test 3: Bear trend — SELL is allowed with no penalty
+    tests.push(this._runTest('RegimeDecision Bear SELL', () => {
+      const r = engine.evaluate({ regime: 'TRENDING_BEAR', confidence: 70, direction: 'SELL', confluenceScore: 60 });
+      if (!r.allowTrade) return { status: 'FAIL', reason: `Bear SELL should be allowed, got block` };
+      if (r.penalty !== 0) return { status: 'FAIL', reason: `Bear SELL should have 0 penalty, got ${r.penalty}` };
+      if (r.preferredDirection !== 'SELL') return { status: 'FAIL', reason: `Bear SELL preferred should be SELL, got ${r.preferredDirection}` };
+      return { status: 'PASS', reason: `Bear SELL: allowed, penalty=0, preferred=SELL` };
+    }));
+
+    // Test 4: Bear trend — BUY is penalized
+    tests.push(this._runTest('RegimeDecision Bear BUY Penalty', () => {
+      const r = engine.evaluate({ regime: 'TRENDING_BEAR', confidence: 70, direction: 'BUY', confluenceScore: 60 });
+      if (r.penalty < 5) return { status: 'FAIL', reason: `Bear BUY should have penalty >= 5, got ${r.penalty}` };
+      if (r.preferredDirection !== 'SELL') return { status: 'FAIL', reason: `Preferred should be SELL, got ${r.preferredDirection}` };
+      return { status: 'PASS', reason: `Bear BUY: penalty=${r.penalty}, preferred=SELL` };
+    }));
+
+    // Test 5: Sideways — weak trend-following trade rejected
+    tests.push(this._runTest('RegimeDecision Sideways Reject Weak', () => {
+      const r = engine.evaluate({ regime: 'RANGING', confidence: 60, direction: 'BUY', confluenceScore: 50 });
+      if (r.allowTrade) return { status: 'FAIL', reason: `Sideways with low confluence should be rejected, got allowed` };
+      return { status: 'PASS', reason: `Sideways weak: rejected (confluence 50 < 65)` };
+    }));
+
+    // Test 6: Sideways — strong confluence allowed
+    tests.push(this._runTest('RegimeDecision Sideways Strong Allowed', () => {
+      const r = engine.evaluate({ regime: 'RANGING', confidence: 60, direction: 'BUY', confluenceScore: 80 });
+      if (!r.allowTrade) return { status: 'FAIL', reason: `Sideways with strong confluence should be allowed, got rejected` };
+      return { status: 'PASS', reason: `Sideways strong: allowed with confluence 80` };
+    }));
+
+    // Test 7: High Volatility — insufficient confluence rejected
+    tests.push(this._runTest('RegimeDecision HighVol Reject', () => {
+      const r = engine.evaluate({ regime: 'HIGH_VOLATILITY', confidence: 60, direction: 'BUY', confluenceScore: 50 });
+      if (r.allowTrade) return { status: 'FAIL', reason: `High vol with low confluence should be rejected` };
+      if (!r.warning) return { status: 'FAIL', reason: `High vol should include warning flag` };
+      if (r.riskReduction !== 0.5) return { status: 'FAIL', reason: `High vol should recommend 0.5 risk reduction` };
+      return { status: 'PASS', reason: `HighVol: rejected, warning=HIGH_VOLATILITY, riskReduction=0.5` };
+    }));
+
+    // Test 8: High Volatility — sufficient confluence allowed
+    tests.push(this._runTest('RegimeDecision HighVol Allowed', () => {
+      const r = engine.evaluate({ regime: 'HIGH_VOLATILITY', confidence: 60, direction: 'BUY', confluenceScore: 80 });
+      if (!r.allowTrade) return { status: 'FAIL', reason: `High vol with strong confluence should be allowed` };
+      if (!r.warning) return { status: 'FAIL', reason: `High vol should include warning even when allowed` };
+      return { status: 'PASS', reason: `HighVol: allowed with confluence 80, warning=${r.warning}` };
+    }));
+
+    // Test 9: Unknown regime — always allowed
+    tests.push(this._runTest('RegimeDecision Unknown', () => {
+      const r = engine.evaluate({ regime: 'UNKNOWN', confidence: 0, direction: 'BUY', confluenceScore: 50 });
+      if (!r.allowTrade) return { status: 'FAIL', reason: `Unknown regime should always allow trade` };
+      if (r.penalty !== 0) return { status: 'FAIL', reason: `Unknown regime should have 0 penalty` };
+      return { status: 'PASS', reason: `Unknown: allowed, penalty=0` };
+    }));
+
+    // Test 10: Missing regime field
+    tests.push(this._runTest('RegimeDecision Missing Regime', () => {
+      const r = engine.evaluate({ regime: null, confidence: 0, direction: 'BUY', confluenceScore: 50 });
+      if (!r.allowTrade) return { status: 'FAIL', reason: `Missing regime should fall back to unknown (allowed)` };
+      return { status: 'PASS', reason: `Missing regime: falls back to unknown handler, allowed` };
+    }));
+
+    // Test 11: Determinism
+    tests.push(this._runTest('RegimeDecision Determinism', () => {
+      const input = { regime: 'TRENDING_BEAR', confidence: 80, direction: 'SELL', confluenceScore: 70 };
+      const r1 = engine.evaluate(input);
+      const r2 = engine.evaluate(input);
+      if (r1.allowTrade !== r2.allowTrade || r1.penalty !== r2.penalty) {
+        return { status: 'FAIL', reason: `Non-deterministic: ${JSON.stringify(r1)} vs ${JSON.stringify(r2)}` };
+      }
+      return { status: 'PASS', reason: `Deterministic: allow=${r1.allowTrade}, penalty=${r1.penalty}` };
     }));
 
     const executionTime = Date.now() - start;
