@@ -1,7 +1,7 @@
 const express = require('express');
 
 function createRouter(deps) {
-  const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, symbol, getLastDecision } = deps;
+  const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, symbol, getLastDecision } = deps;
   const router = express.Router();
 
   router.get('/market', (req, res) => {
@@ -786,6 +786,67 @@ function createRouter(deps) {
     logger.info('Risk', `Risk | ${tf} | ${direction} @ ${entryPrice} | allowed=${result.tradeAllowed} | ${result.calculationTime}ms`);
 
     res.json(result);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Advance Risk — dynamic position sizing, ATR SL/TP, daily limits, session risk
+  // ---------------------------------------------------------------------------
+
+  router.get('/advance-risk', (req, res) => {
+    if (!advanceRiskEngine) {
+      return res.status(503).json({ error: 'Advance Risk engine not available' });
+    }
+
+    const tf = (req.query.timeframe || '1h').toLowerCase();
+    const entryPrice = parseFloat(req.query.entryPrice);
+    const direction = (req.query.direction || 'BUY').toUpperCase();
+
+    if (!entryPrice || entryPrice <= 0) {
+      return res.status(400).json({ error: 'Valid entryPrice query parameter required' });
+    }
+    if (!['BUY', 'SELL'].includes(direction)) {
+      return res.status(400).json({ error: 'direction must be BUY or SELL' });
+    }
+
+    let atr = null, trend = null, structure = null, confluence = null, regime = null;
+    const valid = candleEngine.getAllTimeframes();
+    if (valid.includes(tf) && atrEngine) atr = atrEngine.calculate(tf);
+    if (analyzer) trend = analyzer.getAnalysis();
+    if (structureEngine && candleEngine) {
+      const c = candleEngine.getCandles(tf, 100);
+      if (c.length > 0) structure = structureEngine.calculate(c);
+    }
+    if (confluenceEngine && candleEngine) {
+      const c = candleEngine.getCandles(tf, 100);
+      if (c.length > 0) confluence = confluenceEngine.calculate(c, tf);
+    }
+    if (regimeEngine && candleEngine) {
+      const c = candleEngine.getCandles(tf, 500);
+      if (c.length > 0) {
+        const r = regimeEngine.calculate(c, tf);
+        regime = r.regime;
+      }
+    }
+
+    const result = advanceRiskEngine.evaluate({
+      symbol, timeframe: tf, entryPrice,
+      atr: atr || { ready: false, atr: null, atrPercentage: 0 },
+      direction, trend, structure, confluence, regime,
+    });
+
+    logger.info('AdvanceRisk', `GET /advance-risk | ${tf} | ${direction} @ ${entryPrice} | allowed=${result.tradeAllowed} | pos=${result.positionSize} | ${result.calculationTime}ms`);
+    res.json(result);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Advance Risk State — current risk engine state (daily limits, losses, session)
+  // ---------------------------------------------------------------------------
+
+  router.get('/advance-risk/state', (req, res) => {
+    if (!advanceRiskEngine) {
+      return res.status(503).json({ error: 'Advance Risk engine not available' });
+    }
+    res.json({ available: true, ...advanceRiskEngine.getState() });
   });
 
   // ---------------------------------------------------------------------------

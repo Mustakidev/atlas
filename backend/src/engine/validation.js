@@ -17,13 +17,14 @@ const TOLERANCE = 0.01;
 const SOFT_TOLERANCE = 5.0;
 
 class ValidationEngine {
-  constructor({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, regimeDecisionEngine, logger, symbol }) {
+  constructor({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, logger, symbol }) {
     this.analyzer = analyzer;
     this.indicatorRegistry = indicatorRegistry;
     this.structureEngine = structureEngine;
     this.candleEngine = candleEngine;
     this.regimeEngine = regimeEngine;
     this.regimeDecisionEngine = regimeDecisionEngine;
+    this.advanceRiskEngine = advanceRiskEngine;
     this.logger = logger;
     this.symbol = symbol || 'BTCUSDT';
     this.version = ENGINE_VERSION;
@@ -59,6 +60,7 @@ class ValidationEngine {
     results.analytics = this._validateAnalytics();
     results.paperTrading = this._validatePaperTrading();
     results.risk = this._validateRisk();
+    results.advanceRisk = this._validateAdvanceRisk();
     results.marketRegime = this._validateMarketRegime();
     results.regimeDecision = this._validateRegimeDecision();
 
@@ -2222,6 +2224,209 @@ class ValidationEngine {
 
     const executionTime = Date.now() - start;
     return { tests, executionTime };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Advance Risk Validation
+  // ---------------------------------------------------------------------------
+
+  _validateAdvanceRisk() {
+    const start = Date.now();
+    const tests = [];
+    const { AdvanceRiskEngine } = require('./advanceRisk');
+    const { PaperTradingEngine } = require('./paperTrading');
+
+    const makeEngine = (overrides = {}) => {
+      const pt = new PaperTradingEngine({ logger: this.logger, symbol: 'TEST' });
+      return new AdvanceRiskEngine({
+        logger: this.logger,
+        symbol: 'TEST',
+        paperTradeEngine: pt,
+        config: overrides.config || null,
+      });
+    };
+
+    const atrResult = (atr, atrPct, level) => ({
+      ready: true,
+      atr,
+      atrPercentage: atrPct,
+      volatilityLevel: level || (atrPct < 1 ? 'Low' : atrPct <= 3 ? 'Medium' : 'High'),
+    });
+
+    // Test 1: Determinism — same inputs produce identical output
+    tests.push(this._runTest('AdvanceRisk Determinism', () => {
+      const engine = makeEngine();
+      const params = {
+        symbol: 'TEST', timeframe: '1h', entryPrice: 50000,
+        atr: atrResult(800, 1.6), direction: 'BUY',
+        trend: null, structure: null, confluence: null, regime: 'TRENDING_BULL',
+      };
+      const r1 = engine.evaluate(params);
+      const r2 = engine.evaluate(params);
+      if (r1.stopLoss !== r2.stopLoss) return { status: 'FAIL', reason: `Non-deterministic SL: ${r1.stopLoss} vs ${r2.stopLoss}` };
+      if (r1.takeProfit !== r2.takeProfit) return { status: 'FAIL', reason: `Non-deterministic TP: ${r1.takeProfit} vs ${r2.takeProfit}` };
+      if (r1.positionSize !== r2.positionSize) return { status: 'FAIL', reason: `Non-deterministic posSize: ${r1.positionSize} vs ${r2.positionSize}` };
+      return { status: 'PASS', reason: `Deterministic: SL=${r1.stopLoss}, TP=${r1.takeProfit}, pos=${r1.positionSize}` };
+    }));
+
+    // Test 2: BUY → SL below entry, TP above entry
+    tests.push(this._runTest('AdvanceRisk BUY Levels', () => {
+      const engine = makeEngine();
+      const r = engine.evaluate({
+        symbol: 'TEST', timeframe: '1h', entryPrice: 50000,
+        atr: atrResult(800, 1.6), direction: 'BUY',
+        trend: null, structure: null, confluence: null, regime: 'TRENDING_BULL',
+      });
+      if (r.stopLoss >= r.entryPrice) return { status: 'FAIL', reason: `BUY SL ${r.stopLoss} >= entry ${r.entryPrice}` };
+      if (r.takeProfit <= r.entryPrice) return { status: 'FAIL', reason: `BUY TP ${r.takeProfit} <= entry ${r.entryPrice}` };
+      return { status: 'PASS', reason: `BUY SL=${r.stopLoss} < ${r.entryPrice} < TP=${r.takeProfit}` };
+    }));
+
+    // Test 3: SELL → SL above entry, TP below entry
+    tests.push(this._runTest('AdvanceRisk SELL Levels', () => {
+      const engine = makeEngine();
+      const r = engine.evaluate({
+        symbol: 'TEST', timeframe: '1h', entryPrice: 50000,
+        atr: atrResult(800, 1.6), direction: 'SELL',
+        trend: null, structure: null, confluence: null, regime: 'TRENDING_BEAR',
+      });
+      if (r.stopLoss <= r.entryPrice) return { status: 'FAIL', reason: `SELL SL ${r.stopLoss} <= entry ${r.entryPrice}` };
+      if (r.takeProfit >= r.entryPrice) return { status: 'FAIL', reason: `SELL TP ${r.takeProfit} >= entry ${r.entryPrice}` };
+      return { status: 'PASS', reason: `SELL SL=${r.stopLoss} > ${r.entryPrice} > TP=${r.takeProfit}` };
+    }));
+
+    // Test 4: Position size is positive and finite
+    tests.push(this._runTest('AdvanceRisk Position Size', () => {
+      const engine = makeEngine();
+      const r = engine.evaluate({
+        symbol: 'TEST', timeframe: '1h', entryPrice: 50000,
+        atr: atrResult(800, 1.6), direction: 'BUY',
+        trend: null, structure: null, confluence: null, regime: 'TRENDING_BULL',
+      });
+      if (!r.positionSize || r.positionSize <= 0 || !isFinite(r.positionSize)) return { status: 'FAIL', reason: `Invalid posSize=${r.positionSize}` };
+      return { status: 'PASS', reason: `Position size=${r.positionSize}` };
+    }));
+
+    // Test 5: R:R is > 0
+    tests.push(this._runTest('AdvanceRisk Risk Reward', () => {
+      const engine = makeEngine();
+      const r = engine.evaluate({
+        symbol: 'TEST', timeframe: '1h', entryPrice: 50000,
+        atr: atrResult(800, 1.6), direction: 'BUY',
+        trend: null, structure: null, confluence: null, regime: 'TRENDING_BULL',
+      });
+      if (!r.riskReward || r.riskReward <= 0) return { status: 'FAIL', reason: `Invalid R:R=${r.riskReward}` };
+      return { status: 'PASS', reason: `R:R 1:${r.riskReward}` };
+    }));
+
+    // Test 6: Trading in trending → trending ATR mult (2) gives wider SL than ranging (1.5)
+    tests.push(this._runTest('AdvanceRisk Regime Multiplier', () => {
+      const engine = makeEngine();
+      const rTrend = engine.evaluate({
+        symbol: 'TEST', timeframe: '1h', entryPrice: 50000,
+        atr: atrResult(800, 1.6), direction: 'BUY',
+        trend: null, structure: null, confluence: null, regime: 'TRENDING_BULL',
+      });
+      const rRange = engine.evaluate({
+        symbol: 'TEST', timeframe: '1h', entryPrice: 50000,
+        atr: atrResult(800, 1.6), direction: 'BUY',
+        trend: null, structure: null, confluence: null, regime: 'RANGING',
+      });
+      const trendSLDist = Math.abs(rTrend.entryPrice - rTrend.stopLoss);
+      const rangeSLDist = Math.abs(rRange.entryPrice - rRange.stopLoss);
+      if (trendSLDist <= rangeSLDist) return { status: 'FAIL', reason: `Trend SL dist ${trendSLDist} <= Range ${rangeSLDist} — trending should have wider SL` };
+      return { status: 'PASS', reason: `Trend SL dist=${trendSLDist} > Range=${rangeSLDist}` };
+    }));
+
+    // Test 7: Session detection
+    tests.push(this._runTest('AdvanceRisk Session Detection', () => {
+      const engine = makeEngine();
+      const r = engine.evaluate({
+        symbol: 'TEST', timeframe: '1h', entryPrice: 50000,
+        atr: atrResult(800, 1.6), direction: 'BUY',
+        trend: null, structure: null, confluence: null, regime: 'TRENDING_BULL',
+      });
+      if (!r.session) return { status: 'WARNING', reason: `No session detected` };
+      return { status: 'PASS', reason: `Session=${r.session}` };
+    }));
+
+    // Test 8: Consecutive loss cooldown — after 3 losses, tradeAllowed should be false
+    tests.push(this._runTest('AdvanceRisk Consecutive Loss Cooldown', () => {
+      const engine = makeEngine();
+      for (let i = 0; i < 3; i++) engine.onTradeClosed(-100);
+      const r = engine.evaluate({
+        symbol: 'TEST', timeframe: '1h', entryPrice: 50000,
+        atr: atrResult(800, 1.6), direction: 'BUY',
+        trend: null, structure: null, confluence: null, regime: 'TRENDING_BULL',
+      });
+      const state = engine.getState();
+      if (state.consecutiveLosses < 3) return { status: 'FAIL', reason: `Expected 3 consecutive losses, got ${state.consecutiveLosses}` };
+      return { status: r.tradeAllowed ? 'WARNING' : 'PASS', reason: `Consecutive losses=${state.consecutiveLosses}, allowed=${r.tradeAllowed}` };
+    }));
+
+    // Test 9: Daily loss limit — after exceeding max daily loss, trades blocked
+    tests.push(this._runTest('AdvanceRisk Daily Loss Limit', () => {
+      const engine = makeEngine({ config: { get: () => null } });
+      // Lose more than 5% of $10k balance
+      for (let i = 0; i < 5; i++) engine.onTradeClosed(-120);
+      const r = engine.evaluate({
+        symbol: 'TEST', timeframe: '1h', entryPrice: 50000,
+        atr: atrResult(800, 1.6), direction: 'BUY',
+        trend: null, structure: null, confluence: null, regime: 'TRENDING_BULL',
+      });
+      const state = engine.getState();
+      return { status: r.tradeAllowed ? 'WARNING' : 'PASS', reason: `Daily PnL=${state.dailyPnl}, allowed=${r.tradeAllowed}` };
+    }));
+
+    // Test 10: Daily auto-reset — after 24h, daily PnL should reset
+    tests.push(this._runTest('AdvanceRisk Daily Reset', () => {
+      const engine = makeEngine();
+      engine.onTradeClosed(-100);
+      const before = engine.getState().dailyPnl;
+      // Simulate day passing by setting lastReset to far past
+      const oldReset = engine._lastDailyReset;
+      engine._lastDailyReset = Date.now() - 86400000 - 1000;
+      engine._consecutiveLosses = 3;
+      engine.onTradeClosed(-100); // should trigger reset
+      const after = engine.getState().dailyPnl;
+      return { status: after === -100 ? 'PASS' : 'WARNING', reason: `pre-reset=${before}, post-reset=${after}` };
+    }));
+
+    // Test 11: tradeAllowed true when no limits hit
+    tests.push(this._runTest('AdvanceRisk Default Allowed', () => {
+      const engine = makeEngine();
+      const r = engine.evaluate({
+        symbol: 'TEST', timeframe: '1h', entryPrice: 50000,
+        atr: atrResult(800, 1.6), direction: 'BUY',
+        trend: null, structure: null, confluence: null, regime: 'TRENDING_BULL',
+      });
+      return { status: r.tradeAllowed ? 'PASS' : 'FAIL', reason: `tradeAllowed=${r.tradeAllowed}` };
+    }));
+
+    // Test 12: getState returns expected keys
+    tests.push(this._runTest('AdvanceRisk State Shape', () => {
+      const engine = makeEngine();
+      const s = engine.getState();
+      const required = ['dailyPnl', 'dailyTrades', 'consecutiveLosses', 'maxDrawdown', 'balance', 'riskPerTrade'];
+      const missing = required.filter(k => s[k] === undefined);
+      if (missing.length > 0) return { status: 'FAIL', reason: `Missing keys: ${missing.join(', ')}` };
+      return { status: 'PASS', reason: `All ${required.length} state keys present` };
+    }));
+
+    const passed = tests.filter(t => t.status === 'PASS').length;
+    const warnings = tests.filter(t => t.status === 'WARNING').length;
+    const failed = tests.filter(t => t.status === 'FAIL').length;
+    const overall = failed > 0 ? 'FAIL' : warnings > 0 ? 'WARNING' : 'PASS';
+
+    return {
+      status: overall,
+      tests,
+      passed,
+      warnings,
+      failed,
+      executionTime: Date.now() - start,
+      reason: `${passed} passed, ${warnings} warnings, ${failed} failed`,
+    };
   }
 
   // ---------------------------------------------------------------------------

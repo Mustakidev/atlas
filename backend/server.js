@@ -27,6 +27,7 @@ const { RiskEngine } = require('./src/engine/risk');
 const { StrategyReplayEngine } = require('./src/engine/strategyReplay');
 const { RegimeEngine } = require('./src/market-regime/RegimeEngine');
 const { RegimeDecisionEngine } = require('./src/market-regime/RegimeDecisionEngine');
+const { AdvanceRiskEngine } = require('./src/engine/advanceRisk');
 const { createRouter } = require('./src/routes/routes');
 
 const fetch = require('node-fetch');
@@ -53,17 +54,19 @@ const backtestEngine = new BacktestEngine({ structureEngine, indicatorRegistry, 
 const analyticsEngine = new AnalyticsEngine({ logger, symbol });
 const paperTradeEngine = new PaperTradingEngine({ logger, symbol });
 const riskEngine = new RiskEngine({ logger, symbol });
-const strategyReplayEngine = new StrategyReplayEngine({ logger, symbol, config });
 const regimeEngine = new RegimeEngine({ indicatorRegistry, atrEngine, candleEngine, analyzer, logger, config, symbol });
 const regimeDecisionEngine = new RegimeDecisionEngine({ logger, symbol });
-const validationEngine = new ValidationEngine({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, regimeDecisionEngine, logger, symbol });
+const advanceRiskEngine = new AdvanceRiskEngine({ logger, symbol, paperTradeEngine, config });
+const strategyReplayEngine = new StrategyReplayEngine({ logger, symbol, config, advanceRiskEngine });
+strategyReplayEngine.setRegimeEngine(regimeEngine);
+const validationEngine = new ValidationEngine({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, logger, symbol });
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../frontend')));
 
-const router = createRouter({ apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, symbol, getLastDecision: () => lastDecision });
+const router = createRouter({ apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, symbol, getLastDecision: () => lastDecision });
 app.use('/api', router);
 
 app.get('/', (req, res) => {
@@ -272,7 +275,7 @@ function runExecutionPipeline(snapshot) {
     return;
   }
 
-  const riskResult = riskEngine.evaluate({
+  const riskResult = advanceRiskEngine.evaluate({
     symbol,
     timeframe: tf,
     entryPrice: price,
@@ -281,10 +284,13 @@ function runExecutionPipeline(snapshot) {
     trend,
     structure: structureResult,
     confluence,
+    regime: marketRegime.regime,
   });
 
   decision.risk = riskResult;
-  decision.gates.riskEngine = { pass: riskResult.tradeAllowed, value: riskResult.tradeAllowed ? 'ALLOWED' : 'BLOCKED', detail: riskResult.tradeAllowed ? `ATR-based SL/TP | R:R 1:${riskResult.riskReward}` : riskResult.rejectionReason };
+  decision.gates.advanceRisk = { pass: riskResult.tradeAllowed, value: riskResult.tradeAllowed ? 'ALLOWED' : 'BLOCKED', detail: riskResult.tradeAllowed
+    ? `AdvanceRisk | pos=${riskResult.positionSize} | SL=$${riskResult.stopLoss} | TP=$${riskResult.takeProfit} | R:R 1:${riskResult.riskReward}`
+    : riskResult.rejectionReason };
 
   console.log(`  Market Regime: ${marketRegime.regime} (conf: ${marketRegime.confidence}) | TrendScore: ${marketRegime.trendScore} | RangeScore: ${marketRegime.rangeScore} | Vol: ${marketRegime.volatility}`);
   console.log(`  Confluence Score: ${confluence.score}`);
@@ -293,13 +299,14 @@ function runExecutionPipeline(snapshot) {
   console.log(`  Components: trend=${confluence.components?.trend?.score ?? '--'} structure=${confluence.components?.structure?.score ?? '--'} momentum=${confluence.components?.momentum?.score ?? '--'} rsi=${confluence.components?.rsi?.score ?? '--'} volatility=${confluence.components?.volatility?.score ?? '--'}`);
   console.log(`  Regime Decision: ${regimeDecision.allowTrade ? 'ALLOWED' : 'BLOCKED'} | Preferred: ${regimeDecision.preferredDirection} | Penalty: ${regimeDecision.penalty}`);
   console.log(`  Signal: ${direction} (price=$${price})`);
+  console.log(`  AdvanceRisk: Session=${riskResult.session || '--'} | PosSize=${riskResult.positionSize || '--'} | SL=$${riskResult.stopLoss || '--'} | TP=$${riskResult.takeProfit || '--'} | R:R=${riskResult.riskReward || '--'}`);
   console.log(`  Trade Allowed: ${riskResult.tradeAllowed ? 'YES' : 'NO'}`);
 
   if (!riskResult.tradeAllowed) {
-    decision.verdict.rejectionReason = `Risk Engine: ${riskResult.rejectionReason}`;
+    decision.verdict.rejectionReason = `AdvanceRisk: ${riskResult.rejectionReason}`;
     lastDecision = decision;
     console.log(`  Execution Triggered: NO`);
-    console.log(`  Reason: Risk Engine — ${riskResult.rejectionReason}`);
+    console.log(`  Reason: ${riskResult.rejectionReason}`);
     console.log(divider);
     paperTradeEngine.evaluateTrades(price);
     return;
@@ -368,6 +375,7 @@ function runExecutionPipeline(snapshot) {
   const closed = paperTradeEngine.evaluateTrades(price);
   if (closed.length > 0) {
     for (const t of closed) {
+      advanceRiskEngine.onTradeClosed(t.pnl);
       console.log(`  Trade Closed: ${t.tradeId} | ${t.exitReason} | Entry=$${t.entryPrice} → Exit=$${t.exitPrice} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
     }
   }
@@ -377,6 +385,7 @@ function runExecutionPipeline(snapshot) {
     const candleResult = paperTradeEngine.onCandle(activeCandle);
     if (candleResult && candleResult.closed && candleResult.closed.length > 0) {
       for (const t of candleResult.closed) {
+        advanceRiskEngine.onTradeClosed(t.pnl);
         console.log(`  Trade Closed (candle): ${t.tradeId} | ${t.exitReason} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
       }
     }

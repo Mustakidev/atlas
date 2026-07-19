@@ -28,11 +28,12 @@ const { MACDEngine } = require('./macd');
 const { ATREngine } = require('./atr');
 const { BollingerEngine } = require('./bollinger');
 const { RiskEngine } = require('./risk');
+const { AdvanceRiskEngine } = require('./advanceRisk');
 const { RegimeEngine } = require('../market-regime/RegimeEngine');
 const { RegimeDecisionEngine } = require('../market-regime/RegimeDecisionEngine');
 
 class StrategyReplayEngine {
-  constructor({ logger, symbol, config }) {
+  constructor({ logger, symbol, config, advanceRiskEngine }) {
     this.logger = logger;
     this.symbol = symbol || DEFAULT_SYMBOL;
     this.version = ENGINE_VERSION;
@@ -41,6 +42,12 @@ class StrategyReplayEngine {
     this.dataSource = 'Historical OHLCV candles (strategy replay)';
     this._bullishThreshold = config?.get?.('CONFLUENCE_BULLISH_THRESHOLD') || BULLISH_THRESHOLD;
     this._bearishThreshold = config?.get?.('CONFLUENCE_BEARISH_THRESHOLD') || BEARISH_THRESHOLD;
+    this._advanceRiskEngine = advanceRiskEngine;
+    this._regimeEngine = null;
+  }
+
+  setRegimeEngine(engine) {
+    this._regimeEngine = engine;
   }
 
   // ---------------------------------------------------------------------------
@@ -145,16 +152,36 @@ class StrategyReplayEngine {
       const structureResult = this._runStructure(window);
       const analyzerOutput = this._synthesizeAnalyzer(window);
 
-      const riskResult = new RiskEngine({ logger: this.logger, symbol: this.symbol }).evaluate({
-        symbol: this.symbol,
-        timeframe: tf,
-        entryPrice: price,
-        atr: atr || { ready: false, atr: null, atrPercentage: 0 },
-        direction: signalDirection,
-        trend: analyzerOutput,
-        structure: structureResult,
-        confluence,
-      });
+      let riskResult;
+      if (this._advanceRiskEngine) {
+        let regime = null;
+        if (this._regimeEngine) {
+          const r = this._regimeEngine.calculate(window, tf);
+          regime = r.regime;
+        }
+        riskResult = this._advanceRiskEngine.evaluate({
+          symbol: this.symbol,
+          timeframe: tf,
+          entryPrice: price,
+          atr: atr || { ready: false, atr: null, atrPercentage: 0 },
+          direction: signalDirection,
+          trend: analyzerOutput,
+          structure: structureResult,
+          confluence,
+          regime,
+        });
+      } else {
+        riskResult = new RiskEngine({ logger: this.logger, symbol: this.symbol }).evaluate({
+          symbol: this.symbol,
+          timeframe: tf,
+          entryPrice: price,
+          atr: atr || { ready: false, atr: null, atrPercentage: 0 },
+          direction: signalDirection,
+          trend: analyzerOutput,
+          structure: structureResult,
+          confluence,
+        });
+      }
 
       if (!riskResult.tradeAllowed) {
         rejections.push({

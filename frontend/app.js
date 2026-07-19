@@ -430,6 +430,46 @@ async function fetchRisk() {
   } catch(e) {}
 }
 
+async function fetchAdvanceRisk() {
+  try {
+    var price = currentPrice;
+    if (!price) return;
+    var d = await dedupedFetch('advance-risk-' + chartCurrentTF, API + '/api/advance-risk?timeframe=' + chartCurrentTF + '&entryPrice=' + price + '&direction=BUY');
+    if (!d) return;
+    console.log('[AdvanceRisk] API: allowed=' + d.tradeAllowed + ' pos=' + d.positionSize + ' SL=' + d.stopLoss + ' TP=' + d.takeProfit);
+    $('advanceRiskStatus').textContent = d.tradeAllowed ? 'Allowed' : 'Rejected';
+    $('advPosSize').textContent = d.positionSize != null ? d.positionSize : '--';
+    $('advDollarRisk').textContent = d.dollarRisk != null ? fmtUSD(d.dollarRisk) : '--';
+    $('advSL').textContent = d.stopLoss != null ? fmtUSD(d.stopLoss) : '--';
+    setClass($('advSL'), 'bearish');
+    $('advTP').textContent = d.takeProfit != null ? fmtUSD(d.takeProfit) : '--';
+    setClass($('advTP'), 'bullish');
+    $('advRR').textContent = d.riskReward != null ? '1:' + d.riskReward : '--';
+    $('advSession').textContent = d.session || '--';
+    $('advDailyLoss').textContent = d.dailyPnl != null ? fmtUSD(d.dailyPnl) : (d.state && d.state.dailyPnl != null ? fmtUSD(d.state.dailyPnl) : '--');
+    $('advConsecLoss').textContent = d.state && d.state.consecutiveLosses != null ? d.state.consecutiveLosses : '--';
+    var verdict = $('advRiskVerdict');
+    var icon = $('advRiskVerdictIcon');
+    var text = $('advRiskVerdictText');
+    var rej = $('advRiskRejection');
+    if (d.tradeAllowed) {
+      verdict.className = 'risk-verdict allowed';
+      icon.textContent = '\u2713';
+      icon.style.color = '#00e676';
+      text.textContent = 'TRADE ALLOWED';
+      text.style.color = '#00e676';
+      rej.textContent = '';
+    } else {
+      verdict.className = 'risk-verdict rejected';
+      icon.textContent = '\u2717';
+      icon.style.color = '#ff5252';
+      text.textContent = 'TRADE REJECTED';
+      text.style.color = '#ff5252';
+      rej.textContent = d.rejectionReason || '';
+    }
+  } catch(e) {}
+}
+
 async function fetchPaperTrades() {
   try {
     var d = await dedupedFetch('paper-trades', API + '/api/paper-trades');
@@ -616,6 +656,7 @@ function startPolling() {
   fetchConfluence();
   fetchMarketRegime();
   fetchRisk();
+  fetchAdvanceRisk();
   fetchPaperTrades();
   fetchInspector();
   fetchLogs();
@@ -628,6 +669,7 @@ function startPolling() {
     fetchConfluence();
     fetchMarketRegime();
     fetchRisk();
+    fetchAdvanceRisk();
     fetchPaperTrades();
     fetchInspector();
     fetchLogs();
@@ -676,12 +718,12 @@ async function fetchInspector() {
       $('inspRegimeDecisionReason').textContent = rd.reason || '--';
     }
 
-    var gateNames = ['confluenceBias', 'regimeDecision', 'trend', 'structure', 'rsi', 'ema', 'macd', 'atr', 'bollinger', 'riskEngine'];
-    var gateLabels = { confluenceBias: 'Confluence Bias', regimeDecision: 'Regime Decision', trend: 'Trend', structure: 'Structure', rsi: 'RSI', ema: 'EMA', macd: 'MACD', atr: 'ATR', bollinger: 'Bollinger', riskEngine: 'Risk Engine' };
+    var gateNames = ['confluenceBias', 'regimeDecision', 'trend', 'structure', 'rsi', 'ema', 'macd', 'atr', 'bollinger', 'advanceRisk'];
+    var gateLabels = { confluenceBias: 'Confluence Bias', regimeDecision: 'Regime Decision', trend: 'Trend', structure: 'Structure', rsi: 'RSI', ema: 'EMA', macd: 'MACD', atr: 'ATR', bollinger: 'Bollinger', advanceRisk: 'Advance Risk' };
     var gatesHtml = '';
     for (var i = 0; i < gateNames.length; i++) {
       var gk = gateNames[i];
-      var g = d.gates[gk];
+      var g = d.gates && d.gates[gk];
       var statusCls, statusText, detail;
       if (g) {
         statusCls = g.pass ? 'gate-pass' : 'gate-fail';
