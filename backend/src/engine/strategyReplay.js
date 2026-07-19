@@ -33,7 +33,7 @@ const { RegimeEngine } = require('../market-regime/RegimeEngine');
 const { RegimeDecisionEngine } = require('../market-regime/RegimeDecisionEngine');
 
 class StrategyReplayEngine {
-  constructor({ logger, symbol, config, advanceRiskEngine }) {
+  constructor({ logger, symbol, config, advanceRiskEngine, mtfConfirmationEngine }) {
     this.logger = logger;
     this.symbol = symbol || DEFAULT_SYMBOL;
     this.version = ENGINE_VERSION;
@@ -43,6 +43,7 @@ class StrategyReplayEngine {
     this._bullishThreshold = config?.get?.('CONFLUENCE_BULLISH_THRESHOLD') || BULLISH_THRESHOLD;
     this._bearishThreshold = config?.get?.('CONFLUENCE_BEARISH_THRESHOLD') || BEARISH_THRESHOLD;
     this._advanceRiskEngine = advanceRiskEngine;
+    this._mtfConfirmationEngine = mtfConfirmationEngine;
     this._regimeEngine = null;
   }
 
@@ -192,6 +193,36 @@ class StrategyReplayEngine {
           direction: signalDirection,
         });
         continue;
+      }
+
+      // MTF Confirmation check
+      if (this._mtfConfirmationEngine && signalDirection) {
+        const mtfTimeframes = {};
+        const mtfTFs = ['1m', '5m', '15m', '1h'];
+        for (const mtfTF of mtfTFs) {
+          const mtfCandles = this._getCandlesForTF(window, tf, mtfTF);
+          if (mtfCandles && mtfCandles.length >= 15) {
+            const mtfConf = this._runConfluence(mtfCandles, mtfTF);
+            mtfTimeframes[mtfTF] = {
+              confluence: { score: mtfConf.score, bias: mtfConf.bias, confidence: mtfConf.confidence },
+            };
+          }
+        }
+        const mtfResult = this._mtfConfirmationEngine.evaluate({
+          direction: signalDirection,
+          timeframe: tf,
+          timeframes: mtfTimeframes,
+        });
+        if (!mtfResult.mtfAllowed) {
+          rejections.push({
+            timestamp: candle.timestamp,
+            reason: `MTF Confirmation: ${mtfResult.rejectionReason}`,
+            score: confluence.score,
+            bias: confluence.bias,
+            direction: signalDirection,
+          });
+          continue;
+        }
       }
 
       const engines = {
@@ -370,6 +401,32 @@ class StrategyReplayEngine {
     } catch (e) {
       return { allowTrade: true, penalty: 0, preferredDirection: direction || 'NEUTRAL', reason: 'Regime decision error' };
     }
+  }
+
+  _getCandlesForTF(candles, baseTF, targetTF) {
+    if (!candles || candles.length === 0 || baseTF === targetTF) return candles;
+    const higherMinutes = { '5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440 };
+    const baseM = higherMinutes[baseTF] || 1;
+    const targetM = higherMinutes[targetTF] || 1;
+    if (targetM <= baseM) return candles;
+    const ratio = Math.round(targetM / baseM);
+    if (ratio < 1) return candles;
+    const aggregated = [];
+    for (let i = ratio - 1; i < candles.length; i += ratio) {
+      const chunk = candles.slice(Math.max(0, i - ratio + 1), i + 1);
+      if (chunk.length === 0) continue;
+      const first = chunk[0];
+      const last = chunk[chunk.length - 1];
+      aggregated.push({
+        open: first.open,
+        high: Math.max(...chunk.map(c => c.high)),
+        low: Math.min(...chunk.map(c => c.low)),
+        close: last.close,
+        volume: chunk.reduce((s, c) => s + (c.volume || 0), 0),
+        timestamp: first.timestamp,
+      });
+    }
+    return aggregated.length > 0 ? aggregated : candles;
   }
 
   _runConfluence(candles, tf) {

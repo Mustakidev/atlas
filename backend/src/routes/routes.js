@@ -1,7 +1,7 @@
 const express = require('express');
 
 function createRouter(deps) {
-  const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, symbol, getLastDecision } = deps;
+  const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision } = deps;
   const router = express.Router();
 
   router.get('/market', (req, res) => {
@@ -847,6 +847,48 @@ function createRouter(deps) {
       return res.status(503).json({ error: 'Advance Risk engine not available' });
     }
     res.json({ available: true, ...advanceRiskEngine.getState() });
+  });
+
+  // ---------------------------------------------------------------------------
+  // MTF Confirmation — evaluate multi-timeframe alignment for a direction
+  // ---------------------------------------------------------------------------
+
+  router.get('/mtf-confirmation', (req, res) => {
+    if (!mtfConfirmationEngine) {
+      return res.status(503).json({ error: 'MTF Confirmation engine not available' });
+    }
+
+    const direction = (req.query.direction || 'BUY').toUpperCase();
+    const tf = (req.query.timeframe || '1h').toLowerCase();
+    const aggressive = req.query.aggressive === 'true';
+
+    if (!['BUY', 'SELL'].includes(direction)) {
+      return res.status(400).json({ error: 'direction must be BUY or SELL' });
+    }
+
+    const mtfTimeframes = {};
+    const mtfTFs = ['1m', '5m', '15m', '1h'];
+    for (const mtfTF of mtfTFs) {
+      const candles = candleEngine.getCandles(mtfTF, 100);
+      const active = candleEngine.getActive(mtfTF);
+      let finalized = candles;
+      if (active && candles.length > 0 &&
+          candles[candles.length - 1].openTime === active.openTime) {
+        finalized = candles.slice(0, -1);
+      }
+      if (finalized.length >= 15 && confluenceEngine) {
+        const c = confluenceEngine.calculate(finalized, mtfTF);
+        const a = atrEngine.calculate(mtfTF);
+        mtfTimeframes[mtfTF] = {
+          confluence: { score: c.score, bias: c.bias, confidence: c.confidence },
+          volatilityLevel: a?.volatilityLevel || null,
+        };
+      }
+    }
+
+    const result = mtfConfirmationEngine.evaluate({ direction, timeframe: tf, timeframes: mtfTimeframes, aggressive });
+    logger.info('MTFConfirmation', `GET /mtf-confirmation | ${direction} | allowed=${result.mtfAllowed} | conf=${result.confidence}% | align=${result.alignmentScore}%`);
+    res.json(result);
   });
 
   // ---------------------------------------------------------------------------

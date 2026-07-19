@@ -28,6 +28,7 @@ const { StrategyReplayEngine } = require('./src/engine/strategyReplay');
 const { RegimeEngine } = require('./src/market-regime/RegimeEngine');
 const { RegimeDecisionEngine } = require('./src/market-regime/RegimeDecisionEngine');
 const { AdvanceRiskEngine } = require('./src/engine/advanceRisk');
+const { MTFConfirmationEngine } = require('./src/engine/mtfConfirmation');
 const { createRouter } = require('./src/routes/routes');
 
 const fetch = require('node-fetch');
@@ -57,16 +58,17 @@ const riskEngine = new RiskEngine({ logger, symbol });
 const regimeEngine = new RegimeEngine({ indicatorRegistry, atrEngine, candleEngine, analyzer, logger, config, symbol });
 const regimeDecisionEngine = new RegimeDecisionEngine({ logger, symbol });
 const advanceRiskEngine = new AdvanceRiskEngine({ logger, symbol, paperTradeEngine, config });
-const strategyReplayEngine = new StrategyReplayEngine({ logger, symbol, config, advanceRiskEngine });
+const mtfConfirmationEngine = new MTFConfirmationEngine({ logger, symbol, config });
+const strategyReplayEngine = new StrategyReplayEngine({ logger, symbol, config, advanceRiskEngine, mtfConfirmationEngine });
 strategyReplayEngine.setRegimeEngine(regimeEngine);
-const validationEngine = new ValidationEngine({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, logger, symbol });
+const validationEngine = new ValidationEngine({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, logger, symbol });
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../frontend')));
 
-const router = createRouter({ apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, symbol, getLastDecision: () => lastDecision });
+const router = createRouter({ apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision: () => lastDecision });
 app.use('/api', router);
 
 app.get('/', (req, res) => {
@@ -213,7 +215,8 @@ function runExecutionPipeline(snapshot) {
       biasReason = `Score ${confluence.score} with ${confluence.missing?.length || 0} missing components`;
     }
     decision.gates.confluenceBias = { pass: false, value: confluence.bias, detail: biasReason };
-    decision.gates.riskEngine = { pass: false, value: '--', detail: 'Skipped (confluence is Neutral)' };
+    decision.gates.mtfConfirmation = { pass: false, value: '--', detail: 'Skipped (no direction)' };
+    decision.gates.advanceRisk = { pass: false, value: '--', detail: 'Skipped (confluence is Neutral)' };
     decision.verdict.rejectionReason = `Confluence bias: ${biasReason}`;
     lastDecision = decision;
 
@@ -275,6 +278,57 @@ function runExecutionPipeline(snapshot) {
     return;
   }
 
+  // Collect multi-timeframe confluence data for MTF confirmation
+  const mtfTimeframes = {};
+  const mtfTFs = ['1m', '5m', '15m', '1h'];
+  for (const mtfTF of mtfTFs) {
+    const mtfCandles = candleEngine.getCandles(mtfTF, 100);
+    const mtfActive = candleEngine.getActive(mtfTF);
+    let mtfFinalized = mtfCandles;
+    if (mtfActive && mtfCandles.length > 0 &&
+        mtfCandles[mtfCandles.length - 1].openTime === mtfActive.openTime) {
+      mtfFinalized = mtfCandles.slice(0, -1);
+    }
+    if (mtfFinalized.length >= 15) {
+      const mtfConfluence = confluenceEngine.calculate(mtfFinalized, mtfTF);
+      const mtfAtr = atrEngine.calculate(mtfTF);
+      mtfTimeframes[mtfTF] = {
+        confluence: {
+          score: mtfConfluence.score,
+          bias: mtfConfluence.bias,
+          confidence: mtfConfluence.confidence,
+        },
+        volatilityLevel: mtfAtr?.volatilityLevel || null,
+      };
+    }
+  }
+
+  const mtfResult = mtfConfirmationEngine.evaluate({
+    direction,
+    timeframe: tf,
+    timeframes: mtfTimeframes,
+  });
+
+  decision.mtfConfirmation = mtfResult;
+  decision.gates.mtfConfirmation = {
+    pass: mtfResult.mtfAllowed,
+    value: mtfResult.mtfAllowed ? 'ALLOWED' : 'BLOCKED',
+    detail: mtfResult.mtfAllowed
+      ? `MTF confirmed | confidence=${mtfResult.confidence}% | alignment=${mtfResult.alignmentScore}%`
+      : mtfResult.rejectionReason,
+  };
+
+  if (!mtfResult.mtfAllowed) {
+    decision.verdict.rejectionReason = mtfResult.rejectionReason;
+    lastDecision = decision;
+    console.log(`  MTF Confirmation: BLOCKED — ${mtfResult.rejectionReason}`);
+    console.log(`  Trade Allowed: NO`);
+    console.log(`  Execution Triggered: NO`);
+    console.log(divider);
+    paperTradeEngine.evaluateTrades(price);
+    return;
+  }
+
   const riskResult = advanceRiskEngine.evaluate({
     symbol,
     timeframe: tf,
@@ -299,6 +353,7 @@ function runExecutionPipeline(snapshot) {
   console.log(`  Components: trend=${confluence.components?.trend?.score ?? '--'} structure=${confluence.components?.structure?.score ?? '--'} momentum=${confluence.components?.momentum?.score ?? '--'} rsi=${confluence.components?.rsi?.score ?? '--'} volatility=${confluence.components?.volatility?.score ?? '--'}`);
   console.log(`  Regime Decision: ${regimeDecision.allowTrade ? 'ALLOWED' : 'BLOCKED'} | Preferred: ${regimeDecision.preferredDirection} | Penalty: ${regimeDecision.penalty}`);
   console.log(`  Signal: ${direction} (price=$${price})`);
+  console.log(`  MTF Confirmation: ${mtfResult.mtfAllowed ? 'ALLOWED' : 'BLOCKED'} | conf=${mtfResult.confidence}% | alignment=${mtfResult.alignmentScore}%`);
   console.log(`  AdvanceRisk: Session=${riskResult.session || '--'} | PosSize=${riskResult.positionSize || '--'} | SL=$${riskResult.stopLoss || '--'} | TP=$${riskResult.takeProfit || '--'} | R:R=${riskResult.riskReward || '--'}`);
   console.log(`  Trade Allowed: ${riskResult.tradeAllowed ? 'YES' : 'NO'}`);
 

@@ -17,7 +17,7 @@ const TOLERANCE = 0.01;
 const SOFT_TOLERANCE = 5.0;
 
 class ValidationEngine {
-  constructor({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, logger, symbol }) {
+  constructor({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, logger, symbol }) {
     this.analyzer = analyzer;
     this.indicatorRegistry = indicatorRegistry;
     this.structureEngine = structureEngine;
@@ -25,6 +25,7 @@ class ValidationEngine {
     this.regimeEngine = regimeEngine;
     this.regimeDecisionEngine = regimeDecisionEngine;
     this.advanceRiskEngine = advanceRiskEngine;
+    this.mtfConfirmationEngine = mtfConfirmationEngine;
     this.logger = logger;
     this.symbol = symbol || 'BTCUSDT';
     this.version = ENGINE_VERSION;
@@ -63,6 +64,7 @@ class ValidationEngine {
     results.advanceRisk = this._validateAdvanceRisk();
     results.marketRegime = this._validateMarketRegime();
     results.regimeDecision = this._validateRegimeDecision();
+    results.mtfConfirmation = this._validateMTFConfirmation();
 
     const statuses = Object.values(results).map(r => r.status);
     let overall = 'PASS';
@@ -3574,6 +3576,141 @@ class ValidationEngine {
     }
 
     return engine;
+  }
+
+  _validateMTFConfirmation() {
+    const start = Date.now();
+    const tests = [];
+
+    if (!this.mtfConfirmationEngine) {
+      tests.push({ name: 'MTFConfirmation Skipped', status: 'WARNING', reason: 'MTFConfirmationEngine not provided', executionTime: 0 });
+      return { tests, executionTime: Date.now() - start };
+    }
+
+    const engine = this.mtfConfirmationEngine;
+    const makeTF = (bias, score, confidence, vol) => ({
+      confluence: { score: score || 50, bias: bias || 'Neutral', confidence: confidence || 50 },
+      volatilityLevel: vol || 0.5,
+    });
+
+    // Test 1: Bullish alignment — all TFs bullish
+    tests.push(this._runTest('MTFConf Bullish All TFs', () => {
+      const r = engine.evaluate({
+        direction: 'BUY',
+        timeframe: '1h',
+        timeframes: {
+          '1m': makeTF('Bullish', 70, 60),
+          '5m': makeTF('Bullish', 65, 55),
+          '15m': makeTF('Bullish', 80, 75),
+          '1h': makeTF('Bullish', 85, 80),
+        },
+      });
+      if (!r.mtfAllowed) return { status: 'FAIL', reason: `All TFs Bullish BUY should be allowed, got blocked: ${r.rejectionReason}` };
+      if (r.confidence < 70) return { status: 'FAIL', reason: `Confidence should be >= 70 for aligned Bullish, got ${r.confidence}` };
+      return { status: 'PASS', reason: `Bullish alignment: allowed, confidence=${r.confidence}%, alignment=${r.alignmentScore}%` };
+    }));
+
+    // Test 2: Bearish alignment — all TFs bearish, SELL
+    tests.push(this._runTest('MTFConf Bearish All TFs SELL', () => {
+      const r = engine.evaluate({
+        direction: 'SELL',
+        timeframe: '1h',
+        timeframes: {
+          '1m': makeTF('Bearish', 30, 65),
+          '5m': makeTF('Bearish', 25, 60),
+          '15m': makeTF('Bearish', 20, 70),
+          '1h': makeTF('Bearish', 15, 75),
+        },
+      });
+      if (!r.mtfAllowed) return { status: 'FAIL', reason: `All TFs Bearish SELL should be allowed, got blocked: ${r.rejectionReason}` };
+      return { status: 'PASS', reason: `Bearish alignment: allowed, confidence=${r.confidence}%, alignment=${r.alignmentScore}%` };
+    }));
+
+    // Test 3: Mixed — 1m opposes, rest align (should be blocked in normal mode)
+    tests.push(this._runTest('MTFConf Mixed 1m Opposes Normal', () => {
+      const r = engine.evaluate({
+        direction: 'BUY',
+        timeframe: '1h',
+        timeframes: {
+          '1m': makeTF('Bearish', 30, 60),
+          '5m': makeTF('Bullish', 65, 55),
+          '15m': makeTF('Bullish', 80, 75),
+          '1h': makeTF('Bullish', 85, 80),
+        },
+      });
+      if (r.mtfAllowed) return { status: 'FAIL', reason: `1m Bearish opposing BUY should block in normal mode` };
+      return { status: 'PASS', reason: `Mixed alignment correctly blocked: ${r.rejectionReason}` };
+    }));
+
+    // Test 4: Mixed with aggressive mode — 1m opposes but should pass
+    tests.push(this._runTest('MTFConf Mixed Aggressive Mode', () => {
+      const r = engine.evaluate({
+        direction: 'BUY',
+        timeframe: '1h',
+        aggressive: true,
+        timeframes: {
+          '1m': makeTF('Bearish', 30, 60),
+          '5m': makeTF('Bullish', 65, 55),
+          '15m': makeTF('Bullish', 80, 75),
+          '1h': makeTF('Bullish', 85, 80),
+        },
+      });
+      if (!r.mtfAllowed) return { status: 'FAIL', reason: `Aggressive mode should allow BUY with 1m opposing, got blocked: ${r.rejectionReason}` };
+      return { status: 'PASS', reason: `Aggressive mode passed: allowed, confidence=${r.confidence}%` };
+    }));
+
+    // Test 5: Ranging — all neutral
+    tests.push(this._runTest('MTFConf Ranging All Neutral', () => {
+      const r = engine.evaluate({
+        direction: 'BUY',
+        timeframe: '1h',
+        timeframes: {
+          '1m': makeTF('Neutral', 50, 30),
+          '5m': makeTF('Neutral', 50, 30),
+          '15m': makeTF('Neutral', 50, 30),
+          '1h': makeTF('Neutral', 50, 30),
+        },
+      });
+      if (r.mtfAllowed) return { status: 'FAIL', reason: `All Neutral should block BUY` };
+      return { status: 'PASS', reason: `Ranging correctly blocked: ${r.rejectionReason}` };
+    }));
+
+    // Test 6: High volatility
+    tests.push(this._runTest('MTFConf High Volatility', () => {
+      const r = engine.evaluate({
+        direction: 'BUY',
+        timeframe: '1h',
+        timeframes: {
+          '1m': makeTF('Bullish', 70, 60, 0.9),
+          '5m': makeTF('Bullish', 65, 55, 0.85),
+          '15m': makeTF('Bullish', 80, 75, 0.8),
+          '1h': makeTF('Bullish', 85, 80, 0.75),
+        },
+      });
+      if (!r.mtfAllowed) return { status: 'FAIL', reason: `Bullish with high vol should be allowed, got blocked: ${r.rejectionReason}` };
+      return { status: 'PASS', reason: `High vol aligned: allowed, confidence=${r.confidence}%` };
+    }));
+
+    // Test 7: Missing timeframe data
+    tests.push(this._runTest('MTFConf Missing Timeframe Data', () => {
+      const r = engine.evaluate({
+        direction: 'BUY',
+        timeframe: '1h',
+        timeframes: {
+          '1m': makeTF('Bullish', 70, 60),
+          '15m': makeTF('Bullish', 80, 75),
+        },
+      });
+      if (r.mtfAllowed) return { status: 'FAIL', reason: `Missing timeframes should block` };
+      return { status: 'PASS', reason: `Missing data correctly blocked: ${r.rejectionReason}` };
+    }));
+
+    const statuses = tests.map(t => t.status);
+    let status = 'PASS';
+    if (statuses.includes('FAIL')) status = 'FAIL';
+    else if (statuses.includes('WARNING')) status = 'WARNING';
+
+    return { tests, status, executionTime: Date.now() - start };
   }
 }
 

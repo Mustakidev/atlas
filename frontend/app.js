@@ -470,6 +470,47 @@ async function fetchAdvanceRisk() {
   } catch(e) {}
 }
 
+async function fetchMtfConfirmation() {
+  try {
+    var price = currentPrice;
+    if (!price) return;
+    var d = await dedupedFetch('mtf-confirmation', API + '/api/mtf-confirmation?direction=BUY&timeframe=' + chartCurrentTF);
+    if (!d) return;
+    console.log('[MTFConf] API: allowed=' + d.mtfAllowed + ' conf=' + d.confidence + '% align=' + d.alignmentScore + '%');
+    $('mtfConfStatus').textContent = d.mtfAllowed ? 'Allowed' : 'Rejected';
+    var alignment = d.alignment || {};
+    $('mtf1m').textContent = alignment['1m'] || '--';
+    setClass($('mtf1m'), (alignment['1m'] || '').toLowerCase() === 'bullish' ? 'bullish' : (alignment['1m'] || '').toLowerCase() === 'bearish' ? 'bearish' : '');
+    $('mtf5m').textContent = alignment['5m'] || '--';
+    setClass($('mtf5m'), (alignment['5m'] || '').toLowerCase() === 'bullish' ? 'bullish' : (alignment['5m'] || '').toLowerCase() === 'bearish' ? 'bearish' : '');
+    $('mtf15m').textContent = alignment['15m'] || '--';
+    setClass($('mtf15m'), (alignment['15m'] || '').toLowerCase() === 'bullish' ? 'bullish' : (alignment['15m'] || '').toLowerCase() === 'bearish' ? 'bearish' : '');
+    $('mtf1h').textContent = alignment['1h'] || '--';
+    setClass($('mtf1h'), (alignment['1h'] || '').toLowerCase() === 'bullish' ? 'bullish' : (alignment['1h'] || '').toLowerCase() === 'bearish' ? 'bearish' : '');
+    $('mtfAlignment').textContent = d.alignmentScore != null ? d.alignmentScore + '%' : '--';
+    $('mtfConfidence').textContent = d.confidence != null ? d.confidence + '%' : '--';
+    var verdict = $('mtfVerdict');
+    var icon = $('mtfVerdictIcon');
+    var text = $('mtfVerdictText');
+    var rej = $('mtfRejection');
+    if (d.mtfAllowed) {
+      verdict.className = 'risk-verdict allowed';
+      icon.textContent = '\u2713';
+      icon.style.color = '#00e676';
+      text.textContent = 'MTF CONFIRMED';
+      text.style.color = '#00e676';
+      rej.textContent = '';
+    } else {
+      verdict.className = 'risk-verdict rejected';
+      icon.textContent = '\u2717';
+      icon.style.color = '#ff5252';
+      text.textContent = 'MTF BLOCKED';
+      text.style.color = '#ff5252';
+      rej.textContent = d.rejectionReason || '';
+    }
+  } catch(e) {}
+}
+
 async function fetchPaperTrades() {
   try {
     var d = await dedupedFetch('paper-trades', API + '/api/paper-trades');
@@ -657,6 +698,7 @@ function startPolling() {
   fetchMarketRegime();
   fetchRisk();
   fetchAdvanceRisk();
+  fetchMtfConfirmation();
   fetchPaperTrades();
   fetchInspector();
   fetchLogs();
@@ -670,6 +712,7 @@ function startPolling() {
     fetchMarketRegime();
     fetchRisk();
     fetchAdvanceRisk();
+    fetchMtfConfirmation();
     fetchPaperTrades();
     fetchInspector();
     fetchLogs();
@@ -718,8 +761,8 @@ async function fetchInspector() {
       $('inspRegimeDecisionReason').textContent = rd.reason || '--';
     }
 
-    var gateNames = ['confluenceBias', 'regimeDecision', 'trend', 'structure', 'rsi', 'ema', 'macd', 'atr', 'bollinger', 'advanceRisk'];
-    var gateLabels = { confluenceBias: 'Confluence Bias', regimeDecision: 'Regime Decision', trend: 'Trend', structure: 'Structure', rsi: 'RSI', ema: 'EMA', macd: 'MACD', atr: 'ATR', bollinger: 'Bollinger', advanceRisk: 'Advance Risk' };
+    var gateNames = ['confluenceBias', 'regimeDecision', 'mtfConfirmation', 'trend', 'structure', 'rsi', 'ema', 'macd', 'atr', 'bollinger', 'advanceRisk'];
+    var gateLabels = { confluenceBias: 'Confluence Bias', regimeDecision: 'Regime Decision', mtfConfirmation: 'MTF Confirmation', trend: 'Trend', structure: 'Structure', rsi: 'RSI', ema: 'EMA', macd: 'MACD', atr: 'ATR', bollinger: 'Bollinger', advanceRisk: 'Advance Risk' };
     var gatesHtml = '';
     for (var i = 0; i < gateNames.length; i++) {
       var gk = gateNames[i];
