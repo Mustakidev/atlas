@@ -1,8 +1,11 @@
 const express = require('express');
+const { sanitizeQuery } = require('../middleware/validate');
 
 function createRouter(deps) {
   const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision } = deps;
   const router = express.Router();
+
+  router.use(sanitizeQuery);
 
   router.get('/market', (req, res) => {
     const snapshot = history.latest();
@@ -41,12 +44,14 @@ function createRouter(deps) {
 
   router.get('/status', (req, res) => {
     const health = apiManager.getHealth();
+    const pipelineHealth = deps.getPipelineHealth ? deps.getPipelineHealth() : null;
     res.json({
       version: '1.0.0',
       uptime: process.uptime(),
       historySize: history.size(),
       cacheAge: deps.cache.getAge(),
       ...health,
+      ...(pipelineHealth ? { pipeline: pipelineHealth } : {}),
     });
   });
 

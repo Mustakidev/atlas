@@ -32,9 +32,29 @@ const { MTFConfirmationEngine } = require('./src/engine/mtfConfirmation');
 const { createRouter } = require('./src/routes/routes');
 
 const fetch = require('node-fetch');
+const fs = require('fs');
+const { createAuth } = require('./src/middleware/auth');
+const { createGlobalLimiter, createExpensiveLimiter, createConditionalExpensive } = require('./src/middleware/rateLimit');
 
 const config = new ConfigManager();
 const logger = new Logger(config);
+
+const configValidation = config.validate();
+for (const w of configValidation.warnings) {
+  logger.warn('Config', w);
+}
+if (!configValidation.valid) {
+  for (const e of configValidation.errors) {
+    logger.error('Config', e);
+  }
+  logger.error('Config', 'Startup configuration validation failed — exiting');
+  process.exit(1);
+}
+logger.system('Config', 'Startup configuration validated successfully');
+
+const auth = createAuth(config, logger);
+const globalLimiter = createGlobalLimiter(config, logger);
+const expensiveLimiter = createConditionalExpensive(createExpensiveLimiter(config, logger));
 const eventBus = new EventBus();
 const symbol = config.get('SYMBOL');
 const cache = new CacheEngine(config, logger, symbol);
@@ -64,21 +84,62 @@ strategyReplayEngine.setRegimeEngine(regimeEngine);
 const validationEngine = new ValidationEngine({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, logger, symbol });
 
 const app = express();
-app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, '../frontend')));
+const allowedOrigins = config.get('CORS_ORIGIN').split(',').map(s => s.trim());
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      logger.warn('CORS', 'Blocked request from unauthorized origin', { origin });
+      callback(null, false);
+    }
+  },
+}));
+app.use(express.json({ limit: config.get('MAX_BODY_SIZE') }));
+app.use(globalLimiter);
 
-const router = createRouter({ apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision: () => lastDecision });
-app.use('/api', router);
-
+// Serve index.html with injected API key (must be before static middleware)
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, '../frontend/index.html'));
+  const htmlPath = path.join(__dirname, '../frontend/index.html');
+  const html = fs.readFileSync(htmlPath, 'utf8');
+  const apiKey = config.get('API_KEY');
+  const injected = html.replace('<head>', '<head>\n  <script>window.__ATLAS_API_KEY="' + apiKey + '";</script>');
+  res.type('html').send(injected);
 });
+
+// Static files (CSS, JS, images) — index:false avoids serving index.html for /
+app.use(express.static(path.join(__dirname, '../frontend'), { index: false }));
+
+const router = createRouter({ apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision: () => lastDecision, getPipelineHealth });
+app.use('/api', expensiveLimiter, auth, router);
 
 let lastSignalTime = 0;
 const SIGNAL_COOLDOWN_MS = 60000;
 let pipelineCycleCount = 0;
 let lastDecision = null;
+let pipelineErrors = 0;
+let lastPipelineError = null;
+let lastSuccessfulCycle = null;
+
+function safeExecute(engineName, fn, fallback) {
+  try {
+    return fn();
+  } catch (err) {
+    pipelineErrors++;
+    lastPipelineError = { engine: engineName, timestamp: new Date().toISOString(), error: err.message };
+    logger.error('Pipeline', `Engine failure: ${engineName}`, { error: err.message });
+    return fallback;
+  }
+}
+
+function getPipelineHealth() {
+  return {
+    pipelineCycleCount,
+    pipelineErrors,
+    lastPipelineError,
+    lastSuccessfulCycle,
+  };
+}
 
 eventBus.on('market:snapshot', (snapshot) => {
   analyzer.analyze(history);
@@ -144,7 +205,12 @@ function runExecutionPipeline(snapshot) {
     return;
   }
 
-  const marketRegime = regimeEngine.calculate(finalized, tf);
+  lastSuccessfulCycle = new Date().toISOString();
+
+  const marketRegime = safeExecute('RegimeEngine', () => regimeEngine.calculate(finalized, tf), {
+    regime: 'UNKNOWN', confidence: 0, trendScore: 50, rangeScore: 50,
+    volatility: 'UNKNOWN', decisionReason: 'Regime engine failed',
+  });
   decision.marketRegime = {
     regime: marketRegime.regime,
     confidence: marketRegime.confidence,
@@ -154,16 +220,18 @@ function runExecutionPipeline(snapshot) {
     decisionReason: marketRegime.decisionReason,
   };
 
-  const confluence = confluenceEngine.calculate(finalized, tf);
+  const confluence = safeExecute('ConfluenceEngine', () => confluenceEngine.calculate(finalized, tf), {
+    score: 50, bias: 'Neutral', confidence: 0, components: {},
+  });
   decision.confluence = { score: confluence.score, bias: confluence.bias, confidence: confluence.confidence, components: confluence.components };
 
-  const atr = atrEngine.calculate(tf);
-  const trend = analyzer.getAnalysis();
-  const structureResult = structureEngine.calculate(finalized);
-  const rsiResult = indicatorRegistry.get('RSI')?.calculate(finalized, tf);
-  const emaResult = indicatorRegistry.get('EMA')?.calculate(finalized, tf, 20);
-  const macdResult = macdEngine.calculate(tf);
-  const bollingerResult = bollingerEngine.calculate(tf);
+  const atr = safeExecute('ATREngine', () => atrEngine.calculate(tf), null);
+  const trend = safeExecute('MarketAnalyzer', () => analyzer.getAnalysis(), null);
+  const structureResult = safeExecute('StructureEngine', () => structureEngine.calculate(finalized), null);
+  const rsiResult = safeExecute('RSI', () => indicatorRegistry.get('RSI')?.calculate(finalized, tf), null);
+  const emaResult = safeExecute('EMA', () => indicatorRegistry.get('EMA')?.calculate(finalized, tf, 20), null);
+  const macdResult = safeExecute('MACDEngine', () => macdEngine.calculate(tf), null);
+  const bollingerResult = safeExecute('BollingerEngine', () => bollingerEngine.calculate(tf), null);
 
   decision.engines.trend = trend;
   decision.engines.structure = { ...structureResult };
@@ -220,12 +288,12 @@ function runExecutionPipeline(snapshot) {
     decision.verdict.rejectionReason = `Confluence bias: ${biasReason}`;
     lastDecision = decision;
 
-    const neutralRegimeDecision = regimeDecisionEngine.evaluate({
+    const neutralRegimeDecision = safeExecute('RegimeDecisionEngine', () => regimeDecisionEngine.evaluate({
       regime: marketRegime.regime,
       confidence: marketRegime.confidence,
       direction: null,
       confluenceScore: confluence.score,
-    });
+    }), { allowTrade: false, penalty: 0, preferredDirection: null, reason: 'Regime decision engine failed' });
     decision.regimeDecision = neutralRegimeDecision;
     decision.gates.regimeDecision = {
       pass: true,
@@ -243,18 +311,18 @@ function runExecutionPipeline(snapshot) {
     console.log(`  Execution Triggered: NO`);
     console.log(`  Reason: ${biasReason}`);
     console.log(divider);
-    paperTradeEngine.evaluateTrades(price);
+    safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
     return;
   }
 
   decision.gates.confluenceBias = { pass: true, value: confluence.bias, detail: `Score ${confluence.score} → ${confluence.bias}` };
 
-  const regimeDecision = regimeDecisionEngine.evaluate({
+  const regimeDecision = safeExecute('RegimeDecisionEngine', () => regimeDecisionEngine.evaluate({
     regime: marketRegime.regime,
     confidence: marketRegime.confidence,
     direction,
     confluenceScore: confluence.score,
-  });
+  }), { allowTrade: false, penalty: 0, preferredDirection: direction, reason: 'Regime decision engine failed' });
   decision.regimeDecision = regimeDecision;
   decision.gates.regimeDecision = {
     pass: regimeDecision.allowTrade,
@@ -274,7 +342,7 @@ function runExecutionPipeline(snapshot) {
     console.log(`  Trade Allowed: NO`);
     console.log(`  Execution Triggered: NO`);
     console.log(divider);
-    paperTradeEngine.evaluateTrades(price);
+    safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
     return;
   }
 
@@ -290,8 +358,8 @@ function runExecutionPipeline(snapshot) {
       mtfFinalized = mtfCandles.slice(0, -1);
     }
     if (mtfFinalized.length >= 15) {
-      const mtfConfluence = confluenceEngine.calculate(mtfFinalized, mtfTF);
-      const mtfAtr = atrEngine.calculate(mtfTF);
+      const mtfConfluence = safeExecute('MTF-Confluence', () => confluenceEngine.calculate(mtfFinalized, mtfTF), { score: 50, bias: 'Neutral', confidence: 0 });
+      const mtfAtr = safeExecute('MTF-ATR', () => atrEngine.calculate(mtfTF), null);
       mtfTimeframes[mtfTF] = {
         confluence: {
           score: mtfConfluence.score,
@@ -303,11 +371,11 @@ function runExecutionPipeline(snapshot) {
     }
   }
 
-  const mtfResult = mtfConfirmationEngine.evaluate({
+  const mtfResult = safeExecute('MTFConfirmation', () => mtfConfirmationEngine.evaluate({
     direction,
     timeframe: tf,
     timeframes: mtfTimeframes,
-  });
+  }), { mtfAllowed: false, rejectionReason: 'MTF confirmation engine failed', confidence: 0, alignmentScore: 0 });
 
   decision.mtfConfirmation = mtfResult;
   decision.gates.mtfConfirmation = {
@@ -325,11 +393,11 @@ function runExecutionPipeline(snapshot) {
     console.log(`  Trade Allowed: NO`);
     console.log(`  Execution Triggered: NO`);
     console.log(divider);
-    paperTradeEngine.evaluateTrades(price);
+    safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
     return;
   }
 
-  const riskResult = advanceRiskEngine.evaluate({
+  const riskResult = safeExecute('AdvanceRisk', () => advanceRiskEngine.evaluate({
     symbol,
     timeframe: tf,
     entryPrice: price,
@@ -339,7 +407,7 @@ function runExecutionPipeline(snapshot) {
     structure: structureResult,
     confluence,
     regime: marketRegime.regime,
-  });
+  }), { tradeAllowed: false, rejectionReason: 'Advance risk engine failed', positionSize: 0, stopLoss: 0, takeProfit: 0, riskReward: 0, session: null });
 
   decision.risk = riskResult;
   decision.gates.advanceRisk = { pass: riskResult.tradeAllowed, value: riskResult.tradeAllowed ? 'ALLOWED' : 'BLOCKED', detail: riskResult.tradeAllowed
@@ -363,7 +431,7 @@ function runExecutionPipeline(snapshot) {
     console.log(`  Execution Triggered: NO`);
     console.log(`  Reason: ${riskResult.rejectionReason}`);
     console.log(divider);
-    paperTradeEngine.evaluateTrades(price);
+    safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
     return;
   }
 
@@ -375,7 +443,7 @@ function runExecutionPipeline(snapshot) {
     console.log(`  Execution Triggered: NO`);
     console.log(`  Reason: Cooldown active — ${waitSec}s remaining (min ${SIGNAL_COOLDOWN_MS / 1000}s between trades)`);
     console.log(divider);
-    paperTradeEngine.evaluateTrades(price);
+    safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
     return;
   }
 
@@ -391,7 +459,7 @@ function runExecutionPipeline(snapshot) {
     mtf: (() => { try { return mtfEngine.calculate(500); } catch(e) { return null; } })(),
   };
 
-  const trade = paperTradeEngine.signal(engines, price, tf, direction);
+  const trade = safeExecute('PaperTrading', () => paperTradeEngine.signal(engines, price, tf, direction), null);
 
   if (trade) {
     lastSignalTime = now;
@@ -427,20 +495,20 @@ function runExecutionPipeline(snapshot) {
     console.log(`  Reason: paperTradeEngine.signal() rejected — internal analysis: direction neutral or confidence < 30%`);
   }
 
-  const closed = paperTradeEngine.evaluateTrades(price);
+  const closed = safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
   if (closed.length > 0) {
     for (const t of closed) {
-      advanceRiskEngine.onTradeClosed(t.pnl);
+      safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl), undefined);
       console.log(`  Trade Closed: ${t.tradeId} | ${t.exitReason} | Entry=$${t.entryPrice} → Exit=$${t.exitPrice} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
     }
   }
 
   const activeCandle = candleEngine.getActive(tf);
   if (activeCandle) {
-    const candleResult = paperTradeEngine.onCandle(activeCandle);
+    const candleResult = safeExecute('PaperTrading', () => paperTradeEngine.onCandle(activeCandle), null);
     if (candleResult && candleResult.closed && candleResult.closed.length > 0) {
       for (const t of candleResult.closed) {
-        advanceRiskEngine.onTradeClosed(t.pnl);
+        safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl), undefined);
         console.log(`  Trade Closed (candle): ${t.tradeId} | ${t.exitReason} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
       }
     }

@@ -3,6 +3,7 @@
 'use strict';
 
 var API = '';
+var API_KEY = window.__ATLAS_API_KEY || '';
 var REFRESH = 3000;
 var CANDLE_REFRESH = 2000;
 var chartCurrentTF = '1h';
@@ -16,9 +17,12 @@ var pipelineDirection = null;
 
 // Request deduplication: track in-flight fetches to prevent duplicates
 var inflight = {};
+function authHeaders() {
+  return API_KEY ? { 'X-API-Key': API_KEY } : {};
+}
 function dedupedFetch(key, url) {
   if (inflight[key]) return inflight[key];
-  inflight[key] = fetch(url)
+  inflight[key] = fetch(url, { headers: authHeaders() })
     .then(function(r) { return r.json(); })
     .then(function(d) { delete inflight[key]; return d; })
     .catch(function(e) { delete inflight[key]; throw e; });
@@ -876,7 +880,7 @@ window.runReplay = async function() {
   $('replayRejectionsHeader').style.display = 'none';
 
   try {
-    var d = await fetch(API + '/api/strategy/replay?timeframe=1h&days=30');
+    var d = await fetch(API + '/api/strategy/replay?timeframe=1h&days=30', { headers: authHeaders() });
     var data = await d.json();
 
     if (data.error) {
