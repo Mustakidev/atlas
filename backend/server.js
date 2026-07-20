@@ -391,7 +391,7 @@ function runExecutionPipeline(snapshot) {
     mtf: (() => { try { return mtfEngine.calculate(500); } catch(e) { return null; } })(),
   };
 
-  const trade = paperTradeEngine.signal(engines, price, tf);
+  const trade = paperTradeEngine.signal(engines, price, tf, direction);
 
   if (trade) {
     lastSignalTime = now;

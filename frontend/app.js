@@ -12,6 +12,7 @@ var chartFirstLoad = true;
 var lastLogCount = 0;
 var lastLogId = 0;
 var currentPrice = null;
+var pipelineDirection = null;
 
 // Request deduplication: track in-flight fetches to prevent duplicates
 var inflight = {};
@@ -391,13 +392,43 @@ async function fetchConfluence() {
   } catch(e) {}
 }
 
+async function updatePipelineDirection() {
+  try {
+    var pt = await dedupedFetch('paper-trades-dir', API + '/api/paper-trades');
+    if (pt && pt.open && pt.open.length > 0 && pt.open[0].direction) {
+      pipelineDirection = pt.open[0].direction;
+      return;
+    }
+
+    var d = await dedupedFetch('pipeline-direction', API + '/api/signal/inspector');
+    if (!d || !d.available) { pipelineDirection = null; return; }
+    var dir = null;
+    if (d.verdict && d.verdict.trade) {
+      var vd = d.verdict.trade.direction;
+      if (vd === 'BUY' || vd === 'SELL') dir = vd;
+    }
+    if (!dir && d.regimeDecision) {
+      var rd = d.regimeDecision.preferredDirection;
+      if (rd === 'BUY' || rd === 'SELL') dir = rd;
+    }
+    if (!dir && d.risk && d.risk.direction) {
+      var rkd = d.risk.direction;
+      if (rkd === 'BUY' || rkd === 'SELL') dir = rkd;
+    }
+    pipelineDirection = dir;
+  } catch(e) {
+    pipelineDirection = null;
+  }
+}
+
 async function fetchRisk() {
   try {
     var price = currentPrice;
-    if (!price) return;
-    var d = await dedupedFetch('risk-' + chartCurrentTF, API + '/api/risk?timeframe=' + chartCurrentTF + '&entryPrice=' + price + '&direction=BUY');
+    var dir = pipelineDirection;
+    if (!price || !dir) return;
+    var d = await dedupedFetch('risk-' + chartCurrentTF + '-' + dir, API + '/api/risk?timeframe=' + chartCurrentTF + '&entryPrice=' + price + '&direction=' + dir);
     if (!d) return;
-    console.log('[Risk] API response: allowed=' + d.tradeAllowed + ' SL=' + d.stopLoss + ' TP=' + d.takeProfit);
+    console.log('[Risk] API response: allowed=' + d.tradeAllowed + ' dir=' + d.direction + ' SL=' + d.stopLoss + ' TP=' + d.takeProfit);
     $('riskStatus').textContent = d.tradeAllowed ? 'Allowed' : 'Rejected';
     setClass($('riskDir'), d.direction === 'BUY' ? 'bullish' : 'bearish');
     $('riskDir').textContent = d.direction || '--';
@@ -433,10 +464,11 @@ async function fetchRisk() {
 async function fetchAdvanceRisk() {
   try {
     var price = currentPrice;
-    if (!price) return;
-    var d = await dedupedFetch('advance-risk-' + chartCurrentTF, API + '/api/advance-risk?timeframe=' + chartCurrentTF + '&entryPrice=' + price + '&direction=BUY');
+    var dir = pipelineDirection;
+    if (!price || !dir) return;
+    var d = await dedupedFetch('advance-risk-' + chartCurrentTF + '-' + dir, API + '/api/advance-risk?timeframe=' + chartCurrentTF + '&entryPrice=' + price + '&direction=' + dir);
     if (!d) return;
-    console.log('[AdvanceRisk] API: allowed=' + d.tradeAllowed + ' pos=' + d.positionSize + ' SL=' + d.stopLoss + ' TP=' + d.takeProfit);
+    console.log('[AdvanceRisk] API: allowed=' + d.tradeAllowed + ' dir=' + d.direction + ' pos=' + d.positionSize + ' SL=' + d.stopLoss + ' TP=' + d.takeProfit);
     $('advanceRiskStatus').textContent = d.tradeAllowed ? 'Allowed' : 'Rejected';
     $('advPosSize').textContent = d.positionSize != null ? d.positionSize : '--';
     $('advDollarRisk').textContent = d.dollarRisk != null ? fmtUSD(d.dollarRisk) : '--';
@@ -473,8 +505,9 @@ async function fetchAdvanceRisk() {
 async function fetchMtfConfirmation() {
   try {
     var price = currentPrice;
-    if (!price) return;
-    var d = await dedupedFetch('mtf-confirmation', API + '/api/mtf-confirmation?direction=BUY&timeframe=' + chartCurrentTF);
+    var dir = pipelineDirection;
+    if (!price || !dir) return;
+    var d = await dedupedFetch('mtf-confirmation-' + dir, API + '/api/mtf-confirmation?direction=' + dir + '&timeframe=' + chartCurrentTF);
     if (!d) return;
     console.log('[MTFConf] API: allowed=' + d.mtfAllowed + ' conf=' + d.confidence + '% align=' + d.alignmentScore + '%');
     $('mtfConfStatus').textContent = d.mtfAllowed ? 'Allowed' : 'Rejected';
@@ -702,6 +735,7 @@ function startPolling() {
   fetchPaperTrades();
   fetchInspector();
   fetchLogs();
+  updatePipelineDirection();
 
   setInterval(function() {
     fetchMarket();
@@ -716,6 +750,7 @@ function startPolling() {
     fetchPaperTrades();
     fetchInspector();
     fetchLogs();
+    updatePipelineDirection();
   }, REFRESH);
 
   initChart();

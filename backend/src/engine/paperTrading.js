@@ -58,7 +58,7 @@ class PaperTradingEngine {
   // Public API — Signal Processing
   // ---------------------------------------------------------------------------
 
-  signal(engines, currentPrice, timeframe) {
+  signal(engines, currentPrice, timeframe, pipelineDirection) {
     const start = Date.now();
 
     if (currentPrice == null || currentPrice <= 0) {
@@ -70,19 +70,27 @@ class PaperTradingEngine {
     const tf = timeframe || '1h';
 
     const analysis = this._analyzeEngines(engines, tf);
+    this._lastAnalysis = analysis;
 
-    if (analysis.direction === 'neutral') {
+    let executionDirection;
+    if (pipelineDirection === 'BUY' || pipelineDirection === 'SELL') {
+      executionDirection = pipelineDirection;
+    } else {
+      executionDirection = analysis.direction;
+    }
+
+    if (executionDirection === 'neutral') {
       this.calculationTime = Date.now() - start;
       return null;
     }
 
-    if (analysis.confidence < 30) {
+    if (!pipelineDirection && analysis.confidence < 30) {
       this.calculationTime = Date.now() - start;
       return null;
     }
 
     const { stopLoss, takeProfit } = this._computeLevels(
-      currentPrice, analysis.direction, engines.atr, engines.bollinger
+      currentPrice, executionDirection, engines.atr, engines.bollinger
     );
 
     const risk = Math.abs(currentPrice - stopLoss);
@@ -94,7 +102,7 @@ class PaperTradingEngine {
     const trade = this._openTrade({
       symbol: this.symbol,
       timeframe: tf,
-      direction: analysis.direction,
+      direction: executionDirection,
       entryPrice: this._round(currentPrice),
       entryTime: new Date().toISOString(),
       stopLoss: this._round(stopLoss),
@@ -433,6 +441,10 @@ class PaperTradingEngine {
       balance: this._balance,
       initialBalance: this._initialBalance,
     };
+  }
+
+  getLastAnalysis() {
+    return this._lastAnalysis || null;
   }
 
   // ---------------------------------------------------------------------------
