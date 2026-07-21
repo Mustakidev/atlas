@@ -1,5 +1,6 @@
 const express = require('express');
 const { sanitizeQuery } = require('../middleware/validate');
+const { getFinalizedCandles } = require('../engine/candleUtils');
 
 function createRouter(deps) {
   const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision } = deps;
@@ -108,13 +109,7 @@ function createRouter(deps) {
     }
 
     // Get finalized candles only (exclude the active/in-progress candle)
-    const allCandles = candleEngine.getCandles(tf, limit);
-    const active = candleEngine.getActive(tf);
-    let finalized = allCandles;
-    if (active && allCandles.length > 0 &&
-        allCandles[allCandles.length - 1].openTime === active.openTime) {
-      finalized = allCandles.slice(0, -1);
-    }
+    const finalized = getFinalizedCandles(candleEngine, tf, limit);
 
     // Calculate RSI
     const start = Date.now();
@@ -154,13 +149,7 @@ function createRouter(deps) {
     }
 
     // Get finalized candles only (exclude the active/in-progress candle)
-    const allCandles = candleEngine.getCandles(tf, limit);
-    const active = candleEngine.getActive(tf);
-    let finalized = allCandles;
-    if (active && allCandles.length > 0 &&
-        allCandles[allCandles.length - 1].openTime === active.openTime) {
-      finalized = allCandles.slice(0, -1);
-    }
+    const finalized = getFinalizedCandles(candleEngine, tf, limit);
 
     const emaIndicator = indicatorRegistry.get('EMA');
 
@@ -275,13 +264,7 @@ function createRouter(deps) {
         });
       }
 
-      const allCandles = candleEngine.getCandles(tf, limit);
-      const active = candleEngine.getActive(tf);
-      let finalized = allCandles;
-      if (active && allCandles.length > 0 &&
-          allCandles[allCandles.length - 1].openTime === active.openTime) {
-        finalized = allCandles.slice(0, -1);
-      }
+      const finalized = getFinalizedCandles(candleEngine, tf, limit);
 
       const start = Date.now();
       const result = confluenceEngine.calculate(finalized, tf);
@@ -321,13 +304,7 @@ function createRouter(deps) {
         });
       }
 
-      const allCandles = candleEngine.getCandles(tf, limit);
-      const active = candleEngine.getActive(tf);
-      let finalized = allCandles;
-      if (active && allCandles.length > 0 &&
-          allCandles[allCandles.length - 1].openTime === active.openTime) {
-        finalized = allCandles.slice(0, -1);
-      }
+      const finalized = getFinalizedCandles(candleEngine, tf, limit);
 
       const start = Date.now();
       const result = regimeEngine.calculate(finalized, tf);
@@ -450,13 +427,7 @@ function createRouter(deps) {
       });
     }
 
-    const allCandles = candleEngine.getCandles(tf, limit);
-    const active = candleEngine.getActive(tf);
-    let finalized = allCandles;
-    if (active && allCandles.length > 0 &&
-        allCandles[allCandles.length - 1].openTime === active.openTime) {
-      finalized = allCandles.slice(0, -1);
-    }
+    const finalized = getFinalizedCandles(candleEngine, tf, limit);
 
     logger.info('Structure', `Structure analysis started | ${tf} | candles=${finalized.length}`);
 
@@ -582,13 +553,7 @@ function createRouter(deps) {
       });
     }
 
-    const allCandles = candleEngine.getCandles(tf, limit);
-    const active = candleEngine.getActive(tf);
-    let finalized = allCandles;
-    if (active && allCandles.length > 0 &&
-        allCandles[allCandles.length - 1].openTime === active.openTime) {
-      finalized = allCandles.slice(0, -1);
-    }
+    const finalized = getFinalizedCandles(candleEngine, tf, limit);
 
     if (finalized.length === 0) {
       return res.json({
@@ -632,13 +597,7 @@ function createRouter(deps) {
     let backtestResult = null;
     const valid = candleEngine.getAllTimeframes();
     if (valid.includes(tf)) {
-      const allCandles = candleEngine.getCandles(tf, limit);
-      const active = candleEngine.getActive(tf);
-      let finalized = allCandles;
-      if (active && allCandles.length > 0 &&
-          allCandles[allCandles.length - 1].openTime === active.openTime) {
-        finalized = allCandles.slice(0, -1);
-      }
+      const finalized = getFinalizedCandles(candleEngine, tf, limit);
       if (finalized.length > 0 && backtestEngine) {
         backtestResult = backtestEngine.run({
           candles: finalized,
@@ -874,13 +833,7 @@ function createRouter(deps) {
     const mtfTimeframes = {};
     const mtfTFs = ['1m', '5m', '15m', '1h'];
     for (const mtfTF of mtfTFs) {
-      const candles = candleEngine.getCandles(mtfTF, 100);
-      const active = candleEngine.getActive(mtfTF);
-      let finalized = candles;
-      if (active && candles.length > 0 &&
-          candles[candles.length - 1].openTime === active.openTime) {
-        finalized = candles.slice(0, -1);
-      }
+      const finalized = getFinalizedCandles(candleEngine, mtfTF, 100);
       if (finalized.length >= 15 && confluenceEngine) {
         const c = confluenceEngine.calculate(finalized, mtfTF);
         const a = atrEngine.calculate(mtfTF);
@@ -928,13 +881,7 @@ function createRouter(deps) {
       });
     }
 
-    const allCandles = candleEngine.getCandles(tf, limit);
-    const active = candleEngine.getActive(tf);
-    let finalized = allCandles;
-    if (active && allCandles.length > 0 &&
-        allCandles[allCandles.length - 1].openTime === active.openTime) {
-      finalized = allCandles.slice(0, -1);
-    }
+    const finalized = getFinalizedCandles(candleEngine, tf, limit);
 
     const result = regimeEngine.calculate(finalized, tf);
 
@@ -1029,12 +976,7 @@ function createRouter(deps) {
       return res.status(400).json({ error: 'Invalid timeframe', supported: valid });
     }
 
-    let candles = candleEngine.getCandles(tf, 500);
-    const active = candleEngine.getActive(tf);
-    if (active && candles.length > 0 &&
-        candles[candles.length - 1].openTime === active.openTime) {
-      candles = candles.slice(0, -1);
-    }
+    let candles = getFinalizedCandles(candleEngine, tf, 500);
 
     if (candles.length === 0) {
       try {

@@ -1,3 +1,4 @@
+const { getFinalizedCandles } = require('../engine/candleUtils');
 const { REGIMES, REGIME_THRESHOLDS } = require('./RegimeTypes');
 const { TrendStrength } = require('./TrendStrength');
 const { RangeDetector } = require('./RangeDetector');
@@ -80,13 +81,7 @@ class RegimeEngine {
     const timeframes = this.candleEngine ? this.candleEngine.getAllTimeframes() : [];
 
     for (const tf of timeframes) {
-      const allCandles = this.candleEngine.getCandles(tf, limit || 500);
-      const active = this.candleEngine.getActive(tf);
-      let finalized = allCandles;
-      if (active && allCandles.length > 0 &&
-          allCandles[allCandles.length - 1].openTime === active.openTime) {
-        finalized = allCandles.slice(0, -1);
-      }
+      const finalized = getFinalizedCandles(this.candleEngine, tf, limit);
       results[tf] = this.calculate(finalized, tf);
     }
 

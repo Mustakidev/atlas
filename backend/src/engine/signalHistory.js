@@ -8,6 +8,7 @@
  *
  * Version: 1.0.0
  */
+const { getFinalizedCandles } = require('./candleUtils');
 const ENGINE_VERSION = '1.0.0';
 
 class SignalHistoryEngine {
@@ -45,13 +46,7 @@ class SignalHistoryEngine {
     const tf = timeframe || this.defaultTimeframe;
     const start = Date.now();
 
-    const allCandles = this.candleEngine.getCandles(tf, 500);
-    const active = this.candleEngine.getActive(tf);
-    let finalized = allCandles;
-    if (active && allCandles.length > 0 &&
-        allCandles[allCandles.length - 1].openTime === active.openTime) {
-      finalized = allCandles.slice(0, -1);
-    }
+    const finalized = getFinalizedCandles(this.candleEngine, tf, 500);
 
     if (!finalized || finalized.length === 0) {
       this.calculationTime = Date.now() - start;

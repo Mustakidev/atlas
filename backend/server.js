@@ -12,6 +12,7 @@ const { ApiManager } = require('./src/network/apiManager');
 const { CandleEngine } = require('./src/engine/candles');
 const { EventBus } = require('./src/core/eventBus');
 const { createIndicatorRegistry } = require('./src/engine/indicators');
+const { getFinalizedCandles } = require('./src/engine/candleUtils');
 const { StructureEngine } = require('./src/engine/structure');
 const { ConfluenceEngine } = require('./src/engine/confluence');
 const { ValidationEngine } = require('./src/engine/validation');
@@ -185,13 +186,7 @@ function runExecutionPipeline(snapshot) {
     return;
   }
 
-  const allCandles = candleEngine.getCandles(tf, 500);
-  const active = candleEngine.getActive(tf);
-  let finalized = allCandles;
-  if (active && allCandles.length > 0 &&
-      allCandles[allCandles.length - 1].openTime === active.openTime) {
-    finalized = allCandles.slice(0, -1);
-  }
+  const finalized = getFinalizedCandles(candleEngine, tf, 500);
 
   if (finalized.length < 15) {
     decision.verdict.rejectionReason = `Insufficient candles (${finalized.length}/15 minimum)`;
@@ -350,13 +345,7 @@ function runExecutionPipeline(snapshot) {
   const mtfTimeframes = {};
   const mtfTFs = ['1m', '5m', '15m', '1h'];
   for (const mtfTF of mtfTFs) {
-    const mtfCandles = candleEngine.getCandles(mtfTF, 100);
-    const mtfActive = candleEngine.getActive(mtfTF);
-    let mtfFinalized = mtfCandles;
-    if (mtfActive && mtfCandles.length > 0 &&
-        mtfCandles[mtfCandles.length - 1].openTime === mtfActive.openTime) {
-      mtfFinalized = mtfCandles.slice(0, -1);
-    }
+    const mtfFinalized = getFinalizedCandles(candleEngine, mtfTF, 100);
     if (mtfFinalized.length >= 15) {
       const mtfConfluence = safeExecute('MTF-Confluence', () => confluenceEngine.calculate(mtfFinalized, mtfTF), { score: 50, bias: 'Neutral', confidence: 0 });
       const mtfAtr = safeExecute('MTF-ATR', () => atrEngine.calculate(mtfTF), null);

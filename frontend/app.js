@@ -196,7 +196,6 @@ async function fetchMarket() {
   try {
     var d = await dedupedFetch('market', API + '/api/market');
     if (!d || !d.connected) return;
-    console.log('[Market] API response:', d);
     currentPrice = d.price;
     $('hdrPrice').textContent = fmtUSD(d.price);
     var chEl = $('hdrChange');
@@ -214,7 +213,6 @@ async function fetchAnalysis() {
   try {
     var d = await dedupedFetch('analysis', API + '/api/analysis');
     if (!d || !d.connected) return;
-    console.log('[Analysis] API response keys:', Object.keys(d), 'trend:', d.trend ? d.trend['1H'] : 'none');
     // Trend
     if (d.trend) {
       setClass($('trend1H'), trendClass(d.trend['1H'])); $('trend1H').textContent = d.trend['1H'] || '--';
@@ -235,7 +233,6 @@ async function fetchStructure() {
   try {
     var d = await dedupedFetch('structure-' + chartCurrentTF, API + '/api/structure?timeframe=' + chartCurrentTF);
     if (!d) return;
-    console.log('[Structure] API response: pattern=' + d.structure + ' dir=' + d.direction + ' score=' + d.score + ' confidence=' + d.confidence);
     $('structureStatus').textContent = d.structure ? 'Live' : 'N/A';
     setClass($('structPattern'), trendClass(d.structure));
     $('structPattern').textContent = d.structure || '--';
@@ -245,7 +242,6 @@ async function fetchStructure() {
     setClass($('structScore'), d.score != null && d.score > 60 ? 'bullish' : d.score != null && d.score < 40 ? 'bearish' : '');
     $('structScore').textContent = d.score != null ? d.score : '--';
     $('structConf').textContent = d.confidence != null ? d.confidence + '%' : '--';
-    console.log('[Structure] Rendered: pattern=' + d.structure + ' dir=' + d.direction + ' BOS=' + (d.lastBOS ? d.lastBOS.type : 'None') + ' score=' + d.score + ' conf=' + d.confidence);
   } catch(e) {}
 }
 
@@ -255,20 +251,17 @@ async function fetchIndicators() {
     var rsiResp = await dedupedFetch('rsi-' + chartCurrentTF, API + '/api/indicators/rsi?timeframe=' + chartCurrentTF);
     var rsi = rsiResp && rsiResp.rsi ? rsiResp.rsi : null;
     if (rsi) {
-      console.log('[RSI] API response:', rsiResp, '| Parsed:', rsi);
       $('rsiStatus').textContent = rsi.ready ? 'Ready' : 'N/A';
       setClass($('rsiValue'), rsi.value > 70 ? 'bearish' : rsi.value < 30 ? 'bullish' : '');
       $('rsiValue').textContent = rsi.value != null ? rsi.value.toFixed(1) : '--';
       $('rsiState').textContent = rsi.state || '--';
       $('rsiInterp').textContent = rsi.signal || '--';
-      console.log('[RSI] Rendered: value=' + rsi.value + ' state=' + rsi.state + ' signal=' + rsi.signal);
     }
 
     // EMA — API returns { symbol, timeframe, periods: { "9":{value,trend,ready}, "20":{...}, ... } }
     var emaResp = await dedupedFetch('ema-' + chartCurrentTF, API + '/api/indicators/ema?timeframe=' + chartCurrentTF);
     var emaPeriods = emaResp && emaResp.periods ? emaResp.periods : null;
     if (emaPeriods) {
-      console.log('[EMA] API response:', emaResp, '| Periods:', emaPeriods);
       var ema20 = emaPeriods['20'] || {};
       $('emaStatus').textContent = ema20.ready ? 'Ready' : 'N/A';
       setClass($('emaTrend'), emaClass(ema20.trend));
@@ -279,39 +272,33 @@ async function fetchIndicators() {
         : ema9.trend === 'Above' && ema20.trend === 'Below' ? 'Bearish crossover zone'
         : ema20.trend === 'Above' ? 'Price above EMA-20 (bullish)' : 'Price below EMA-20 (bearish)';
       $('emaInterp').textContent = interp;
-      console.log('[EMA] Rendered: EMA20=' + ema20.value + ' trend=' + ema20.trend);
     }
 
     // MACD
     var macd = await dedupedFetch('macd-' + chartCurrentTF, API + '/api/macd?timeframe=' + chartCurrentTF);
     if (macd && macd.ready !== undefined) {
-      console.log('[MACD] API response:', macd);
       $('macdStatus').textContent = macd.ready ? 'Ready' : 'N/A';
       setClass($('macdTrend'), trendClass(macd.trend));
       $('macdTrend').textContent = macd.trend || '--';
       $('macdHist').textContent = macd.histogram != null ? macd.histogram.toFixed(4) : '--';
       $('macdSignal').textContent = macd.signal != null ? macd.signal.toFixed(6) : '--';
       $('macdInterp').textContent = macd.interpretation || (macd.crossover && macd.crossover !== 'None' ? 'Crossover: ' + macd.crossover : macd.trend || '--');
-      console.log('[MACD] Rendered: macd=' + macd.macd + ' signal=' + macd.signal + ' trend=' + macd.trend);
     }
 
     // ATR
     var atr = await dedupedFetch('atr-' + chartCurrentTF, API + '/api/atr?timeframe=' + chartCurrentTF);
     if (atr && atr.ready !== undefined) {
-      console.log('[ATR] API response:', atr);
       $('atrStatus').textContent = atr.ready ? 'Ready' : 'N/A';
       $('atrValue').textContent = atr.atr != null ? atr.atr.toFixed(2) : '--';
       $('atrPct').textContent = atr.atrPercentage != null ? atr.atrPercentage.toFixed(2) + '%' : '--';
       setClass($('atrVol'), volClass(atr.volatilityLevel));
       $('atrVol').textContent = atr.volatilityLevel || '--';
       $('atrTrend').textContent = atr.volatilityTrend || '--';
-      console.log('[ATR] Rendered: atr=' + atr.atr + ' vol=' + atr.volatilityLevel + ' trend=' + atr.volatilityTrend);
     }
 
     // Bollinger — API returns { middleBand, upperBand, lowerBand, squeeze, pricePosition, lastClose, bandwidth, ... }
     var bb = await dedupedFetch('bollinger-' + chartCurrentTF, API + '/api/bollinger?timeframe=' + chartCurrentTF);
     if (bb && bb.ready !== undefined) {
-      console.log('[Bollinger] API response:', bb);
       $('bollStatus').textContent = bb.ready ? 'Ready' : 'N/A';
       $('bollUpper').textContent = bb.upperBand != null ? fmtUSD(bb.upperBand) : '--';
       $('bollMid').textContent = bb.middleBand != null ? fmtUSD(bb.middleBand) : '--';
@@ -322,7 +309,6 @@ async function fetchIndicators() {
       $('bollPB').textContent = percentB != null ? percentB.toFixed(3) : '--';
       setClass($('bollSqueeze'), bb.squeeze ? 'high' : '');
       $('bollSqueeze').textContent = bb.squeeze ? 'Active' : 'None';
-      console.log('[Bollinger] Rendered: mid=' + bb.middleBand + ' upper=' + bb.upperBand + ' lower=' + bb.lowerBand + ' squeeze=' + bb.squeeze);
     }
   } catch(e) {}
 }
@@ -331,7 +317,6 @@ async function fetchMarketRegime() {
   try {
     var d = await dedupedFetch('market-regime-' + chartCurrentTF, API + '/api/market-regime?timeframe=' + chartCurrentTF);
     if (!d || !d.regime) return;
-    console.log('[MarketRegime] API response: regime=' + d.regime + ' conf=' + d.confidence + ' trend=' + d.trendScore + ' range=' + d.rangeScore + ' vol=' + d.volatility);
     $('regimeStatus').textContent = d.regime ? 'Live' : 'N/A';
 
     var regimeEl = $('regimeCurrent');
@@ -373,7 +358,6 @@ async function fetchConfluence() {
   try {
     var d = await dedupedFetch('confluence-' + chartCurrentTF, API + '/api/confluence?timeframe=' + chartCurrentTF);
     if (!d) return;
-    console.log('[Confluence] API response: score=' + d.score + ' bias=' + d.bias + ' confidence=' + d.confidence);
     $('confStatus').textContent = d.score != null ? 'Live' : 'N/A';
     $('confScore').textContent = d.score != null ? d.score : '--';
     setClass($('confBias'), trendClass(d.bias));
@@ -432,7 +416,6 @@ async function fetchRisk() {
     if (!price || !dir) return;
     var d = await dedupedFetch('risk-' + chartCurrentTF + '-' + dir, API + '/api/risk?timeframe=' + chartCurrentTF + '&entryPrice=' + price + '&direction=' + dir);
     if (!d) return;
-    console.log('[Risk] API response: allowed=' + d.tradeAllowed + ' dir=' + d.direction + ' SL=' + d.stopLoss + ' TP=' + d.takeProfit);
     $('riskStatus').textContent = d.tradeAllowed ? 'Allowed' : 'Rejected';
     setClass($('riskDir'), d.direction === 'BUY' ? 'bullish' : 'bearish');
     $('riskDir').textContent = d.direction || '--';
@@ -472,7 +455,6 @@ async function fetchAdvanceRisk() {
     if (!price || !dir) return;
     var d = await dedupedFetch('advance-risk-' + chartCurrentTF + '-' + dir, API + '/api/advance-risk?timeframe=' + chartCurrentTF + '&entryPrice=' + price + '&direction=' + dir);
     if (!d) return;
-    console.log('[AdvanceRisk] API: allowed=' + d.tradeAllowed + ' dir=' + d.direction + ' pos=' + d.positionSize + ' SL=' + d.stopLoss + ' TP=' + d.takeProfit);
     $('advanceRiskStatus').textContent = d.tradeAllowed ? 'Allowed' : 'Rejected';
     $('advPosSize').textContent = d.positionSize != null ? d.positionSize : '--';
     $('advDollarRisk').textContent = d.dollarRisk != null ? fmtUSD(d.dollarRisk) : '--';
@@ -513,7 +495,6 @@ async function fetchMtfConfirmation() {
     if (!price || !dir) return;
     var d = await dedupedFetch('mtf-confirmation-' + dir, API + '/api/mtf-confirmation?direction=' + dir + '&timeframe=' + chartCurrentTF);
     if (!d) return;
-    console.log('[MTFConf] API: allowed=' + d.mtfAllowed + ' conf=' + d.confidence + '% align=' + d.alignmentScore + '%');
     $('mtfConfStatus').textContent = d.mtfAllowed ? 'Allowed' : 'Rejected';
     var alignment = d.alignment || {};
     $('mtf1m').textContent = alignment['1m'] || '--';
@@ -552,7 +533,6 @@ async function fetchPaperTrades() {
   try {
     var d = await dedupedFetch('paper-trades', API + '/api/paper-trades');
     if (!d) return;
-    console.log('[PaperTrades] API response: open=' + (d.open || []).length + ' closed=' + (d.closed || []).length + ' balance=' + d.balance);
     var stats = d.stats || {};
     var perf = d.performance || {};
     var openTrades = d.open || [];
@@ -614,7 +594,6 @@ async function fetchPaperTrades() {
     setClass($('perfReturn'), perf.netReturnPct > 0 ? 'bullish' : perf.netReturnPct < 0 ? 'bearish' : '');
     $('perfStreak').textContent = (perf.currentStreak || 0) + ' ' + (perf.currentStreakType || 'None');
     setClass($('perfStreak'), perf.currentStreakType === 'Win' ? 'bullish' : perf.currentStreakType === 'Loss' ? 'bearish' : '');
-    console.log('[PaperTrades] Rendered: wins=' + wins + ' losses=' + losses + ' balance=' + d.balance + ' pf=' + perf.profitFactor + ' return=' + perf.netReturnPct);
 
     // Render closed trades in performance history
     var histList = $('perfSignals');
@@ -647,43 +626,6 @@ async function fetchPerformance() {
   try {
     var d = await dedupedFetch('analytics', API + '/api/analytics');
     if (!d) return;
-    console.log('[Analytics] API response keys:', Object.keys(d));
-    var acc = d.accuracy || {};
-    var gen = d.general || {};
-    var conf = d.confidence || {};
-    var perf = d.performance || {};
-    $('perfWinRate').textContent = perf.winRate != null ? perf.winRate + '%' : '0%';
-    setClass($('perfWinRate'), perf.winRate > 50 ? 'bullish' : '');
-    $('perfLossRate').textContent = perf.lossRate != null ? perf.lossRate + '%' : '0%';
-    setClass($('perfLossRate'), perf.lossRate > 50 ? 'bearish' : '');
-    $('perfTotal').textContent = gen.totalSignals || 0;
-    $('perfAvgConf').textContent = conf.averageConfidence != null ? conf.averageConfidence.toFixed(0) : '0';
-    $('perfStatus').textContent = gen.totalSignals + ' signals';
-    console.log('[Analytics] Rendered: winRate=' + perf.winRate + ' lossRate=' + perf.lossRate + ' total=' + gen.totalSignals + ' avgConf=' + conf.averageConfidence);
-
-    // Fetch last 20 signals from backtest
-    var bt = await dedupedFetch('backtest-' + chartCurrentTF, API + '/api/backtest?timeframe=' + chartCurrentTF + '&predictionCandles=5&warmupCandles=50');
-    var sigs = (bt && bt.signals) ? bt.signals.slice(-20).reverse() : [];
-    var list = $('perfSignals');
-    if (sigs.length === 0) {
-      list.innerHTML = '<div class="perf-empty">No signal history</div>';
-      return;
-    }
-    var html = '';
-    for (var i = 0; i < sigs.length; i++) {
-      var s = sigs[i];
-      var biasCls = s.overallBias === 'Bullish' ? 'dir-buy' : s.overallBias === 'Bearish' ? 'dir-sell' : '';
-      var outCls = s.outcome === 'correct' ? 'outcome-correct' : s.outcome === 'incorrect' ? 'outcome-incorrect' : 'outcome-neutral';
-      html += '<div class="perf-row">' +
-        '<span>' + fmtShortTime(s.timestamp) + '</span>' +
-        '<span class="' + biasCls + '">' + (s.overallBias || '--') + '</span>' +
-        '<span>' + (s.confidence || '--') + '</span>' +
-        '<span>' + fmtUSD(s.priceAtSignal) + '</span>' +
-        '<span>' + fmtUSD(s.priceAfter) + '</span>' +
-        '<span class="' + outCls + '">' + (s.outcome || '--') + '</span>' +
-        '</div>';
-    }
-    list.innerHTML = html;
   } catch(e) {}
 }
 

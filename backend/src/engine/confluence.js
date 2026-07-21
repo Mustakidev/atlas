@@ -10,6 +10,7 @@
  * Version: 1.0.0
  * Data Source: MarketAnalyzer + IndicatorRegistry + StructureEngine + CandleEngine
  */
+const { getFinalizedCandles } = require('./candleUtils');
 const ENGINE_VERSION = '1.0.0';
 const MIN_CANDLES = 15;
 
@@ -118,13 +119,7 @@ class ConfluenceEngine {
     const timeframes = this.candleEngine.getAllTimeframes();
 
     for (const tf of timeframes) {
-      const allCandles = this.candleEngine.getCandles(tf, limit || 500);
-      const active = this.candleEngine.getActive(tf);
-      let finalized = allCandles;
-      if (active && allCandles.length > 0 &&
-          allCandles[allCandles.length - 1].openTime === active.openTime) {
-        finalized = allCandles.slice(0, -1);
-      }
+      const finalized = getFinalizedCandles(this.candleEngine, tf, limit);
       results[tf] = this.calculate(finalized, tf);
     }
 

@@ -16,6 +16,7 @@
  * Data Source: CandleEngine OHLCV candles (finalized only)
  * Asset: Configurable via symbol parameter (default: BTCUSDT)
  */
+const { getFinalizedCandles } = require('./candleUtils');
 const ENGINE_VERSION = '1.0.0';
 const DEFAULT_SYMBOL = 'BTCUSDT';
 const DEFAULT_PERIOD = 20;
@@ -45,13 +46,7 @@ class BollingerEngine {
   calculate(timeframe, limit) {
     const start = Date.now();
 
-    const allCandles = this.candleEngine.getCandles(timeframe, limit || 500);
-    const active = this.candleEngine.getActive(timeframe);
-    let finalized = allCandles;
-    if (active && allCandles.length > 0 &&
-        allCandles[allCandles.length - 1].openTime === active.openTime) {
-      finalized = allCandles.slice(0, -1);
-    }
+    const finalized = getFinalizedCandles(this.candleEngine, timeframe, limit);
 
     if (!finalized || finalized.length < MIN_CANDLES) {
       this.calculationTime = Date.now() - start;

@@ -10,6 +10,7 @@
  * Data Source: ConfluenceEngine + StructureEngine + IndicatorRegistry + CandleEngine
  * Asset: Configurable via symbol parameter (default: BTCUSDT)
  */
+const { getFinalizedCandles } = require('./candleUtils');
 const ENGINE_VERSION = '1.0.0';
 const DEFAULT_SYMBOL = 'BTCUSDT';
 
@@ -55,13 +56,7 @@ class MTFEngine {
 
     // Step 1: Collect per-timeframe data
     for (const tf of ALL_TIMEFRAMES) {
-      const allCandles = this.candleEngine.getCandles(tf, limit || 500);
-      const active = this.candleEngine.getActive(tf);
-      let finalized = allCandles;
-      if (active && allCandles.length > 0 &&
-          allCandles[lastIndex(allCandles)].openTime === active.openTime) {
-        finalized = allCandles.slice(0, -1);
-      }
+      const finalized = getFinalizedCandles(this.candleEngine, tf, limit);
 
       if (finalized.length < 15) {
         timeframeResults[tf] = this._emptyTimeframe(tf);
@@ -334,14 +329,6 @@ class MTFEngine {
       candleCount: 0,
     };
   }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function lastIndex(arr) {
-  return arr.length - 1;
 }
 
 module.exports = { MTFEngine, ENGINE_VERSION, TF_WEIGHTS, ALL_TIMEFRAMES, DEFAULT_SYMBOL };
