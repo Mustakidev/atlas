@@ -144,6 +144,23 @@ test('GET /api/paper-trades returns aggregate trade fields', async () => {
   assert.equal(typeof result.body.balance, 'number');
 });
 
+test('GET /api/candles returns timeframe and candle collections', async () => {
+  const candles = [{ open: 100, high: 102, low: 98, close: 101, openTime: 1704067200000 }];
+  const result = await dispatch('/candles', { timeframe: '1h', limit: '10' }, {
+    candleEngine: {
+      getAllTimeframes: () => ['1h'],
+      getCandles: () => cloneFixture(candles),
+      getActive: () => null,
+    },
+  });
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.timeframe, '1h');
+  assert.equal(result.body.count, 1);
+  assert.ok(Array.isArray(result.body.candles));
+  assert.equal(result.body.candles[0].close, 101);
+});
+
 test('invalid entryPrice is rejected by query sanitization', async () => {
   const result = await dispatch('/risk', { entryPrice: 'not-a-number' });
 

@@ -118,3 +118,16 @@ test('PaperTrading closes an opened trade through the candle lifecycle', () => {
   assert.equal(engine.stats().openTrades, 0);
   assert.equal(engine.stats().closedTrades, 1);
 });
+
+test('PaperTrading closes a BUY trade at stop loss', () => {
+  const engine = new PaperTradingEngine({ logger: logger(), symbol: 'BTCUSDT' });
+  const opened = engine.signal(acceptedPaperSignal(), 100, '1h', 'BUY');
+  const closedResult = engine.onCandle({ open: 97, high: 98, low: 96, close: 96, openTime: 2, timestamp: '2024-01-01T02:00:00.000Z' });
+
+  assert.equal(closedResult.closed.length, 1);
+  assert.equal(closedResult.closed[0].tradeId, opened.tradeId);
+  assert.equal(closedResult.closed[0].exitReason, 'Stop Loss');
+  assert.equal(engine.open().length, 0);
+  assert.equal(engine.closed().length, 1);
+  assert.ok(engine.getBalance() < 10000, 'stop-loss close should reduce balance');
+});
