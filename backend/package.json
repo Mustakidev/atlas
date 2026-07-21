@@ -6,9 +6,11 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node --test",
+    "test": "node --test test/*.test.js test/unit/*.test.js test/integration/*.test.js test/api/*.test.js",
     "test:unit": "node --test test/unit/*.test.js",
-    "test:integration": "node --test test/integration/*.test.js"
+    "test:integration": "node --test test/integration/*.test.js",
+    "test:api": "node --test test/api/*.test.js",
+    "test:coverage": "node --experimental-test-coverage --test test/*.test.js test/unit/*.test.js test/integration/*.test.js test/api/*.test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
