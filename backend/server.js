@@ -1,7 +1,3 @@
-const express = require('express');
-const cors = require('cors');
-const path = require('path');
-
 const { ConfigManager } = require('./src/config/config');
 const { Logger } = require('./src/logger/logger');
 const { CacheEngine } = require('./src/engine/cache');
@@ -30,12 +26,10 @@ const { RegimeEngine } = require('./src/market-regime/RegimeEngine');
 const { RegimeDecisionEngine } = require('./src/market-regime/RegimeDecisionEngine');
 const { AdvanceRiskEngine } = require('./src/engine/advanceRisk');
 const { MTFConfirmationEngine } = require('./src/engine/mtfConfirmation');
-const { createRouter } = require('./src/routes/routes');
+const { createApp } = require('./src/app');
+const { createExecutionPipeline } = require('./src/core/executionPipeline');
 
 const fetch = require('node-fetch');
-const fs = require('fs');
-const { createAuth } = require('./src/middleware/auth');
-const { createGlobalLimiter, createExpensiveLimiter, createConditionalExpensive } = require('./src/middleware/rateLimit');
 
 const config = new ConfigManager();
 const logger = new Logger(config);
@@ -53,9 +47,6 @@ if (!configValidation.valid) {
 }
 logger.system('Config', 'Startup configuration validated successfully');
 
-const auth = createAuth(config, logger);
-const globalLimiter = createGlobalLimiter(config, logger);
-const expensiveLimiter = createConditionalExpensive(createExpensiveLimiter(config, logger));
 const eventBus = new EventBus();
 const symbol = config.get('SYMBOL');
 const cache = new CacheEngine(config, logger, symbol);
@@ -83,36 +74,25 @@ const mtfConfirmationEngine = new MTFConfirmationEngine({ logger, symbol, config
 const strategyReplayEngine = new StrategyReplayEngine({ logger, symbol, config, advanceRiskEngine, mtfConfirmationEngine });
 strategyReplayEngine.setRegimeEngine(regimeEngine);
 const validationEngine = new ValidationEngine({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, logger, symbol });
-
-const app = express();
-const allowedOrigins = config.get('CORS_ORIGIN').split(',').map(s => s.trim());
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      logger.warn('CORS', 'Blocked request from unauthorized origin', { origin });
-      callback(null, false);
-    }
-  },
-}));
-app.use(express.json({ limit: config.get('MAX_BODY_SIZE') }));
-app.use(globalLimiter);
-
-// Serve index.html with injected API key (must be before static middleware)
-app.get('/', (req, res) => {
-  const htmlPath = path.join(__dirname, '../frontend/index.html');
-  const html = fs.readFileSync(htmlPath, 'utf8');
-  const apiKey = config.get('API_KEY');
-  const injected = html.replace('<head>', '<head>\n  <script>window.__ATLAS_API_KEY="' + apiKey + '";</script>');
-  res.type('html').send(injected);
+const executionPipeline = createExecutionPipeline({
+  config,
+  logger,
+  symbol,
+  candleEngine,
+  regimeEngine,
+  confluenceEngine,
+  atrEngine,
+  analyzer,
+  structureEngine,
+  indicatorRegistry,
+  macdEngine,
+  bollingerEngine,
+  regimeDecisionEngine,
+  mtfConfirmationEngine,
+  advanceRiskEngine,
+  mtfEngine,
+  paperTradeEngine,
 });
-
-// Static files (CSS, JS, images) — index:false avoids serving index.html for /
-app.use(express.static(path.join(__dirname, '../frontend'), { index: false }));
-
-const router = createRouter({ apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision: () => lastDecision, getPipelineHealth });
-app.use('/api', expensiveLimiter, auth, router);
 
 let lastSignalTime = 0;
 const SIGNAL_COOLDOWN_MS = 60000;
@@ -142,10 +122,44 @@ function getPipelineHealth() {
   };
 }
 
+const app = createApp({
+  config,
+  logger,
+  routes: {
+    apiManager,
+    history,
+    analyzer,
+    candleEngine,
+    eventBus,
+    cache,
+    indicatorRegistry,
+    structureEngine,
+    confluenceEngine,
+    validationEngine,
+    mtfEngine,
+    macdEngine,
+    atrEngine,
+    bollingerEngine,
+    signalHistoryEngine,
+    backtestEngine,
+    analyticsEngine,
+    paperTradeEngine,
+    riskEngine,
+    strategyReplayEngine,
+    regimeEngine,
+    regimeDecisionEngine,
+    advanceRiskEngine,
+    mtfConfirmationEngine,
+    symbol,
+  },
+  getLastDecision: executionPipeline.getLastDecision,
+  getPipelineHealth: executionPipeline.getPipelineHealth,
+});
+
 eventBus.on('market:snapshot', (snapshot) => {
   analyzer.analyze(history);
   signalHistoryEngine.record();
-  runExecutionPipeline(snapshot);
+  executionPipeline.run(snapshot);
 });
 
 function runExecutionPipeline(snapshot) {
@@ -386,127 +400,7 @@ function runExecutionPipeline(snapshot) {
     return;
   }
 
-  const riskResult = safeExecute('AdvanceRisk', () => advanceRiskEngine.evaluate({
-    symbol,
-    timeframe: tf,
-    entryPrice: price,
-    atr: atr || { ready: false, atr: null, atrPercentage: 0 },
-    direction,
-    trend,
-    structure: structureResult,
-    confluence,
-    regime: marketRegime.regime,
-  }), { tradeAllowed: false, rejectionReason: 'Advance risk engine failed', positionSize: 0, stopLoss: 0, takeProfit: 0, riskReward: 0, session: null });
 
-  decision.risk = riskResult;
-  decision.gates.advanceRisk = { pass: riskResult.tradeAllowed, value: riskResult.tradeAllowed ? 'ALLOWED' : 'BLOCKED', detail: riskResult.tradeAllowed
-    ? `AdvanceRisk | pos=${riskResult.positionSize} | SL=$${riskResult.stopLoss} | TP=$${riskResult.takeProfit} | R:R 1:${riskResult.riskReward}`
-    : riskResult.rejectionReason };
-
-  console.log(`  Market Regime: ${marketRegime.regime} (conf: ${marketRegime.confidence}) | TrendScore: ${marketRegime.trendScore} | RangeScore: ${marketRegime.rangeScore} | Vol: ${marketRegime.volatility}`);
-  console.log(`  Confluence Score: ${confluence.score}`);
-  console.log(`  Bias: ${confluence.bias}`);
-  console.log(`  Confidence: ${confluence.confidence}%`);
-  console.log(`  Components: trend=${confluence.components?.trend?.score ?? '--'} structure=${confluence.components?.structure?.score ?? '--'} momentum=${confluence.components?.momentum?.score ?? '--'} rsi=${confluence.components?.rsi?.score ?? '--'} volatility=${confluence.components?.volatility?.score ?? '--'}`);
-  console.log(`  Regime Decision: ${regimeDecision.allowTrade ? 'ALLOWED' : 'BLOCKED'} | Preferred: ${regimeDecision.preferredDirection} | Penalty: ${regimeDecision.penalty}`);
-  console.log(`  Signal: ${direction} (price=$${price})`);
-  console.log(`  MTF Confirmation: ${mtfResult.mtfAllowed ? 'ALLOWED' : 'BLOCKED'} | conf=${mtfResult.confidence}% | alignment=${mtfResult.alignmentScore}%`);
-  console.log(`  AdvanceRisk: Session=${riskResult.session || '--'} | PosSize=${riskResult.positionSize || '--'} | SL=$${riskResult.stopLoss || '--'} | TP=$${riskResult.takeProfit || '--'} | R:R=${riskResult.riskReward || '--'}`);
-  console.log(`  Trade Allowed: ${riskResult.tradeAllowed ? 'YES' : 'NO'}`);
-
-  if (!riskResult.tradeAllowed) {
-    decision.verdict.rejectionReason = `AdvanceRisk: ${riskResult.rejectionReason}`;
-    lastDecision = decision;
-    console.log(`  Execution Triggered: NO`);
-    console.log(`  Reason: ${riskResult.rejectionReason}`);
-    console.log(divider);
-    safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
-    return;
-  }
-
-  const now = Date.now();
-  if (now - lastSignalTime < SIGNAL_COOLDOWN_MS) {
-    const waitSec = Math.ceil((SIGNAL_COOLDOWN_MS - (now - lastSignalTime)) / 1000);
-    decision.verdict.rejectionReason = `Cooldown active — ${waitSec}s remaining (min ${SIGNAL_COOLDOWN_MS / 1000}s between trades)`;
-    lastDecision = decision;
-    console.log(`  Execution Triggered: NO`);
-    console.log(`  Reason: Cooldown active — ${waitSec}s remaining (min ${SIGNAL_COOLDOWN_MS / 1000}s between trades)`);
-    console.log(divider);
-    safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
-    return;
-  }
-
-  const engines = {
-    trend,
-    structure: structureResult,
-    rsi: rsiResult,
-    ema: emaResult,
-    macd: macdResult,
-    atr: atr,
-    bollinger: bollingerResult,
-    confluence,
-    mtf: (() => { try { return mtfEngine.calculate(500); } catch(e) { return null; } })(),
-  };
-
-  const trade = safeExecute('PaperTrading', () => paperTradeEngine.signal(engines, price, tf, direction), null);
-
-  if (trade) {
-    lastSignalTime = now;
-    decision.verdict.tradeOpened = true;
-    decision.verdict.trade = {
-      tradeId: trade.tradeId,
-      direction: trade.direction,
-      entryPrice: trade.entryPrice,
-      stopLoss: trade.stopLoss,
-      takeProfit: trade.takeProfit,
-      riskReward: trade.riskReward,
-      positionSize: trade.positionSize,
-      confidence: trade.confidence,
-      reason: trade.reason,
-    };
-    lastDecision = decision;
-    console.log(`  Execution Triggered: YES`);
-    console.log(`  Trade Opened: YES`);
-    console.log(`  Trade ID: ${trade.tradeId}`);
-    console.log(`  Direction: ${trade.direction}`);
-    console.log(`  Entry: $${trade.entryPrice}`);
-    console.log(`  Stop Loss: $${trade.stopLoss}`);
-    console.log(`  Take Profit: $${trade.takeProfit}`);
-    console.log(`  Risk/Reward: 1:${trade.riskReward}`);
-    console.log(`  Confidence: ${trade.confidence}%`);
-    console.log(`  Position Size: ${trade.positionSize}`);
-    console.log(`  Reason: ${trade.reason}`);
-  } else {
-    decision.verdict.rejectionReason = 'paperTradeEngine.signal() rejected — internal analysis: direction neutral or confidence < 30%';
-    lastDecision = decision;
-    console.log(`  Execution Triggered: YES`);
-    console.log(`  Trade Opened: NO`);
-    console.log(`  Reason: paperTradeEngine.signal() rejected — internal analysis: direction neutral or confidence < 30%`);
-  }
-
-  const closed = safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
-  if (closed.length > 0) {
-    for (const t of closed) {
-      safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl), undefined);
-      console.log(`  Trade Closed: ${t.tradeId} | ${t.exitReason} | Entry=$${t.entryPrice} → Exit=$${t.exitPrice} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
-    }
-  }
-
-  const activeCandle = candleEngine.getActive(tf);
-  if (activeCandle) {
-    const candleResult = safeExecute('PaperTrading', () => paperTradeEngine.onCandle(activeCandle), null);
-    if (candleResult && candleResult.closed && candleResult.closed.length > 0) {
-      for (const t of candleResult.closed) {
-        safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl), undefined);
-        console.log(`  Trade Closed (candle): ${t.tradeId} | ${t.exitReason} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
-      }
-    }
-  }
-
-  const openCount = paperTradeEngine.open().length;
-  const closedCount = paperTradeEngine.closed().length;
-  console.log(`  Portfolio: ${openCount} open | ${closedCount} closed | Balance: $${paperTradeEngine.getBalance()}`);
-  console.log(divider);
 }
 
 let fetchInProgress = false;
