@@ -464,8 +464,8 @@ async function fetchAdvanceRisk() {
     setClass($('advTP'), 'bullish');
     $('advRR').textContent = d.riskReward != null ? '1:' + d.riskReward : '--';
     $('advSession').textContent = d.session || '--';
-    $('advDailyLoss').textContent = d.dailyPnl != null ? fmtUSD(d.dailyPnl) : (d.state && d.state.dailyPnl != null ? fmtUSD(d.state.dailyPnl) : '--');
-    $('advConsecLoss').textContent = d.state && d.state.consecutiveLosses != null ? d.state.consecutiveLosses : '--';
+    $('advDailyLoss').textContent = d.dailyPnL != null ? fmtUSD(d.dailyPnL) : '--';
+    $('advConsecLoss').textContent = d.consecutiveLosses != null ? d.consecutiveLosses : '--';
     var verdict = $('advRiskVerdict');
     var icon = $('advRiskVerdictIcon');
     var text = $('advRiskVerdictText');
@@ -619,13 +619,6 @@ async function fetchPaperTrades() {
     }
     histList.innerHTML = histHtml;
     $('perfStatus').textContent = closedTrades.length + ' trades';
-  } catch(e) {}
-}
-
-async function fetchPerformance() {
-  try {
-    var d = await dedupedFetch('analytics', API + '/api/analytics');
-    if (!d) return;
   } catch(e) {}
 }
 
