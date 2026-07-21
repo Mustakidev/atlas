@@ -126,6 +126,7 @@ const app = createApp({
   config,
   logger,
   routes: {
+    logger,
     apiManager,
     history,
     analyzer,
