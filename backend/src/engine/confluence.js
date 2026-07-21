@@ -11,6 +11,7 @@
  * Data Source: MarketAnalyzer + IndicatorRegistry + StructureEngine + CandleEngine
  */
 const { getFinalizedCandles } = require('./candleUtils');
+const { classifyBias } = require('./biasClassifier');
 const ENGINE_VERSION = '1.0.0';
 const MIN_CANDLES = 15;
 
@@ -320,12 +321,10 @@ class ConfluenceEngine {
   // ---------------------------------------------------------------------------
 
   _classifyBias(score) {
-    const bullishThreshold = this.config ? this.config.get('CONFLUENCE_BULLISH_THRESHOLD') : 65;
-    const bearishThreshold = this.config ? this.config.get('CONFLUENCE_BEARISH_THRESHOLD') : 35;
-
-    if (score >= bullishThreshold) return 'Bullish';
-    if (score <= bearishThreshold) return 'Bearish';
-    return 'Neutral';
+    return classifyBias(score, {
+      bullishThreshold: this.config?.get('CONFLUENCE_BULLISH_THRESHOLD'),
+      bearishThreshold: this.config?.get('CONFLUENCE_BEARISH_THRESHOLD'),
+    });
   }
 
   _computeConfidence(componentResults, missing) {
