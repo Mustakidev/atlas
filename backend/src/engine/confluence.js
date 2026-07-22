@@ -15,9 +15,9 @@ const { classifyBias } = require('./biasClassifier');
 const { calculateConfidence } = require('./confidenceCalculator');
 const { aggregateScore } = require('./scoreAggregator');
 const { ComponentRegistry } = require('./componentRegistry');
-const { normalizeComponentResult } = require('./componentNormalizer');
-const { inspectDefinition, inspectResult } = require('./componentValidator');
+const { inspectDefinition } = require('./componentValidator');
 const { createDefaultComponents } = require('./defaultComponentScorers');
+const { executeComponents } = require('./componentExecution');
 const ENGINE_VERSION = '1.0.0';
 const MIN_CANDLES = 15;
 
@@ -67,30 +67,13 @@ class ConfluenceEngine {
     const analyzerTf = this._reverseTf(tf);
     const context = { analysis, analyzerTf, tf };
 
-    const componentResults = {};
-    const missing = [];
-
-    for (const [name, component] of this._componentRegistry) {
-      try {
-        const result = component.calculate(candles, tf, context);
-        this._lastDiagnostics.push(...inspectResult(name, result));
-        componentResults[name] = normalizeComponentResult(result, component.weight);
-
-        if (result.available === false || result.score === null) {
-          missing.push({ name, reason: result.reason || 'Insufficient data' });
-        }
-      } catch (err) {
-        componentResults[name] = {
-          score: null,
-          direction: null,
-          weight: component.weight,
-          available: false,
-          confidence: null,
-          reason: err.message,
-        };
-        missing.push({ name, reason: err.message });
-      }
-    }
+    const { componentResults, missing } = executeComponents({
+      components: this._componentRegistry,
+      candles,
+      tf,
+      context,
+      diagnostics: this._lastDiagnostics,
+    });
 
     const overallScore = aggregateScore(componentResults);
     const bias = overallScore !== null ? this._classifyBias(overallScore) : 'Neutral';
