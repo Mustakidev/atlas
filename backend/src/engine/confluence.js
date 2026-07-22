@@ -13,6 +13,7 @@
 const { getFinalizedCandles } = require('./candleUtils');
 const { classifyBias } = require('./biasClassifier');
 const { calculateConfidence } = require('./confidenceCalculator');
+const { aggregateScore } = require('./scoreAggregator');
 const ENGINE_VERSION = '1.0.0';
 const MIN_CANDLES = 15;
 
@@ -57,8 +58,6 @@ class ConfluenceEngine {
     const context = { analysis, analyzerTf, tf };
 
     const componentResults = {};
-    let totalWeight = 0;
-    let weightedScoreSum = 0;
     const missing = [];
 
     for (const [name, component] of this.components) {
@@ -73,10 +72,7 @@ class ConfluenceEngine {
           reason: result.reason || null,
         };
 
-        if (result.available !== false && result.score !== null) {
-          totalWeight += component.weight;
-          weightedScoreSum += result.score * component.weight;
-        } else {
+        if (result.available === false || result.score === null) {
           missing.push({ name, reason: result.reason || 'Insufficient data' });
         }
       } catch (err) {
@@ -92,7 +88,7 @@ class ConfluenceEngine {
       }
     }
 
-    const overallScore = totalWeight > 0 ? Math.round(weightedScoreSum / totalWeight) : null;
+    const overallScore = aggregateScore(componentResults);
     const bias = overallScore !== null ? this._classifyBias(overallScore) : 'Neutral';
     const confidence = this._computeConfidence(componentResults, missing);
 
