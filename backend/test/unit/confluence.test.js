@@ -400,3 +400,43 @@ test('[registry] preserves component and missing response order', () => {
     { name: 'second', reason: 'second missing' },
   ]);
 });
+
+test('[normalization] preserves raw zero score eligibility and zero confidence fallback', () => {
+  const engine = createEngine();
+  engine.clearComponents();
+  engine.registerComponent('zero', {
+    weight: 1,
+    calculate: () => ({ score: 0, available: true, confidence: 0 }),
+  });
+
+  const result = engine.calculate(fresh(rangingCandles, 40), '1h');
+
+  assert.equal(result.score, 0);
+  assert.equal(result.components.zero.score, 0);
+  assert.equal(result.components.zero.confidence, null);
+  assert.deepEqual(result.missing, []);
+});
+
+test('[normalization] preserves undefined score, NaN score, empty reason, and missing direction behavior', () => {
+  const engine = createEngine();
+  engine.clearComponents();
+  engine.registerComponent('undefinedScore', {
+    weight: 0.5,
+    calculate: () => ({ score: undefined, available: true }),
+  });
+  engine.registerComponent('nanScore', {
+    weight: 0.5,
+    calculate: () => ({ score: NaN, available: false, reason: '' }),
+  });
+
+  const result = engine.calculate(fresh(rangingCandles, 40), '1h');
+
+  assert.ok(Object.hasOwn(result.components.undefinedScore, 'score'));
+  assert.equal(result.components.undefinedScore.score, undefined);
+  assert.ok(Number.isNaN(result.components.nanScore.score));
+  assert.ok(Object.hasOwn(result.components.undefinedScore, 'direction'));
+  assert.equal(result.components.undefinedScore.direction, undefined);
+  assert.equal(result.components.nanScore.reason, null);
+  assert.deepEqual(result.missing, [{ name: 'nanScore', reason: 'Insufficient data' }]);
+  assert.ok(Number.isNaN(result.score));
+});

@@ -15,6 +15,7 @@ const { classifyBias } = require('./biasClassifier');
 const { calculateConfidence } = require('./confidenceCalculator');
 const { aggregateScore } = require('./scoreAggregator');
 const { ComponentRegistry } = require('./componentRegistry');
+const { normalizeComponentResult } = require('./componentNormalizer');
 const ENGINE_VERSION = '1.0.0';
 const MIN_CANDLES = 15;
 
@@ -64,14 +65,7 @@ class ConfluenceEngine {
     for (const [name, component] of this._componentRegistry) {
       try {
         const result = component.calculate(candles, tf, context);
-        componentResults[name] = {
-          score: result.score,
-          direction: result.direction,
-          weight: component.weight,
-          available: result.available !== false,
-          confidence: result.confidence || null,
-          reason: result.reason || null,
-        };
+        componentResults[name] = normalizeComponentResult(result, component.weight);
 
         if (result.available === false || result.score === null) {
           missing.push({ name, reason: result.reason || 'Insufficient data' });
