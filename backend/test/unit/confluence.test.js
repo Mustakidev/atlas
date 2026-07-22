@@ -58,8 +58,8 @@ function createEngine({ analysis, structureResult, rsiResult, componentError } =
 
 function createControlledScoreEngine(score) {
   const engine = createEngine();
-  for (const component of engine.components.values()) {
-    component.calculate = () => ({ score, direction: 'neutral', available: true, confidence: 80 });
+  for (const name of Object.keys(EXPECTED_WEIGHTS)) {
+    engine.getComponent(name).calculate = () => ({ score, direction: 'neutral', available: true, confidence: 80 });
   }
   return engine;
 }
@@ -339,4 +339,64 @@ test('[aggregation] preserves current weights, response invariants, and determin
   const second = engine.calculate(candles, '1h');
   assertResponseShape(first);
   assert.deepEqual(stableResult(first), stableResult(second));
+});
+
+test('[registry] preserves the default component order and weights', () => {
+  const engine = createEngine();
+
+  assert.deepEqual(Object.keys(engine.getComponents()), [
+    'trend',
+    'structure',
+    'momentum',
+    'rsi',
+    'volatility',
+  ]);
+  assert.deepEqual(engine.getComponents(), {
+    trend: { weight: 0.30 },
+    structure: { weight: 0.25 },
+    momentum: { weight: 0.15 },
+    rsi: { weight: 0.15 },
+    volatility: { weight: 0.15 },
+  });
+});
+
+test('[registry] preserves engine registration and lookup façade behavior', () => {
+  const engine = createEngine();
+  const calculate = () => ({ score: 50, available: true, confidence: 80 });
+
+  assert.equal(engine.registerComponent('custom', { weight: 0.1, calculate }), engine);
+  assert.deepEqual(engine.getComponent('custom'), { weight: 0.1, calculate });
+  assert.equal(engine.getComponent('unknown'), null);
+  assert.deepEqual(engine.getComponents().custom, { weight: 0.1 });
+});
+
+test('[registry] clearComponents clears the registry and returns the engine', () => {
+  const engine = createEngine();
+
+  assert.equal(engine.clearComponents(), engine);
+  assert.deepEqual(engine.getComponents(), {});
+  assert.equal(engine.getInfo().componentCount, 0);
+  assert.equal(engine.registerComponent('afterClear', { weight: 1, calculate: () => ({}) }), engine);
+  assert.deepEqual(Object.keys(engine.getComponents()), ['afterClear']);
+});
+
+test('[registry] preserves component and missing response order', () => {
+  const engine = createEngine();
+  engine.clearComponents();
+  engine.registerComponent('first', {
+    weight: 0.5,
+    calculate: () => ({ score: null, available: false, reason: 'first missing' }),
+  });
+  engine.registerComponent('second', {
+    weight: 0.5,
+    calculate: () => ({ score: null, available: false, reason: 'second missing' }),
+  });
+
+  const result = engine.calculate(fresh(rangingCandles, 40), '1h');
+
+  assert.deepEqual(Object.keys(result.components), ['first', 'second']);
+  assert.deepEqual(result.missing, [
+    { name: 'first', reason: 'first missing' },
+    { name: 'second', reason: 'second missing' },
+  ]);
 });

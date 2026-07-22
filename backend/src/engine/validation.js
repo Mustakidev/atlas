@@ -3560,7 +3560,7 @@ class ValidationEngine {
     const { ConfluenceEngine } = require('./confluence');
     const engine = new ConfluenceEngine(mock);
 
-    engine.components.clear();
+    engine.clearComponents();
     for (const [name, data] of Object.entries(componentOverrides)) {
       engine.registerComponent(name, {
         weight: { trend: 0.30, structure: 0.25, momentum: 0.15, rsi: 0.15, volatility: 0.15 }[name],

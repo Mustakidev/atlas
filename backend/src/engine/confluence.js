@@ -14,6 +14,7 @@ const { getFinalizedCandles } = require('./candleUtils');
 const { classifyBias } = require('./biasClassifier');
 const { calculateConfidence } = require('./confidenceCalculator');
 const { aggregateScore } = require('./scoreAggregator');
+const { ComponentRegistry } = require('./componentRegistry');
 const ENGINE_VERSION = '1.0.0';
 const MIN_CANDLES = 15;
 
@@ -36,7 +37,7 @@ class ConfluenceEngine {
     this.calculationTime = 0;
     this.dataSource = 'MarketAnalyzer + IndicatorRegistry + StructureEngine + CandleEngine';
 
-    this.components = new Map();
+    this._componentRegistry = new ComponentRegistry();
     this._registerDefaults();
   }
 
@@ -60,7 +61,7 @@ class ConfluenceEngine {
     const componentResults = {};
     const missing = [];
 
-    for (const [name, component] of this.components) {
+    for (const [name, component] of this._componentRegistry) {
       try {
         const result = component.calculate(candles, tf, context);
         componentResults[name] = {
@@ -125,26 +126,25 @@ class ConfluenceEngine {
   }
 
   registerComponent(name, { weight, calculate }) {
-    if (this.components.has(name)) {
-      throw new Error(`Component '${name}' is already registered`);
-    }
-    if (typeof calculate !== 'function') {
-      throw new Error(`Component '${name}' must provide a calculate function`);
-    }
-    this.components.set(name, { weight, calculate });
+    this._componentRegistry.register(name, { weight, calculate });
     return this;
   }
 
   getComponent(name) {
-    return this.components.get(name) || null;
+    return this._componentRegistry.get(name);
   }
 
   getComponents() {
     const result = {};
-    for (const [name, comp] of this.components) {
+    for (const [name, comp] of this._componentRegistry) {
       result[name] = { weight: comp.weight };
     }
     return result;
+  }
+
+  clearComponents() {
+    this._componentRegistry.clear();
+    return this;
   }
 
   getInfo() {
@@ -154,7 +154,7 @@ class ConfluenceEngine {
       implemented: true,
       version: this.version,
       symbol: this.symbol,
-      componentCount: this.components.size,
+      componentCount: this._componentRegistry.size,
       components: this.getComponents(),
     };
   }
@@ -325,7 +325,7 @@ class ConfluenceEngine {
   }
 
   _computeConfidence(componentResults, missing) {
-    return calculateConfidence(componentResults, this.components.size);
+    return calculateConfidence(componentResults, this._componentRegistry.size);
   }
 
   // ---------------------------------------------------------------------------
