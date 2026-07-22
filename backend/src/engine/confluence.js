@@ -16,8 +16,13 @@ const { calculateConfidence } = require('./confidenceCalculator');
 const { aggregateScore } = require('./scoreAggregator');
 const { ComponentRegistry } = require('./componentRegistry');
 const { normalizeComponentResult } = require('./componentNormalizer');
+const { inspectDefinition, inspectResult } = require('./componentValidator');
 const ENGINE_VERSION = '1.0.0';
 const MIN_CANDLES = 15;
+
+function extractComponentDefinition({ weight, calculate }) {
+  return { weight, calculate };
+}
 
 const TF_MAP = {
   '24H': '24h', '12H': '12h', '4H': '4h', '1H': '1h',
@@ -37,6 +42,7 @@ class ConfluenceEngine {
     this.lastUpdated = null;
     this.calculationTime = 0;
     this.dataSource = 'MarketAnalyzer + IndicatorRegistry + StructureEngine + CandleEngine';
+    this._lastDiagnostics = [];
 
     this._componentRegistry = new ComponentRegistry();
     this._registerDefaults();
@@ -48,6 +54,7 @@ class ConfluenceEngine {
 
   calculate(candles, tf) {
     const start = Date.now();
+    this._lastDiagnostics = [];
 
     if (!candles || candles.length < MIN_CANDLES) {
       this.calculationTime = Date.now() - start;
@@ -65,6 +72,7 @@ class ConfluenceEngine {
     for (const [name, component] of this._componentRegistry) {
       try {
         const result = component.calculate(candles, tf, context);
+        this._lastDiagnostics.push(...inspectResult(name, result));
         componentResults[name] = normalizeComponentResult(result, component.weight);
 
         if (result.available === false || result.score === null) {
@@ -119,7 +127,12 @@ class ConfluenceEngine {
     return results;
   }
 
-  registerComponent(name, { weight, calculate }) {
+  registerComponent(name, definition) {
+    this._lastDiagnostics = [];
+    this._lastDiagnostics.push(...inspectDefinition(name, definition));
+    const { weight, calculate } = definition === null || definition === undefined
+      ? extractComponentDefinition(definition)
+      : definition;
     this._componentRegistry.register(name, { weight, calculate });
     return this;
   }

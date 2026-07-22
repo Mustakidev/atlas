@@ -440,3 +440,54 @@ test('[normalization] preserves undefined score, NaN score, empty reason, and mi
   assert.deepEqual(result.missing, [{ name: 'nanScore', reason: 'Insufficient data' }]);
   assert.ok(Number.isNaN(result.score));
 });
+
+test('[validation] observes malformed definitions without changing registry errors', () => {
+  const engine = createEngine();
+
+  assert.throws(() => engine.registerComponent('invalid', { weight: 1, calculate: null }), {
+    message: "Component 'invalid' must provide a calculate function",
+  });
+  assert.deepEqual(engine._lastDiagnostics.map(({ code, severity, field, name }) => ({ code, severity, field, name })), [
+    { code: 'COMPONENT_CALCULATE_INVALID', severity: 'ERROR', field: 'calculate', name: 'invalid' },
+  ]);
+
+  assert.throws(() => engine.registerComponent('null-definition', null), {
+    name: 'TypeError',
+    message: "Cannot destructure property 'weight' of 'object null' as it is null.",
+  });
+  assert.deepEqual(engine._lastDiagnostics.map(({ code, severity, field, name }) => ({ code, severity, field, name })), [
+    { code: 'COMPONENT_DEFINITION_INVALID', severity: 'ERROR', field: 'component', name: 'null-definition' },
+  ]);
+});
+
+test('[validation] observes raw results while preserving the public response and legacy values', () => {
+  const engine = createEngine();
+  engine.clearComponents();
+  engine.registerComponent('legacy', {
+    weight: 1,
+    calculate: () => ({ score: undefined, available: true }),
+  });
+
+  const result = engine.calculate(fresh(rangingCandles, 40), '1h');
+
+  assert.deepEqual(Object.keys(result).sort(), [
+    'bias', 'calculatedAt', 'calculationTime', 'candleCount', 'components',
+    'confidence', 'dataSource', 'engineVersion', 'lastUpdated', 'missing',
+    'score', 'timeframe', 'timestamp',
+  ]);
+  assert.ok(Number.isNaN(result.score));
+  assert.deepEqual(result.components.legacy, {
+    score: undefined,
+    direction: undefined,
+    weight: 1,
+    available: true,
+    confidence: null,
+    reason: null,
+  });
+  assert.deepEqual(result.missing, []);
+  assert.deepEqual(engine._lastDiagnostics.map(({ code, severity, field, name }) => ({ code, severity, field, name })), [
+    { code: 'RESULT_SCORE_MISSING', severity: 'WARNING', field: 'score', name: 'legacy' },
+    { code: 'RESULT_DIRECTION_MISSING', severity: 'INFO', field: 'direction', name: 'legacy' },
+    { code: 'RESULT_CONFIDENCE_MISSING', severity: 'INFO', field: 'confidence', name: 'legacy' },
+  ]);
+});
