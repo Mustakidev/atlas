@@ -12,6 +12,7 @@
  */
 const { getFinalizedCandles } = require('./candleUtils');
 const { classifyBias } = require('./biasClassifier');
+const { calculateConfidence } = require('./confidenceCalculator');
 const ENGINE_VERSION = '1.0.0';
 const MIN_CANDLES = 15;
 
@@ -328,20 +329,7 @@ class ConfluenceEngine {
   }
 
   _computeConfidence(componentResults, missing) {
-    const available = [];
-    for (const [name, result] of Object.entries(componentResults)) {
-      if (result.available && result.confidence !== null) {
-        available.push(result.confidence);
-      }
-    }
-
-    if (available.length === 0) return 0;
-
-    const avgConfidence = available.reduce((a, b) => a + b, 0) / available.length;
-    const totalCount = this.components.size;
-    const coveragePenalty = available.length / totalCount;
-
-    return Math.round(avgConfidence * coveragePenalty);
+    return calculateConfidence(componentResults, this.components.size);
   }
 
   // ---------------------------------------------------------------------------
