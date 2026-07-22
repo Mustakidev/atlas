@@ -18,6 +18,7 @@ const { ComponentRegistry } = require('./componentRegistry');
 const { inspectDefinition } = require('./componentValidator');
 const { createDefaultComponents } = require('./defaultComponentScorers');
 const { executeComponents } = require('./componentExecution');
+const { buildConfluenceResponse } = require('./confluenceResponseBuilder');
 const ENGINE_VERSION = '1.0.0';
 const MIN_CANDLES = 15;
 
@@ -82,7 +83,8 @@ class ConfluenceEngine {
     this.calculationTime = Date.now() - start;
     this.lastUpdated = new Date().toISOString();
 
-    return {
+    const calculatedAt = new Date().toISOString();
+    return buildConfluenceResponse({
       timeframe: tf,
       candleCount: candles.length,
       score: overallScore,
@@ -91,12 +93,12 @@ class ConfluenceEngine {
       components: componentResults,
       missing,
       timestamp: candles[candles.length - 1].timestamp,
-      calculatedAt: new Date().toISOString(),
+      calculatedAt,
       engineVersion: this.version,
       lastUpdated: this.lastUpdated,
       calculationTime: this.calculationTime,
       dataSource: this.dataSource,
-    };
+    });
   }
 
   calculateAll(limit) {
