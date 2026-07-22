@@ -17,6 +17,7 @@ const { aggregateScore } = require('./scoreAggregator');
 const { ComponentRegistry } = require('./componentRegistry');
 const { normalizeComponentResult } = require('./componentNormalizer');
 const { inspectDefinition, inspectResult } = require('./componentValidator');
+const { createDefaultComponents } = require('./defaultComponentScorers');
 const ENGINE_VERSION = '1.0.0';
 const MIN_CANDLES = 15;
 
@@ -171,153 +172,14 @@ class ConfluenceEngine {
   // ---------------------------------------------------------------------------
 
   _registerDefaults() {
-    this.registerComponent('trend', {
-      weight: 0.30,
-      calculate: (candles, tf, ctx) => this._scoreTrend(candles, tf, ctx),
+    const components = createDefaultComponents({
+      structureEngine: this.structureEngine,
+      indicatorRegistry: this.indicatorRegistry,
     });
 
-    this.registerComponent('structure', {
-      weight: 0.25,
-      calculate: (candles, tf, ctx) => this._scoreStructure(candles, tf, ctx),
-    });
-
-    this.registerComponent('momentum', {
-      weight: 0.15,
-      calculate: (candles, tf, ctx) => this._scoreMomentum(candles, tf, ctx),
-    });
-
-    this.registerComponent('rsi', {
-      weight: 0.15,
-      calculate: (candles, tf, ctx) => this._scoreRSI(candles, tf, ctx),
-    });
-
-    this.registerComponent('volatility', {
-      weight: 0.15,
-      calculate: (candles, tf, ctx) => this._scoreVolatility(candles, tf, ctx),
-    });
-  }
-
-  // ---------------------------------------------------------------------------
-  // Component scoring functions
-  // ---------------------------------------------------------------------------
-
-  _scoreTrend(candles, tf, ctx) {
-    const analysis = ctx.analysis;
-    if (!analysis || !analysis.trend) {
-      return { score: null, direction: null, available: false, reason: 'No analysis data' };
+    for (const { name, weight, calculate } of components) {
+      this.registerComponent(name, { weight, calculate });
     }
-
-    const trendVal = analysis.trend[ctx.analyzerTf];
-    const confVal = analysis.confidence ? analysis.confidence[ctx.analyzerTf] || 0 : 0;
-
-    if (!trendVal) {
-      return { score: null, direction: null, available: false, reason: `No trend data for ${ctx.analyzerTf}` };
-    }
-
-    let score;
-    if (trendVal === 'Bullish') {
-      score = 65 + Math.min(confVal * 0.35, 35);
-    } else if (trendVal === 'Bearish') {
-      score = 35 - Math.min(confVal * 0.35, 35);
-    } else {
-      score = 50;
-    }
-
-    return {
-      score: Math.round(Math.max(0, Math.min(100, score))),
-      direction: trendVal.toLowerCase(),
-      available: true,
-      confidence: confVal,
-    };
-  }
-
-  _scoreStructure(candles, tf, ctx) {
-    const result = this.structureEngine.calculate(candles);
-
-    if (!result.ready) {
-      return { score: null, direction: null, available: false, reason: result.reason };
-    }
-
-    return {
-      score: result.score,
-      direction: result.direction,
-      available: true,
-      confidence: result.confidence,
-    };
-  }
-
-  _scoreMomentum(candles, tf, ctx) {
-    const analysis = ctx.analysis;
-    if (!analysis || !analysis.momentum) {
-      return { score: null, direction: null, available: false, reason: 'No analysis data' };
-    }
-
-    const momVal = analysis.momentum[ctx.analyzerTf];
-    if (momVal === undefined || momVal === null) {
-      return { score: null, direction: null, available: false, reason: `No momentum data for ${ctx.analyzerTf}` };
-    }
-
-    let direction = 'neutral';
-    if (momVal > 55) direction = 'bullish';
-    else if (momVal < 45) direction = 'bearish';
-
-    return {
-      score: Math.round(Math.max(0, Math.min(100, momVal))),
-      direction,
-      available: true,
-      confidence: analysis.confidence ? analysis.confidence[ctx.analyzerTf] || 50 : 50,
-    };
-  }
-
-  _scoreRSI(candles, tf, ctx) {
-    const rsiIndicator = this.indicatorRegistry.get('RSI');
-    if (!rsiIndicator) {
-      return { score: null, direction: null, available: false, reason: 'RSI indicator not registered' };
-    }
-
-    const result = rsiIndicator.calculate(candles, tf);
-    if (!result.ready) {
-      return { score: null, direction: null, available: false, reason: result.reason || 'RSI not ready' };
-    }
-
-    let direction = 'neutral';
-    if (result.state === 'Overbought') direction = 'neutral';
-    else if (result.state === 'Oversold') direction = 'neutral';
-    else {
-      if (result.value > 55) direction = 'bullish';
-      else if (result.value < 45) direction = 'bearish';
-    }
-
-    return {
-      score: result.strength,
-      direction,
-      available: true,
-      confidence: result.confidence || 50,
-    };
-  }
-
-  _scoreVolatility(candles, tf, ctx) {
-    const analysis = ctx.analysis;
-    if (!analysis || !analysis.volatility) {
-      return { score: null, direction: null, available: false, reason: 'No analysis data' };
-    }
-
-    const volVal = analysis.volatility[ctx.analyzerTf];
-    if (!volVal) {
-      return { score: null, direction: null, available: false, reason: `No volatility data for ${ctx.analyzerTf}` };
-    }
-
-    let score;
-    if (volVal === 'Low') score = 85;
-    else if (volVal === 'Medium') score = 50;
-    else score = 15;
-
-    return {
-      score,
-      direction: null,
-      available: true,
-      confidence: analysis.confidence ? analysis.confidence[ctx.analyzerTf] || 50 : 50,
-    };
   }
 
   // ---------------------------------------------------------------------------
