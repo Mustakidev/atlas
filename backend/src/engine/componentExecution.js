@@ -11,10 +11,24 @@ function executeComponents({ components, candles, tf, context, diagnostics: diag
     try {
       const result = component.calculate(candles, tf, context);
       collectedDiagnostics.push(...inspectResult(name, result));
-      componentResults[name] = normalizeComponentResult(result, component.weight);
+      const normalized = normalizeComponentResult(result, component.weight);
+      const invalidScore = !Number.isFinite(result.score);
+      const invalidWeight = !Number.isFinite(component.weight) || component.weight < 0;
 
-      if (result.available === false || result.score === null) {
-        missing.push({ name, reason: result.reason || 'Insufficient data' });
+      if (invalidScore || invalidWeight) {
+        normalized.score = null;
+        normalized.available = false;
+      }
+
+      componentResults[name] = normalized;
+
+      if (result.available === false || result.score === null || invalidScore || invalidWeight) {
+        missing.push({
+          name,
+          reason: result.reason || (result.score === null
+            ? 'Insufficient data'
+            : (invalidScore ? 'Invalid score' : 'Invalid weight')),
+        });
       }
     } catch (err) {
       componentResults[name] = {

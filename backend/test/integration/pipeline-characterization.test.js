@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { createExecutionPipeline } = require('../../src/core/executionPipeline');
+const { ConfluenceEngine } = require('../../src/engine/confluence');
 const { bullishCandles } = require('../fixtures/market');
 const { fresh } = require('../helpers/fixtures');
 
@@ -81,6 +82,25 @@ function run(harness, price = 100) {
   return harness.pipeline.getLastDecision();
 }
 
+function malformedConfluenceEngine() {
+  const engine = new ConfluenceEngine({
+    analyzer: { getAnalysis: () => null },
+    indicatorRegistry: { get: () => null },
+    structureEngine: { calculate: () => ({ ready: false, reason: 'not ready' }) },
+    candleEngine: null,
+    logger: logger(),
+    config: config(),
+    symbol: 'BTCUSDT',
+  });
+
+  engine.clearComponents();
+  engine.registerComponent('malformed', {
+    weight: 1,
+    calculate: () => ({ score: NaN, direction: 'bullish', available: true, confidence: 80 }),
+  });
+  return engine;
+}
+
 test('preserves BUY and SELL execution decision fields', () => {
   const buy = createHarness();
   const buyDecision = run(buy);
@@ -103,6 +123,30 @@ test('preserves neutral rejection and gate fields', () => {
   assert.deepEqual(decision.gates.confluenceBias, { pass: false, value: 'Neutral', detail: 'Score 50 is between thresholds (35-65)' });
   assert.equal(decision.gates.mtfConfirmation.detail, 'Skipped (no direction)');
   assert.equal(decision.gates.advanceRisk.detail, 'Skipped (confluence is Neutral)');
+});
+
+test('malformed Confluence scores cannot open a paper trade', () => {
+  const harness = createHarness({ confluenceEngine: malformedConfluenceEngine() });
+  const decision = run(harness);
+
+  assert.deepEqual(decision.confluence, {
+    score: null,
+    bias: 'Neutral',
+    confidence: 0,
+    components: {
+      malformed: {
+        score: null,
+        direction: 'bullish',
+        weight: 1,
+        available: false,
+        confidence: 80,
+        reason: null,
+      },
+    },
+  });
+  assert.equal(decision.verdict.tradeOpened, false);
+  assert.equal(harness.state.signals.length, 0);
+  assert.match(decision.verdict.rejectionReason, /^Confluence bias:/);
 });
 
 test('preserves regime, MTF, advance-risk, and paper-trade rejection order', () => {

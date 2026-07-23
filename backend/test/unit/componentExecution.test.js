@@ -127,7 +127,8 @@ test('collects validator diagnostics before normalization and preserves their or
     ['second', 'RESULT_SCORE_NAN'],
   ]);
   assert.equal(result.componentResults.first.score, 101);
-  assert.ok(Number.isNaN(result.componentResults.second.score));
+  assert.equal(result.componentResults.second.score, null);
+  assert.equal(result.componentResults.second.available, false);
 });
 
 test('missing logic uses raw result values rather than normalized values', () => {
@@ -136,21 +137,63 @@ test('missing logic uses raw result values rather than normalized values', () =>
     ['raw-undefined', definition(1, () => ({ score: undefined, available: 0, reason: 'raw available value' }))],
   ]);
 
-  assert.deepEqual(result.missing, [{ name: 'raw-null', reason: 'raw null score' }]);
-  assert.equal(result.componentResults['raw-null'].available, true);
-  assert.equal(result.componentResults['raw-undefined'].available, true);
+  assert.deepEqual(result.missing, [
+    { name: 'raw-null', reason: 'raw null score' },
+    { name: 'raw-undefined', reason: 'raw available value' },
+  ]);
+  assert.equal(result.componentResults['raw-null'].available, false);
+  assert.equal(result.componentResults['raw-undefined'].available, false);
 });
 
-test('preserves undefined-score and NaN-score legacy behavior', () => {
+test('sanitizes undefined-score and NaN-score results', () => {
   const result = run([
     ['undefined-score', definition(0.5, () => ({ score: undefined, available: true }))],
     ['nan-score', definition(0.5, () => ({ score: NaN, available: false }))],
   ]);
 
   assert.ok(Object.hasOwn(result.componentResults['undefined-score'], 'score'));
-  assert.equal(result.componentResults['undefined-score'].score, undefined);
-  assert.ok(Number.isNaN(result.componentResults['nan-score'].score));
-  assert.deepEqual(result.missing, [{ name: 'nan-score', reason: 'Insufficient data' }]);
+  assert.equal(result.componentResults['undefined-score'].score, null);
+  assert.equal(result.componentResults['undefined-score'].available, false);
+  assert.equal(result.componentResults['nan-score'].score, null);
+  assert.equal(result.componentResults['nan-score'].available, false);
+  assert.deepEqual(result.missing, [
+    { name: 'undefined-score', reason: 'Invalid score' },
+    { name: 'nan-score', reason: 'Invalid score' },
+  ]);
+});
+
+test('sanitizes missing, infinite, negative-infinite, and nonnumeric scores', () => {
+  const cases = [
+    ['missing-score', () => ({ available: true }), 'RESULT_SCORE_MISSING'],
+    ['infinite-score', () => ({ score: Infinity, available: true }), 'RESULT_SCORE_INFINITE'],
+    ['negative-infinite-score', () => ({ score: -Infinity, available: true }), 'RESULT_SCORE_INFINITE'],
+    ['string-score', () => ({ score: '80', available: true }), 'RESULT_SCORE_NON_NUMERIC'],
+  ];
+
+  for (const [name, calculate, diagnosticCode] of cases) {
+    const result = run([[name, definition(1, calculate)]]);
+
+    assert.deepEqual(result.componentResults[name], {
+      score: null,
+      direction: undefined,
+      weight: 1,
+      available: false,
+      confidence: null,
+      reason: null,
+    });
+    assert.deepEqual(result.missing, [{ name, reason: 'Invalid score' }]);
+    assert.ok(result.diagnostics.some(diagnostic => diagnostic.name === name && diagnostic.code === diagnosticCode));
+  }
+});
+
+test('rejects invalid component weights without coercion', () => {
+  for (const weight of [null, undefined, NaN, Infinity, -Infinity, '1', -1]) {
+    const result = run([['invalid-weight', definition(weight, () => available())]]);
+
+    assert.equal(result.componentResults['invalid-weight'].score, null);
+    assert.equal(result.componentResults['invalid-weight'].available, false);
+    assert.deepEqual(result.missing, [{ name: 'invalid-weight', reason: 'Invalid weight' }]);
+  }
 });
 
 test('does not mutate the iterable, component definitions, or context', () => {

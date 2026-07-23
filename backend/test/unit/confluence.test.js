@@ -294,18 +294,26 @@ test('[aggregation] characterizes component error isolation', () => {
   });
 });
 
-test('[aggregation][legacy] documents undefined component score behavior without freezing NaN', t => {
-  const result = createEngine({
+test('[aggregation][safety] invalid component scores are unavailable and excluded', () => {
+  const engine = createEngine({
     structureResult: { ready: true, score: undefined, direction: 'bullish', confidence: 80 },
-  }).calculate(fresh(bullishCandles, 40), '1h');
-
-  if (!Number.isFinite(result.score)) {
-    // TODO: Fix the production undefined-score path before requiring a finite score here.
-    t.skip('Known legacy defect: undefined component scores currently produce NaN');
-    return;
-  }
+  });
+  const result = engine.calculate(fresh(bullishCandles, 40), '1h');
 
   assert.ok(Number.isFinite(result.score));
+  assert.equal(result.score, 79);
+  assert.equal(result.bias, 'Bullish');
+  assert.equal(result.confidence, 64);
+  assert.deepEqual(result.components.structure, {
+    score: null,
+    direction: 'bullish',
+    weight: 0.25,
+    available: false,
+    confidence: 80,
+    reason: null,
+  });
+  assert.deepEqual(result.missing, [{ name: 'structure', reason: 'Invalid score' }]);
+  assert.ok(engine._lastDiagnostics.some(({ name, code }) => name === 'structure' && code === 'RESULT_SCORE_MISSING'));
 });
 
 test('[aggregation] preserves threshold behavior immediately around bullish and bearish boundaries', () => {
@@ -417,7 +425,7 @@ test('[normalization] preserves raw zero score eligibility and zero confidence f
   assert.deepEqual(result.missing, []);
 });
 
-test('[normalization] preserves undefined score, NaN score, empty reason, and missing direction behavior', () => {
+test('[normalization][safety] invalid scores become unavailable without changing diagnostics', () => {
   const engine = createEngine();
   engine.clearComponents();
   engine.registerComponent('undefinedScore', {
@@ -432,13 +440,28 @@ test('[normalization] preserves undefined score, NaN score, empty reason, and mi
   const result = engine.calculate(fresh(rangingCandles, 40), '1h');
 
   assert.ok(Object.hasOwn(result.components.undefinedScore, 'score'));
-  assert.equal(result.components.undefinedScore.score, undefined);
-  assert.ok(Number.isNaN(result.components.nanScore.score));
+  assert.equal(result.components.undefinedScore.score, null);
+  assert.equal(result.components.undefinedScore.available, false);
+  assert.equal(result.components.nanScore.score, null);
+  assert.equal(result.components.nanScore.available, false);
   assert.ok(Object.hasOwn(result.components.undefinedScore, 'direction'));
   assert.equal(result.components.undefinedScore.direction, undefined);
   assert.equal(result.components.nanScore.reason, null);
-  assert.deepEqual(result.missing, [{ name: 'nanScore', reason: 'Insufficient data' }]);
-  assert.ok(Number.isNaN(result.score));
+  assert.deepEqual(result.missing, [
+    { name: 'undefinedScore', reason: 'Invalid score' },
+    { name: 'nanScore', reason: 'Invalid score' },
+  ]);
+  assert.equal(result.score, null);
+  assert.equal(result.bias, 'Neutral');
+  assert.equal(result.confidence, 0);
+  assert.deepEqual(result.components.undefinedScore, {
+    score: null,
+    direction: undefined,
+    weight: 0.5,
+    available: false,
+    confidence: null,
+    reason: null,
+  });
 });
 
 test('[validation] observes malformed definitions without changing registry errors', () => {
@@ -475,16 +498,18 @@ test('[validation] observes raw results while preserving the public response and
     'confidence', 'dataSource', 'engineVersion', 'lastUpdated', 'missing',
     'score', 'timeframe', 'timestamp',
   ]);
-  assert.ok(Number.isNaN(result.score));
+  assert.equal(result.score, null);
+  assert.equal(result.bias, 'Neutral');
+  assert.equal(result.confidence, 0);
   assert.deepEqual(result.components.legacy, {
-    score: undefined,
+    score: null,
     direction: undefined,
     weight: 1,
-    available: true,
+    available: false,
     confidence: null,
     reason: null,
   });
-  assert.deepEqual(result.missing, []);
+  assert.deepEqual(result.missing, [{ name: 'legacy', reason: 'Invalid score' }]);
   assert.deepEqual(engine._lastDiagnostics.map(({ code, severity, field, name }) => ({ code, severity, field, name })), [
     { code: 'RESULT_SCORE_MISSING', severity: 'WARNING', field: 'score', name: 'legacy' },
     { code: 'RESULT_DIRECTION_MISSING', severity: 'INFO', field: 'direction', name: 'legacy' },
