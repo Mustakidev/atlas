@@ -26,6 +26,7 @@ const { RegimeEngine } = require('./src/market-regime/RegimeEngine');
 const { RegimeDecisionEngine } = require('./src/market-regime/RegimeDecisionEngine');
 const { AdvanceRiskEngine } = require('./src/engine/advanceRisk');
 const { MTFConfirmationEngine } = require('./src/engine/mtfConfirmation');
+const { createValidationDependencies } = require('./src/engine/validationDependencies');
 const { createApp } = require('./src/app');
 const { createExecutionPipeline } = require('./src/core/executionPipeline');
 
@@ -73,7 +74,11 @@ const advanceRiskEngine = new AdvanceRiskEngine({ logger, symbol, paperTradeEngi
 const mtfConfirmationEngine = new MTFConfirmationEngine({ logger, symbol, config });
 const strategyReplayEngine = new StrategyReplayEngine({ logger, symbol, config, advanceRiskEngine, mtfConfirmationEngine });
 strategyReplayEngine.setRegimeEngine(regimeEngine);
-const validationEngine = new ValidationEngine({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, logger, symbol });
+const validationDependencyFactory = () => createValidationDependencies({ config, symbol });
+const validationEngine = new ValidationEngine({
+  ...validationDependencyFactory(),
+  dependencyFactory: validationDependencyFactory,
+});
 const executionPipeline = createExecutionPipeline({
   config,
   logger,
