@@ -38,14 +38,27 @@ test('preserves zero confidence as an available value', () => {
   assert.equal(calculateConfidence(availableResults([0]), 5), 0);
 });
 
-test('preserves null and undefined confidence handling', () => {
+test('preserves null confidence handling and ignores undefined confidence', () => {
   assert.equal(calculateConfidence({
     missing: { available: true, confidence: null },
     available: { available: true, confidence: 80 },
   }, 2), 40);
-  assert.ok(Number.isNaN(calculateConfidence({
+  assert.equal(calculateConfidence({
     missing: { available: true, confidence: undefined },
-  }, 1)));
+  }, 1), 0);
+});
+
+test('ignores non-finite and nonnumeric confidence values', () => {
+  const result = calculateConfidence({
+    valid: { available: true, confidence: 80 },
+    nan: { available: true, confidence: NaN },
+    positiveInfinity: { available: true, confidence: Infinity },
+    negativeInfinity: { available: true, confidence: -Infinity },
+    string: { available: true, confidence: '80' },
+  }, 5);
+
+  assert.equal(result, 16);
+  assert.ok(Number.isFinite(result));
 });
 
 test('reduces coverage when a dynamically registered component is unavailable', () => {

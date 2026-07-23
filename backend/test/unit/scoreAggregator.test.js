@@ -40,10 +40,27 @@ test('returns null when no component contributes to the score', () => {
   }), null);
 });
 
-test('preserves undefined score legacy behavior', () => {
-  assert.ok(Number.isNaN(aggregateScore({
+test('excludes invalid scores from the aggregate', () => {
+  for (const score of [undefined, null, NaN, Infinity, -Infinity, '80']) {
+    assert.equal(aggregateScore({
+      valid: { score: 80, weight: 0.5, available: true },
+      invalid: { score, weight: 0.5, available: true },
+    }), 80);
+  }
+
+  assert.equal(aggregateScore({
     undefinedScore: { score: undefined, weight: 1, available: true },
-  })));
+    stringScore: { score: '80', weight: 1, available: true },
+  }), null);
+});
+
+test('rejects invalid and non-finite weights without coercion', () => {
+  for (const weight of [null, undefined, NaN, Infinity, -Infinity, '1', -1]) {
+    assert.equal(aggregateScore({
+      valid: { score: 80, weight: 1, available: true },
+      invalidWeight: { score: 20, weight, available: true },
+    }), 80);
+  }
 });
 
 test('returns identical output for repeated identical input', () => {

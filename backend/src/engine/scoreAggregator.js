@@ -3,13 +3,24 @@ function aggregateScore(componentResults) {
   let weightedScoreSum = 0;
 
   for (const result of Object.values(componentResults)) {
-    if (result.available !== false && result.score !== null) {
-      totalWeight += result.weight;
-      weightedScoreSum += result.score * result.weight;
-    }
+    if (!result || result.available === false || !Number.isFinite(result.score)
+      || !Number.isFinite(result.weight) || result.weight < 0) continue;
+
+    const weightedScore = result.score * result.weight;
+    const nextTotalWeight = totalWeight + result.weight;
+    const nextWeightedScoreSum = weightedScoreSum + weightedScore;
+    if (!Number.isFinite(weightedScore)
+      || !Number.isFinite(nextTotalWeight)
+      || !Number.isFinite(nextWeightedScoreSum)) continue;
+
+    totalWeight = nextTotalWeight;
+    weightedScoreSum = nextWeightedScoreSum;
   }
 
-  return totalWeight > 0 ? Math.round(weightedScoreSum / totalWeight) : null;
+  if (totalWeight <= 0) return null;
+
+  const score = weightedScoreSum / totalWeight;
+  return Number.isFinite(score) ? Math.round(score) : null;
 }
 
 module.exports = { aggregateScore };
