@@ -30,7 +30,7 @@ class EMAIndicator extends Indicator {
     this._calculationTime = 0;
     this._dataSource = 'CandleEngine OHLCV candles (finalized only)';
 
-    // Cache: { [tf]: { [period]: { lastOpenTime, result } } }
+    // Retained as an empty compatibility surface for existing invalidate() callers.
     this._cache = Object.create(null);
   }
 
@@ -59,15 +59,6 @@ class EMAIndicator extends Indicator {
       return this._notReady('No candle data', tf, p, 0, timestamp);
     }
 
-    const lastOpenTime = candles[candles.length - 1].openTime;
-
-    // --- cache hit ---
-    if (tf && this._cache[tf] && this._cache[tf][p] &&
-        this._cache[tf][p].lastOpenTime === lastOpenTime) {
-      this._calculationTime = Date.now() - start;
-      return this._cache[tf][p].result;
-    }
-
     // --- guard: insufficient data ---
     const minCandles = p + 1;
     if (candles.length < minCandles) {
@@ -75,7 +66,6 @@ class EMAIndicator extends Indicator {
         `Insufficient candle data (${candles.length}/${minCandles})`,
         tf, p, candles.length, timestamp
       );
-      this._storeResult(tf, p, lastOpenTime, result);
       this._calculationTime = Date.now() - start;
       this._lastUpdated = new Date().toISOString();
       return result;
@@ -102,7 +92,6 @@ class EMAIndicator extends Indicator {
     // --- build result ---
     const result = this._buildResult(emaValue, trend, candles.length, p, tf, timestamp);
 
-    this._storeResult(tf, p, lastOpenTime, result);
     this._calculationTime = Date.now() - start;
     this._lastUpdated = new Date().toISOString();
 
@@ -252,15 +241,6 @@ class EMAIndicator extends Indicator {
     };
   }
 
-  // ---------------------------------------------------------------------------
-  // Cache
-  // ---------------------------------------------------------------------------
-
-  _storeResult(tf, period, lastOpenTime, result) {
-    if (!tf) return;
-    if (!this._cache[tf]) this._cache[tf] = Object.create(null);
-    this._cache[tf][period] = { lastOpenTime, result };
-  }
 }
 
 module.exports = { EMAIndicator, DEFAULT_PERIODS, ENGINE_VERSION, DEFAULT_SYMBOL };
