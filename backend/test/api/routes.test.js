@@ -186,3 +186,39 @@ test('indicator route preserves per-indicator engine failure fallback', async ()
   assert.equal(result.body.indicators.Broken.result.signal, 'Error');
   assert.equal(result.body.indicators.Broken.result.error, 'deterministic failure');
 });
+
+test('GET /api/validation preserves the cached result contract and rerun flag', async () => {
+  const calls = [];
+  const validationResult = {
+    timestamp: '2024-01-01T00:00:00.000Z',
+    overall: 'PASS',
+    engines: {},
+    details: {},
+    engineVersion: '1.0.0',
+    lastUpdated: '2024-01-01T00:00:00.000Z',
+    calculationTime: 1,
+    dataSource: 'Isolated synthetic datasets (never production data)',
+  };
+  const validationEngine = {
+    runAll(forceRerun) {
+      calls.push(forceRerun);
+      return validationResult;
+    },
+  };
+
+  const cached = await dispatch('/validation', {}, { validationEngine });
+  const rerun = await dispatch('/validation', { rerun: 'true' }, { validationEngine });
+
+  assert.equal(cached.statusCode, 200);
+  assert.strictEqual(cached.body, validationResult);
+  assert.equal(rerun.statusCode, 200);
+  assert.strictEqual(rerun.body, validationResult);
+  assert.deepEqual(calls, [false, true]);
+});
+
+test('GET /api/validation returns 503 when the engine is unavailable', async () => {
+  const result = await dispatch('/validation');
+
+  assert.equal(result.statusCode, 503);
+  assert.equal(result.body.error, 'Validation engine not available');
+});

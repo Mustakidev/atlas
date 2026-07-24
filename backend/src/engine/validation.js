@@ -17,7 +17,7 @@ const TOLERANCE = 0.01;
 const SOFT_TOLERANCE = 5.0;
 
 class ValidationEngine {
-  constructor({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, logger, symbol }) {
+  constructor({ analyzer, indicatorRegistry, structureEngine, candleEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, logger, symbol, dependencyFactory }) {
     this.analyzer = analyzer;
     this.indicatorRegistry = indicatorRegistry;
     this.structureEngine = structureEngine;
@@ -33,6 +33,7 @@ class ValidationEngine {
     this.calculationTime = 0;
     this.dataSource = 'Isolated synthetic datasets (never production data)';
     this._cache = null;
+    this._dependencyFactory = typeof dependencyFactory === 'function' ? dependencyFactory : null;
   }
 
   // ---------------------------------------------------------------------------
@@ -42,6 +43,10 @@ class ValidationEngine {
   runAll(forceRerun) {
     if (this._cache && !forceRerun) {
       return this._cache;
+    }
+
+    if (this._dependencyFactory) {
+      this._replaceDependencies(this._dependencyFactory());
     }
 
     const start = Date.now();
@@ -98,6 +103,24 @@ class ValidationEngine {
     }
 
     return this._cache;
+  }
+
+  _replaceDependencies(dependencies) {
+    const dependencyKeys = [
+      'analyzer',
+      'indicatorRegistry',
+      'structureEngine',
+      'candleEngine',
+      'regimeEngine',
+      'regimeDecisionEngine',
+      'advanceRiskEngine',
+      'mtfConfirmationEngine',
+      'logger',
+    ];
+
+    for (const key of dependencyKeys) {
+      this[key] = dependencies[key];
+    }
   }
 
   getInfo() {
@@ -1162,6 +1185,11 @@ class ValidationEngine {
     const start = Date.now();
     const tests = [];
 
+    const calculate = (candles, tf) => {
+      this.candleEngine?.setValidationCandles?.(tf, candles);
+      return this.regimeEngine.calculate(candles, tf);
+    };
+
     if (!this.regimeEngine) {
       tests.push({ name: 'MarketRegime Skipped', status: 'WARNING', reason: 'RegimeEngine not provided', executionTime: 0 });
       return { tests, executionTime: Date.now() - start };
@@ -1169,7 +1197,7 @@ class ValidationEngine {
 
     tests.push(this._runTest('MarketRegime Always Returned', () => {
       const candles = this._makeCandles(30, (i) => 100 + i);
-      const result = this.regimeEngine.calculate(candles, 'val_1h');
+      const result = calculate(candles, 'val_1h');
       if (!result.regime) {
         return { status: 'FAIL', reason: 'Regime was not returned' };
       }
@@ -1178,7 +1206,7 @@ class ValidationEngine {
 
     tests.push(this._runTest('MarketRegime Confidence Range', () => {
       const candles = this._makeCandles(30, (i) => 100 + i);
-      const result = this.regimeEngine.calculate(candles, 'val_2h');
+      const result = calculate(candles, 'val_2h');
       if (result.confidence < 0 || result.confidence > 100) {
         return { status: 'FAIL', reason: `Confidence ${result.confidence} outside 0-100` };
       }
@@ -1187,7 +1215,7 @@ class ValidationEngine {
 
     tests.push(this._runTest('MarketRegime TrendScore Range', () => {
       const candles = this._makeCandles(30, (i) => 100 + Math.sin(i) * 10);
-      const result = this.regimeEngine.calculate(candles, 'val_3h');
+      const result = calculate(candles, 'val_3h');
       if (result.trendScore !== null && (result.trendScore < 0 || result.trendScore > 100)) {
         return { status: 'FAIL', reason: `TrendScore ${result.trendScore} outside 0-100` };
       }
@@ -1196,7 +1224,7 @@ class ValidationEngine {
 
     tests.push(this._runTest('MarketRegime No Undefined', () => {
       const c = this._makeCandles(30, (i) => 100 + Math.sin(i) * 5);
-      const r = this.regimeEngine.calculate(c, 'val_4h');
+      const r = calculate(c, 'val_4h');
       const check = (obj, path) => {
         for (const [k, v] of Object.entries(obj)) {
           if (v === undefined) return path ? `${path}.${k}` : k;
@@ -1214,8 +1242,8 @@ class ValidationEngine {
 
     tests.push(this._runTest('MarketRegime Determinism', () => {
       const c = this._makeCandles(60, (i) => 100 + Math.sin(i * 0.2) * 15);
-      const r1 = this.regimeEngine.calculate(c, 'val_5h');
-      const r2 = this.regimeEngine.calculate(c, 'val_5h');
+      const r1 = calculate(c, 'val_5h');
+      const r2 = calculate(c, 'val_5h');
       if (r1.regime !== r2.regime || r1.confidence !== r2.confidence) {
         return { status: 'FAIL', reason: `Non-deterministic: ${r1.regime}/${r1.confidence} vs ${r2.regime}/${r2.confidence}` };
       }
@@ -1224,7 +1252,7 @@ class ValidationEngine {
 
     tests.push(this._runTest('MarketRegime Insufficient Data', () => {
       const c = this._makeCandles(5, (i) => 100 + i);
-      const r = this.regimeEngine.calculate(c, 'val_8h');
+      const r = calculate(c, 'val_8h');
       if (r.regime !== 'UNKNOWN') {
         return { status: 'WARNING', reason: `Expected UNKNOWN with 5 candles, got ${r.regime}` };
       }
