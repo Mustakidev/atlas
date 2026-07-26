@@ -120,7 +120,7 @@ function createRouter(deps) {
     const confidence = rsiResult.ready
       ? Math.min(100, Math.round(50 + Math.max(0, finalized.length - 15) * 0.3))
       : null;
-    rsiResult.confidence = confidence;
+    const response = { ...rsiResult, confidence };
 
     // Log
     logger.info('RSI', `RSI Updated | ${tf} | ${rsiResult.ready ? rsiResult.value : 'N/A'} | ${duration}ms`);
@@ -128,7 +128,7 @@ function createRouter(deps) {
     res.json({
       timeframe: tf,
       candleCount: finalized.length,
-      rsi: rsiResult,
+      rsi: response,
     });
   });
 

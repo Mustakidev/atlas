@@ -36,6 +36,7 @@ class BollingerEngine {
     this.calculationTime = 0;
     this.dataSource = 'CandleEngine OHLCV candles (finalized only)';
 
+    // Retained as an empty compatibility surface for existing invalidate() callers.
     this._cache = Object.create(null);
   }
 
@@ -52,13 +53,6 @@ class BollingerEngine {
       this.calculationTime = Date.now() - start;
       this.lastUpdated = new Date().toISOString();
       return this._notReady(timeframe, finalized ? finalized.length : 0);
-    }
-
-    const lastOpenTime = finalized[finalized.length - 1].openTime;
-
-    if (this._cache[timeframe] && this._cache[timeframe].lastOpenTime === lastOpenTime) {
-      this.calculationTime = Date.now() - start;
-      return this._cache[timeframe].result;
     }
 
     const closes = new Array(finalized.length);
@@ -103,7 +97,6 @@ class BollingerEngine {
       dataSource: this.dataSource,
     };
 
-    this._cache[timeframe] = { lastOpenTime, result };
     return result;
   }
 

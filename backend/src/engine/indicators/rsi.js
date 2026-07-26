@@ -11,8 +11,7 @@
  * First average: SMA over `period` values.
  * Subsequent:    Wilder's smoothing — (prev * (period-1) + current) / period.
  *
- * Cache: results are cached per timeframe. Recalculation only occurs when
- * the last candle's openTime changes (i.e., a new candle has closed).
+ * Results are calculated from the supplied candle array on every call.
  */
 const { Indicator } = require('./base');
 
@@ -26,7 +25,7 @@ class RSIIndicator extends Indicator {
     this._period = RSI_PERIOD;
     this._symbol = symbol || 'BTCUSDT';
 
-    // Per-timeframe cache: { lastOpenTime, result }
+    // Retained as an empty compatibility surface for existing invalidate() callers.
     this._cache = Object.create(null);
   }
 
@@ -34,7 +33,7 @@ class RSIIndicator extends Indicator {
    * Calculate RSI from candle history.
    *
    * @param {Array} candles  - OHLCV objects sorted ascending by openTime
-   * @param {string} [tf]    - Timeframe key for caching (e.g. '1h')
+   * @param {string} [tf]    - Timeframe key (e.g. '1h')
    * @returns {Object}       - Structured RSI result
    */
   calculate(candles, tf) {
@@ -43,20 +42,12 @@ class RSIIndicator extends Indicator {
       return this._notReady('No candle data');
     }
 
-    const last = candles[candles.length - 1];
-    const lastOpenTime = last.openTime;
-
-    // --- cache hit ---
-    if (tf && this._cache[tf] && this._cache[tf].lastOpenTime === lastOpenTime) {
-      return this._cache[tf].result;
-    }
-
     // --- guard: insufficient data ---
     if (candles.length < MIN_CANDLES) {
-      const result = this._notReady('Insufficient candle history');
-      this._store(tf, lastOpenTime, result);
-      return result;
+      return this._notReady('Insufficient candle history');
     }
+
+    const last = candles[candles.length - 1];
 
     // --- extract close prices ---
     const closes = new Array(candles.length);
@@ -68,7 +59,6 @@ class RSIIndicator extends Indicator {
     const rsi = this._wilderRSI(closes);
     const result = this._buildResult(rsi, last);
 
-    this._store(tf, lastOpenTime, result);
     return result;
   }
 
@@ -199,13 +189,8 @@ class RSIIndicator extends Indicator {
   }
 
   // ---------------------------------------------------------------------------
-  // Cache
+  // Compatibility
   // ---------------------------------------------------------------------------
-
-  _store(tf, lastOpenTime, result) {
-    if (!tf) return;
-    this._cache[tf] = { lastOpenTime, result };
-  }
 
   /** Clear cache for a specific timeframe or all. */
   invalidate(tf) {

@@ -370,8 +370,9 @@ test('validation preserves actual production-like dependency state and route ana
   const analysisBefore = (await dispatch(router, '/analysis')).body;
   const stateBefore = captureProductionState(graph);
   assert.ok(stateBefore.analyzer);
-  assert.ok(Object.keys(stateBefore.rsiCache).length > 0);
-  assert.ok(Object.keys(stateBefore.emaCache).length > 0);
+  // Indicator result caching is intentionally disabled; compatibility caches stay empty.
+  assert.equal(Object.keys(stateBefore.rsiCache).length, 0);
+  assert.equal(Object.keys(stateBefore.emaCache).length, 0);
   assert.equal(stateBefore.structure.result.ready, true);
   assert.ok(stateBefore.regime.result.regime);
   assert.ok(stateBefore.regimeDecision.result.reason);
