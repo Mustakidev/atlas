@@ -364,7 +364,7 @@ test('validation preserves actual production-like dependency state and route ana
   const graph = createProductionGraph();
   seedMarket(graph);
   seedPaperTrading(graph);
-  graph.mtfConfirmationEngine.evaluate({ direction: 'BUY', aggressive: true, timeframes: bullishTimeframes() });
+  const aggressiveMtfResult = graph.mtfConfirmationEngine.evaluate({ direction: 'BUY', aggressive: true, timeframes: bullishTimeframes() });
 
   const router = createRoute(graph);
   const analysisBefore = (await dispatch(router, '/analysis')).body;
@@ -377,7 +377,8 @@ test('validation preserves actual production-like dependency state and route ana
   assert.ok(stateBefore.regime.result.regime);
   assert.ok(stateBefore.regimeDecision.result.reason);
   assert.ok(stateBefore.candles.candles.length > 0);
-  assert.equal(stateBefore.mtf.aggressive, true);
+  assert.equal(aggressiveMtfResult.aggressive, true);
+  assert.equal(stateBefore.mtf.aggressive, false);
   assert.ok(stateBefore.paperTrading.balance > 10000);
   assert.equal(stateBefore.paperTrading.open.length, 1);
   assert.equal(stateBefore.paperTrading.history.length, 1);

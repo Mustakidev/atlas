@@ -18,6 +18,9 @@ class MTFConfirmationEngine {
   evaluate(params) {
     const start = Date.now();
     const { direction, timeframe, aggressive, timeframes } = params || {};
+    // Omitted mode preserves the legacy setter configuration; explicit values
+    // apply only to this evaluation and never update that configuration.
+    const effectiveAggressive = aggressive === undefined ? this._aggressive : aggressive === true;
 
     const result = {
       mtfAllowed: false,
@@ -28,7 +31,7 @@ class MTFConfirmationEngine {
       timeframes: {},
       alignment: {},
       confidence: 0,
-      aggressive: this._aggressive,
+      aggressive: effectiveAggressive,
       blockedBy: [],
       confirmedBy: [],
       alignmentScore: 0,
@@ -45,9 +48,6 @@ class MTFConfirmationEngine {
       this.lastUpdated = new Date().toISOString();
       return result;
     }
-
-    if (aggressive === true) this._aggressive = true;
-    result.aggressive = this._aggressive;
 
     const frameData = timeframes || {};
     const availableTFs = TIMEFRAMES_ORDERED.filter(tf => frameData[tf] && frameData[tf].confluence);
@@ -71,7 +71,7 @@ class MTFConfirmationEngine {
     result.confidence = this._computeConfidence(frameData, availableTFs, trends);
 
     // Evaluate alignment rules
-    const verdict = this._evaluateAlignment(direction, trends);
+    const verdict = this._evaluateAlignment(direction, trends, effectiveAggressive);
     result.mtfAllowed = verdict.allowed;
     result.rejectionReason = !verdict.allowed ? `MTF Confirmation: blocked by ${verdict.blockedBy.join('; ')}` : null;
     result.blockedBy = verdict.blockedBy;
@@ -120,7 +120,7 @@ class MTFConfirmationEngine {
     return Math.round(Math.max(0, Math.min(100, raw)));
   }
 
-  _evaluateAlignment(direction, trends) {
+  _evaluateAlignment(direction, trends, aggressive) {
     const isBuy = direction === 'BUY';
     const targetDir = isBuy ? 'Bullish' : 'Bearish';
     const oppDir = isBuy ? 'Bearish' : 'Bullish';
@@ -146,7 +146,7 @@ class MTFConfirmationEngine {
     if (check1m) { confirmedBy.push(`1m=${t1m}`); } else { blockedBy.push(`1m=${t1m} (does not confirm)`); }
 
     // Aggressive mode: allow if only 5m or 1m oppose, but both HTFs agree
-    if (this._aggressive && blockedBy.length > 0) {
+    if (aggressive && blockedBy.length > 0) {
       const htfOk = check15m && check1h;
       const onlyLowerBlock = blockedBy.every(b =>
         b.startsWith('1m=') || b.startsWith('5m=')
