@@ -19,11 +19,13 @@ const DEFAULT_PERIOD = 14;
 const MIN_CANDLES = DEFAULT_PERIOD + 1;
 
 class ATREngine {
-  constructor({ candleEngine, logger, symbol }) {
+  #period;
+
+  constructor({ candleEngine, logger, symbol, period = DEFAULT_PERIOD }) {
+    this.#period = validatePeriod(period);
     this.candleEngine = candleEngine;
     this.logger = logger;
     this.symbol = symbol || DEFAULT_SYMBOL;
-    this.period = DEFAULT_PERIOD;
     this.version = ENGINE_VERSION;
     this.lastUpdated = null;
     this.calculationTime = 0;
@@ -32,6 +34,8 @@ class ATREngine {
     // Retained as an empty compatibility surface for existing invalidate() callers.
     this._cache = Object.create(null);
   }
+
+  get period() { return this.#period; }
 
   // ---------------------------------------------------------------------------
   // Public API
@@ -42,7 +46,7 @@ class ATREngine {
 
     const finalized = getFinalizedCandles(this.candleEngine, timeframe, limit);
 
-    if (!finalized || finalized.length < MIN_CANDLES) {
+    if (!finalized || finalized.length < this.period + 1) {
       this.calculationTime = Date.now() - start;
       this.lastUpdated = new Date().toISOString();
       return this._notReady(timeframe, finalized ? finalized.length : 0);
@@ -103,7 +107,7 @@ class ATREngine {
       version: this.version,
       symbol: this.symbol,
       period: this.period,
-      minCandles: MIN_CANDLES,
+      minCandles: this.period + 1,
     };
   }
 
@@ -186,7 +190,7 @@ class ATREngine {
       atrPercentage: null,
       volatilityLevel: null,
       volatilityTrend: null,
-      reason: `Insufficient candle data (${candleCount}/${MIN_CANDLES})`,
+      reason: `Insufficient candle data (${candleCount}/${this.period + 1})`,
       candleCount,
       calculationTime: this.calculationTime,
       lastUpdated: this.lastUpdated,
@@ -194,6 +198,13 @@ class ATREngine {
       dataSource: this.dataSource,
     };
   }
+}
+
+function validatePeriod(period) {
+  if (!Number.isFinite(period) || !Number.isInteger(period) || period <= 0) {
+    throw new TypeError('ATR period must be a finite positive integer');
+  }
+  return period;
 }
 
 module.exports = { ATREngine, ENGINE_VERSION, DEFAULT_PERIOD, MIN_CANDLES, DEFAULT_SYMBOL };
