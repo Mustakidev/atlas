@@ -1,28 +1,35 @@
-const REGIMES = {
+function deepFreeze(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+
+  for (const nested of Object.values(value)) deepFreeze(nested);
+  return Object.freeze(value);
+}
+
+const REGIMES = deepFreeze({
   TRENDING_BULL: 'TRENDING_BULL',
   TRENDING_BEAR: 'TRENDING_BEAR',
   RANGING: 'RANGING',
   HIGH_VOLATILITY: 'HIGH_VOLATILITY',
   LOW_VOLATILITY: 'LOW_VOLATILITY',
   UNKNOWN: 'UNKNOWN',
-};
+});
 
-const REGIME_DESCRIPTIONS = {
+const REGIME_DESCRIPTIONS = deepFreeze({
   TRENDING_BULL: 'Sustained upward movement with strong bullish structure',
   TRENDING_BEAR: 'Sustained downward movement with strong bearish structure',
   RANGING: 'Sideways price action with no clear direction',
   HIGH_VOLATILITY: 'Elevated price volatility exceeding normal ranges',
   LOW_VOLATILITY: 'Suppressed price volatility indicating consolidation',
   UNKNOWN: 'Insufficient data to determine market regime',
-};
+});
 
-const REGIME_THRESHOLDS = {
+const REGIME_THRESHOLDS = deepFreeze({
   TREND_BULL_MIN_SCORE: 60,
   TREND_BEAR_MAX_SCORE: 40,
   RANGE_CONFIDENCE_MIN: 55,
   HIGH_VOL_ATR_PCT: 3.0,
   LOW_VOL_ATR_PCT: 1.0,
-};
+});
 
 function isTrending(regime) {
   return regime === REGIMES.TRENDING_BULL || regime === REGIMES.TRENDING_BEAR;
