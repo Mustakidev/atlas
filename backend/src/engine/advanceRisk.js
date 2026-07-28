@@ -244,6 +244,22 @@ class AdvanceRiskEngine {
     };
   }
 
+  getPolicy() {
+    return {
+      accountBalance: this._accountBalance,
+      riskPerTradePct: this._riskPerTradePct,
+      atrMultTrending: this._atrMultTrending,
+      atrMultRanging: this._atrMultRanging,
+      rrTrending: this._rrTrending,
+      rrRanging: this._rrRanging,
+      maxDailyLossPct: this._maxDailyLossPct,
+      maxDailyDrawdownPct: this._maxDailyDrawdownPct,
+      maxConsecutiveLosses: this._maxConsecutiveLosses,
+      cooldownMs: this._cooldownMs,
+      sessionMultipliers: { ...this._sessionMultipliers },
+    };
+  }
+
   setAccountBalance(val) { if (val > 0) this._accountBalance = val; }
   setRiskPerTradePct(val) { if (val > 0 && val <= 100) this._riskPerTradePct = val; }
   setMaxDailyLossPct(val) { if (val > 0 && val <= 100) this._maxDailyLossPct = val; }

@@ -27,28 +27,27 @@ const { StructureEngine } = require('./structure');
 const { MACDEngine } = require('./macd');
 const { ATREngine } = require('./atr');
 const { BollingerEngine } = require('./bollinger');
-const { RiskEngine } = require('./risk');
 const { AdvanceRiskEngine } = require('./advanceRisk');
 const { RegimeEngine } = require('../market-regime/RegimeEngine');
 const { RegimeDecisionEngine } = require('../market-regime/RegimeDecisionEngine');
+const { MTFConfirmationEngine } = require('./mtfConfirmation');
 
 class StrategyReplayEngine {
-  constructor({ logger, symbol, config, advanceRiskEngine, mtfConfirmationEngine }) {
+  constructor({ logger, symbol, config, advanceRiskEngine, riskPolicySource, mtfConfirmationEngine }) {
     this.logger = logger;
     this.symbol = symbol || DEFAULT_SYMBOL;
+    this.config = config;
     this.version = ENGINE_VERSION;
     this.lastUpdated = null;
     this.calculationTime = 0;
     this.dataSource = 'Historical OHLCV candles (strategy replay)';
     this._bullishThreshold = config?.get?.('CONFLUENCE_BULLISH_THRESHOLD') || BULLISH_THRESHOLD;
     this._bearishThreshold = config?.get?.('CONFLUENCE_BEARISH_THRESHOLD') || BEARISH_THRESHOLD;
-    this._advanceRiskEngine = advanceRiskEngine;
-    this._mtfConfirmationEngine = mtfConfirmationEngine;
-    this._regimeEngine = null;
+    this._riskPolicySource = riskPolicySource || advanceRiskEngine || null;
   }
 
-  setRegimeEngine(engine) {
-    this._regimeEngine = engine;
+  setRegimeEngine() {
+    // Replay creates regime dependencies from the replay candles per step.
   }
 
   // ---------------------------------------------------------------------------
@@ -70,6 +69,7 @@ class StrategyReplayEngine {
     const trades = [];
     const rejections = [];
     const regimeHistory = [];
+    const { advanceRiskEngine, mtfConfirmationEngine } = this._createReplayDependencies();
     let tradeCounter = 0;
     let openTrade = null;
 
@@ -153,36 +153,17 @@ class StrategyReplayEngine {
       const structureResult = this._runStructure(window);
       const analyzerOutput = this._synthesizeAnalyzer(window);
 
-      let riskResult;
-      if (this._advanceRiskEngine) {
-        let regime = null;
-        if (this._regimeEngine) {
-          const r = this._regimeEngine.calculate(window, tf);
-          regime = r.regime;
-        }
-        riskResult = this._advanceRiskEngine.evaluate({
-          symbol: this.symbol,
-          timeframe: tf,
-          entryPrice: price,
-          atr: atr || { ready: false, atr: null, atrPercentage: 0 },
-          direction: signalDirection,
-          trend: analyzerOutput,
-          structure: structureResult,
-          confluence,
-          regime,
-        });
-      } else {
-        riskResult = new RiskEngine({ logger: this.logger, symbol: this.symbol }).evaluate({
-          symbol: this.symbol,
-          timeframe: tf,
-          entryPrice: price,
-          atr: atr || { ready: false, atr: null, atrPercentage: 0 },
-          direction: signalDirection,
-          trend: analyzerOutput,
-          structure: structureResult,
-          confluence,
-        });
-      }
+      const riskResult = advanceRiskEngine.evaluate({
+        symbol: this.symbol,
+        timeframe: tf,
+        entryPrice: price,
+        atr: atr || { ready: false, atr: null, atrPercentage: 0 },
+        direction: signalDirection,
+        trend: analyzerOutput,
+        structure: structureResult,
+        confluence,
+        regime: marketRegime.regime,
+      });
 
       if (!riskResult.tradeAllowed) {
         rejections.push({
@@ -196,7 +177,7 @@ class StrategyReplayEngine {
       }
 
       // MTF Confirmation check
-      if (this._mtfConfirmationEngine && signalDirection) {
+      if (mtfConfirmationEngine && signalDirection) {
         const mtfTimeframes = {};
         const mtfTFs = ['1m', '5m', '15m', '1h'];
         for (const mtfTF of mtfTFs) {
@@ -208,9 +189,10 @@ class StrategyReplayEngine {
             };
           }
         }
-        const mtfResult = this._mtfConfirmationEngine.evaluate({
+        const mtfResult = mtfConfirmationEngine.evaluate({
           direction: signalDirection,
           timeframe: tf,
+          aggressive: false,
           timeframes: mtfTimeframes,
         });
         if (!mtfResult.mtfAllowed) {
@@ -346,6 +328,44 @@ class StrategyReplayEngine {
       version: this.version,
       symbol: this.symbol,
     };
+  }
+
+  _createReplayDependencies() {
+    return {
+      advanceRiskEngine: this._createReplayRiskEngine(),
+      mtfConfirmationEngine: new MTFConfirmationEngine({
+        logger: this.logger,
+        symbol: this.symbol,
+        config: this.config,
+      }),
+    };
+  }
+
+  _createReplayRiskEngine() {
+    const engine = new AdvanceRiskEngine({
+      logger: this.logger,
+      symbol: this.symbol,
+      paperTradeEngine: null,
+      config: this.config,
+    });
+    const policy = this._riskPolicySource?.getPolicy?.();
+    if (!policy) return engine;
+
+    engine.setAccountBalance(policy.accountBalance);
+    engine.setRiskPerTradePct(policy.riskPerTradePct);
+    engine.setAtrMultTrending(policy.atrMultTrending);
+    engine.setAtrMultRanging(policy.atrMultRanging);
+    engine.setRrTrending(policy.rrTrending);
+    engine.setRrRanging(policy.rrRanging);
+    engine.setMaxDailyLossPct(policy.maxDailyLossPct);
+    engine.setMaxDailyDrawdownPct(policy.maxDailyDrawdownPct);
+    engine.setMaxConsecutiveLosses(policy.maxConsecutiveLosses);
+    engine.setConsecutiveCooldownMs(policy.cooldownMs);
+    for (const [session, multiplier] of Object.entries(policy.sessionMultipliers || {})) {
+      engine.setSessionMultiplier(session, multiplier);
+    }
+    engine.resetDaily();
+    return engine;
   }
 
   // ---------------------------------------------------------------------------
