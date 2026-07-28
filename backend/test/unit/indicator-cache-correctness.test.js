@@ -157,12 +157,10 @@ test('current indicator parameters affect the next calculation without invalidat
   assert.deepEqual(withoutTiming(macdSecond), withoutTiming(macdExpectedEngine.calculate('1h', 60)));
 
   const atrCandles = mutableCandleEngine(variedDataset);
-  const atr = new ATREngine({ candleEngine: atrCandles, logger, symbol: 'BTCUSDT' });
+  const atr = new ATREngine({ candleEngine: atrCandles, logger, symbol: 'BTCUSDT', period: 5 });
   atr.calculate('1h', 60);
-  atr.period = 5;
   const atrSecond = atr.calculate('1h', 60);
-  const atrExpected = new ATREngine({ candleEngine: mutableCandleEngine(variedDataset), logger, symbol: 'BTCUSDT' });
-  atrExpected.period = 5;
+  const atrExpected = new ATREngine({ candleEngine: mutableCandleEngine(variedDataset), logger, symbol: 'BTCUSDT', period: 5 });
   assert.deepEqual(withoutTiming(atrSecond), withoutTiming(atrExpected.calculate('1h', 60)));
 
   const bollingerCandles = mutableCandleEngine(variedDataset);
