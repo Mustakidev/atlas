@@ -72,8 +72,7 @@ const regimeEngine = new RegimeEngine({ indicatorRegistry, atrEngine, candleEngi
 const regimeDecisionEngine = new RegimeDecisionEngine({ logger, symbol });
 const advanceRiskEngine = new AdvanceRiskEngine({ logger, symbol, paperTradeEngine, config });
 const mtfConfirmationEngine = new MTFConfirmationEngine({ logger, symbol, config });
-const strategyReplayEngine = new StrategyReplayEngine({ logger, symbol, config, advanceRiskEngine, mtfConfirmationEngine });
-strategyReplayEngine.setRegimeEngine(regimeEngine);
+const strategyReplayEngine = new StrategyReplayEngine({ logger, symbol, config, riskPolicySource: advanceRiskEngine });
 const validationDependencyFactory = () => createValidationDependencies({ config, symbol });
 const validationEngine = new ValidationEngine({
   ...validationDependencyFactory(),
