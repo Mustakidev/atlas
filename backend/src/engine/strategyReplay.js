@@ -244,9 +244,13 @@ class StrategyReplayEngine {
       }
 
       tradeCounter++;
-      const levels = this._computeLevels(price, signalDirection, atr);
-      const riskSize = Math.abs(price - levels.stopLoss);
-      const positionSize = riskSize > 0 ? this._round(100 / riskSize) : 0;
+      const riskSize = riskResult.riskPerUnit;
+      const levels = {
+        stopLoss: riskResult.stopLoss,
+        takeProfit: riskResult.takeProfit,
+        riskReward: riskResult.riskReward,
+      };
+      const positionSize = riskResult.positionSize;
 
       const regimeDecision = this._runRegimeDecision(marketRegime, signalDirection, confluence.score);
 

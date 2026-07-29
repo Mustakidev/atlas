@@ -214,6 +214,26 @@ test('risk policy values are copied without copying live business state', () => 
   });
 });
 
+test('replay trades use the approved AdvanceRisk execution plan', () => {
+  const source = new AdvanceRiskEngine({ logger, symbol: 'BTCUSDT', paperTradeEngine: {}, config });
+  source.setAccountBalance(25000);
+  source.setRiskPerTradePct(2);
+  source.setAtrMultTrending(3);
+  source.setRrTrending(4);
+  for (const session of ['ASIAN', 'LONDON', 'NEW_YORK']) source.setSessionMultiplier(session, 2);
+
+  const { replay } = makeReplay({ riskPolicySource: source });
+  const result = replay.run(candles('up'), '1h');
+  const trade = result.trades[0];
+
+  assert.ok(trade);
+  assert.equal(trade.stopLoss, 147);
+  assert.equal(trade.takeProfit, 162);
+  assert.equal(trade.positionSize, 166.67);
+  assert.equal(trade.riskReward, 4);
+  assert.equal(trade.riskSize, 3);
+});
+
 test('replay exception does not contaminate subsequent replay or production risk state', () => {
   const liveRisk = new AdvanceRiskEngine({ logger, symbol: 'BTCUSDT', paperTradeEngine: {}, config });
   const { replay } = makeReplay({ riskPolicySource: liveRisk });

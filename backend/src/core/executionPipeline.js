@@ -303,7 +303,7 @@ function createExecutionPipeline({
     }
 
     const engines = { trend, structure: structureResult, rsi: rsiResult, ema: emaResult, macd: macdResult, atr, bollinger: bollingerResult, confluence, mtf: (() => { try { return mtfEngine.calculate(500); } catch (e) { return null; } })() };
-    const trade = safeExecute('PaperTrading', () => paperTradeEngine.signal(engines, price, tf, direction), null);
+    const trade = safeExecute('PaperTrading', () => paperTradeEngine.signal(engines, price, tf, direction, riskResult), null);
     if (trade) {
       lastSignalTime = now;
       decision.verdict.tradeOpened = true;

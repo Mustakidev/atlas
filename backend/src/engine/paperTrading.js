@@ -20,6 +20,8 @@ const DEFAULT_MAX_TRADES = 500;
 const INITIAL_BALANCE = 10000;
 const RISK_PER_TRADE_PCT = 1;
 
+const isFiniteNumber = (value) => typeof value === 'number' && Number.isFinite(value);
+
 const TRADE_STATES = {
   PENDING: 'PENDING',
   OPEN: 'OPEN',
@@ -58,7 +60,7 @@ class PaperTradingEngine {
   // Public API — Signal Processing
   // ---------------------------------------------------------------------------
 
-  signal(engines, currentPrice, timeframe, pipelineDirection) {
+  signal(engines, currentPrice, timeframe, pipelineDirection, executionPlan) {
     const start = Date.now();
 
     if (currentPrice == null || currentPrice <= 0) {
@@ -89,15 +91,28 @@ class PaperTradingEngine {
       return null;
     }
 
-    const { stopLoss, takeProfit } = this._computeLevels(
-      currentPrice, executionDirection, engines.atr, engines.bollinger
-    );
+    let stopLoss;
+    let takeProfit;
+    let riskReward;
+    let positionSize;
 
-    const risk = Math.abs(currentPrice - stopLoss);
-    const reward = Math.abs(takeProfit - currentPrice);
-    const riskReward = risk > 0 ? this._round(reward / risk) : 0;
-    const riskAmount = this._balance * (RISK_PER_TRADE_PCT / 100);
-    const positionSize = risk > 0 ? this._round(riskAmount / risk) : 0;
+    if (executionPlan !== undefined) {
+      if (!this._isValidExecutionPlan(executionPlan, currentPrice, executionDirection)) {
+        this.calculationTime = Date.now() - start;
+        return null;
+      }
+      ({ stopLoss, takeProfit, riskReward, positionSize } = executionPlan);
+    } else {
+      ({ stopLoss, takeProfit } = this._computeLevels(
+        currentPrice, executionDirection, engines.atr, engines.bollinger
+      ));
+
+      const risk = Math.abs(currentPrice - stopLoss);
+      const reward = Math.abs(takeProfit - currentPrice);
+      riskReward = risk > 0 ? this._round(reward / risk) : 0;
+      const riskAmount = this._balance * (RISK_PER_TRADE_PCT / 100);
+      positionSize = risk > 0 ? this._round(riskAmount / risk) : 0;
+    }
 
     const trade = this._openTrade({
       symbol: this.symbol,
@@ -105,8 +120,8 @@ class PaperTradingEngine {
       direction: executionDirection,
       entryPrice: this._round(currentPrice),
       entryTime: new Date().toISOString(),
-      stopLoss: this._round(stopLoss),
-      takeProfit: this._round(takeProfit),
+      stopLoss: executionPlan === undefined ? this._round(stopLoss) : stopLoss,
+      takeProfit: executionPlan === undefined ? this._round(takeProfit) : takeProfit,
       riskReward,
       positionSize,
       currentPrice: this._round(currentPrice),
@@ -118,6 +133,16 @@ class PaperTradingEngine {
     this.lastUpdated = new Date().toISOString();
     this.calculationTime = Date.now() - start;
     return trade;
+  }
+
+  _isValidExecutionPlan(plan, entryPrice, direction) {
+    if (!plan || !['stopLoss', 'takeProfit', 'positionSize', 'riskReward'].every(key => isFiniteNumber(plan[key]))) {
+      return false;
+    }
+    if (plan.positionSize <= 0 || plan.riskReward <= 0) return false;
+    if (direction === 'BUY') return plan.stopLoss < entryPrice && entryPrice < plan.takeProfit;
+    if (direction === 'SELL') return plan.takeProfit < entryPrice && entryPrice < plan.stopLoss;
+    return false;
   }
 
   // ---------------------------------------------------------------------------
