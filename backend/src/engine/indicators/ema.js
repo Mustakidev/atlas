@@ -15,16 +15,18 @@
  */
 const { Indicator } = require('./base');
 
-const DEFAULT_PERIODS = [9, 20, 50, 100, 200];
+const DEFAULT_PERIODS = Object.freeze([9, 20, 50, 100, 200]);
 const ENGINE_VERSION = '1.0.0';
 const DEFAULT_SYMBOL = 'BTCUSDT';
 
 class EMAIndicator extends Indicator {
+  #periods;
+
   constructor(symbol) {
     super('EMA', 'Exponential Moving Average — multi-period exponential smoothing with configurable periods');
     this._implemented = true;
     this._symbol = symbol || DEFAULT_SYMBOL;
-    this._periods = DEFAULT_PERIODS;
+    this.#periods = Object.freeze([...DEFAULT_PERIODS]);
     this._version = ENGINE_VERSION;
     this._lastUpdated = null;
     this._calculationTime = 0;
@@ -47,7 +49,7 @@ class EMAIndicator extends Indicator {
    */
   calculate(candles, tf, period) {
     const start = Date.now();
-    const p = period || 20;
+    const p = period === undefined ? 20 : validatePeriod(period);
     const timestamp = candles && candles.length > 0
       ? candles[candles.length - 1].timestamp
       : null;
@@ -102,11 +104,17 @@ class EMAIndicator extends Indicator {
    * Calculate EMA for all default periods.
    * @param {Array} candles - OHLCV objects
    * @param {string} tf - Timeframe key
+   * @param {number[]} [periods] - Periods to calculate, defaulting to configured periods
    * @returns {Object} { [period]: result }
    */
-  calculateAll(candles, tf) {
+  calculateAll(candles, tf, periods = this.#periods) {
+    if (!Array.isArray(periods)) {
+      throw new TypeError('EMA periods must be an array');
+    }
+
+    const validatedPeriods = periods.map(validatePeriod);
     const results = {};
-    for (const period of this._periods) {
+    for (const period of validatedPeriods) {
       results[period] = this.calculate(candles, tf, period);
     }
     return results;
@@ -117,7 +125,7 @@ class EMAIndicator extends Indicator {
    * @returns {number[]}
    */
   getPeriods() {
-    return [...this._periods];
+    return [...this.#periods];
   }
 
   /**
@@ -138,8 +146,8 @@ class EMAIndicator extends Indicator {
   getInfo() {
     return {
       ...super.getInfo(),
-      periods: this._periods,
-      minCandles: Math.max(...this._periods) + 1,
+      periods: [...this.#periods],
+      minCandles: Math.max(...this.#periods) + 1,
       version: this._version,
       symbol: this._symbol,
     };
@@ -241,6 +249,13 @@ class EMAIndicator extends Indicator {
     };
   }
 
+}
+
+function validatePeriod(period) {
+  if (!Number.isFinite(period) || !Number.isInteger(period) || period <= 0) {
+    throw new TypeError('EMA period must be a finite positive integer');
+  }
+  return period;
 }
 
 module.exports = { EMAIndicator, DEFAULT_PERIODS, ENGINE_VERSION, DEFAULT_SYMBOL };
