@@ -84,9 +84,7 @@ class AdvanceRiskEngine {
         `Daily loss limit reached — max ${this._maxDailyLossPct}% loss (${this._dailyPnL.toFixed(2)})`);
     }
 
-    const dailyDrawdownPct = this._accountBalance > 0
-      ? ((this._dailyHighWater - this._accountBalance + this._dailyPnL) / this._accountBalance) * 100
-      : 0;
+    const dailyDrawdownPct = this._calculateDailyDrawdownPct();
     if (dailyDrawdownPct >= this._maxDailyDrawdownPct) {
       this._dailyLossLimitReached = true;
       return this._rejected(symbol, timeframe, entryPrice, direction,
@@ -210,10 +208,7 @@ class AdvanceRiskEngine {
 
   getDailyPnL() { return this._round(this._dailyPnL); }
   getDailyDrawdownPct() {
-    if (this._accountBalance <= 0) return 0;
-    return this._round(
-      ((this._dailyHighWater - (this._accountBalance + this._dailyPnL)) / this._accountBalance) * 100
-    );
+    return this._round(this._calculateDailyDrawdownPct());
   }
   getConsecutiveLosses() { return this._consecutiveLosses; }
   isTradingEnabled() { return this._tradingEnabled && !this._dailyLossLimitReached && this._lossPauseUntil <= Date.now(); }
@@ -313,6 +308,12 @@ class AdvanceRiskEngine {
       this.resetDaily();
       this.resetConsecutiveLosses();
     }
+  }
+
+  _calculateDailyDrawdownPct() {
+    if (this._accountBalance <= 0) return 0;
+    const equity = this._accountBalance + this._dailyPnL;
+    return ((this._dailyHighWater - equity) / this._accountBalance) * 100;
   }
 
   _validateInputs(params) {
