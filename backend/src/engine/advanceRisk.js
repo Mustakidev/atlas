@@ -2,6 +2,8 @@ const { REGIMES } = require('../market-regime/RegimeTypes');
 
 const ENGINE_VERSION = '2.0.0';
 
+const isFiniteNumber = (value) => typeof value === 'number' && Number.isFinite(value);
+
 const DEFAULTS = {
   ACCOUNT_BALANCE: 10000,
   RISK_PER_TRADE_PCT: 1,
@@ -91,13 +93,19 @@ class AdvanceRiskEngine {
         `Daily drawdown limit reached — ${dailyDrawdownPct.toFixed(2)}% >= ${this._maxDailyDrawdownPct}% max`);
     }
 
-    const confConfidence = confluence?.confidence ?? 0;
+    const confConfidence = confluence?.confidence;
+    if (!isFiniteNumber(confConfidence) || confConfidence > 100) {
+      return this._calculationRejected(start, symbol, timeframe, entryPrice, direction, 'Invalid confluence confidence');
+    }
     if (confConfidence < DEFAULTS.MIN_CONFIDENCE) {
       return this._rejected(symbol, timeframe, entryPrice, direction,
         `Confluence confidence ${confConfidence} below minimum ${DEFAULTS.MIN_CONFIDENCE}`);
     }
 
-    const atrPct = atr?.atrPercentage ?? 0;
+    const atrPct = atr?.atrPercentage;
+    if (!isFiniteNumber(atrPct) || atrPct < 0) {
+      return this._calculationRejected(start, symbol, timeframe, entryPrice, direction, 'Invalid ATR percentage');
+    }
     if (atrPct > DEFAULTS.MAX_VOLATILITY_PCT) {
       return this._rejected(symbol, timeframe, entryPrice, direction,
         `Volatility ${atrPct}% exceeds maximum ${DEFAULTS.MAX_VOLATILITY_PCT}%`);
@@ -114,7 +122,7 @@ class AdvanceRiskEngine {
 
     const effectiveRiskPct = this._riskPerTradePct * sessionMult;
 
-    const atrValue = atr?.atr ?? 0;
+    const atrValue = atr.atr;
     const isBuy = direction === 'BUY';
 
     const stopLossRaw = isBuy
@@ -144,21 +152,40 @@ class AdvanceRiskEngine {
       positionSize = this._round(positionSize * 0.5);
     }
 
+    const roundedEntryPrice = this._round(entryPrice);
+    const roundedRiskPerUnit = this._round(riskPerUnit);
+    const roundedRewardPerUnit = this._round(rewardPerUnit);
+    const roundedDollarRisk = this._round(dollarRisk);
+    const dailyDrawdown = this._round(dailyDrawdownPct);
+
+    if (![roundedEntryPrice, stopLoss, takeProfit, riskReward, roundedRiskPerUnit,
+      roundedRewardPerUnit, positionSize, roundedDollarRisk, this._accountBalance,
+      effectiveRiskPct, atrValue, atrMult, sessionMult, this._dailyPnL, dailyDrawdown]
+      .every(Number.isFinite)) {
+      return this._calculationRejected(start, symbol, timeframe, entryPrice, direction,
+        'Risk calculation produced non-finite value');
+    }
+
+    if (!(riskPerUnit > 0) || !(roundedRiskPerUnit > 0)) {
+      return this._calculationRejected(start, symbol, timeframe, entryPrice, direction,
+        'Risk distance must be finite and greater than zero');
+    }
+
     this.calculationTime = Date.now() - start;
     this.lastUpdated = new Date().toISOString();
 
     return {
       symbol: symbol || this.symbol,
       timeframe,
-      entryPrice: this._round(entryPrice),
+      entryPrice: roundedEntryPrice,
       direction,
       stopLoss,
       takeProfit,
       riskReward,
-      riskPerUnit: this._round(riskPerUnit),
-      rewardPerUnit: this._round(rewardPerUnit),
+      riskPerUnit: roundedRiskPerUnit,
+      rewardPerUnit: roundedRewardPerUnit,
       positionSize,
-      dollarRisk: this._round(dollarRisk),
+      dollarRisk: roundedDollarRisk,
       accountBalance: this._accountBalance,
       riskPerTradePct: effectiveRiskPct,
       atrUsed: atrValue,
@@ -169,7 +196,7 @@ class AdvanceRiskEngine {
       tradeAllowed: true,
       rejectionReason: null,
       dailyPnL: this._dailyPnL,
-      dailyDrawdownPct: this._round(dailyDrawdownPct),
+      dailyDrawdownPct: dailyDrawdown,
       consecutiveLosses: this._consecutiveLosses,
       tradingEnabled: this._tradingEnabled,
       timestamp: new Date().toISOString(),
@@ -180,28 +207,38 @@ class AdvanceRiskEngine {
   }
 
   onTradeClosed(pnl) {
+    if (!isFiniteNumber(pnl)) return;
+
     this._resetDailyIfNeeded();
-    if (pnl < 0) {
-      this._consecutiveLosses++;
-      this._dailyPnL += pnl;
-      if (this._accountBalance + this._dailyPnL > this._dailyHighWater) {
-        this._dailyHighWater = this._accountBalance + this._dailyPnL;
+    const nextDailyPnL = this._dailyPnL + pnl;
+    const nextEquity = this._accountBalance + nextDailyPnL;
+    if (!isFiniteNumber(nextDailyPnL) || !isFiniteNumber(nextEquity)) return;
+
+    const isLoss = pnl < 0;
+    const nextConsecutiveLosses = isLoss ? this._consecutiveLosses + 1 : 0;
+    let nextLossPauseUntil = this._lossPauseUntil;
+    let lossPct = null;
+
+    if (isLoss) {
+      if (nextConsecutiveLosses >= this._maxConsecutiveLosses) {
+        nextLossPauseUntil = Date.now() + this._cooldownMs;
+        if (!isFiniteNumber(nextLossPauseUntil)) return;
       }
-      if (this._consecutiveLosses >= this._maxConsecutiveLosses) {
-        this._lossPauseUntil = Date.now() + this._cooldownMs;
-        this.logger?.info('AdvanceRisk', `Consecutive loss pause activated — ${this._consecutiveLosses} losses, cool down ${this._cooldownMs / 60000} min`);
-      }
-      const lossPct = Math.abs(this._dailyPnL) / this._accountBalance * 100;
-      if (lossPct >= this._maxDailyLossPct) {
-        this._dailyLossLimitReached = true;
-        this.logger?.warn('AdvanceRisk', `Daily loss limit reached — ${lossPct.toFixed(2)}% loss (${this._dailyPnL.toFixed(2)})`);
-      }
-    } else {
-      this._consecutiveLosses = 0;
-      this._dailyPnL += pnl;
-      if (this._accountBalance + this._dailyPnL > this._dailyHighWater) {
-        this._dailyHighWater = this._accountBalance + this._dailyPnL;
-      }
+      lossPct = Math.abs(nextDailyPnL) / this._accountBalance * 100;
+      if (!isFiniteNumber(lossPct)) return;
+    }
+
+    this._dailyPnL = nextDailyPnL;
+    this._consecutiveLosses = nextConsecutiveLosses;
+    this._lossPauseUntil = nextLossPauseUntil;
+    if (nextEquity > this._dailyHighWater) this._dailyHighWater = nextEquity;
+
+    if (isLoss && nextConsecutiveLosses >= this._maxConsecutiveLosses) {
+      this.logger?.info('AdvanceRisk', `Consecutive loss pause activated — ${nextConsecutiveLosses} losses, cool down ${this._cooldownMs / 60000} min`);
+    }
+    if (isLoss && lossPct >= this._maxDailyLossPct) {
+      this._dailyLossLimitReached = true;
+      this.logger?.warn('AdvanceRisk', `Daily loss limit reached — ${lossPct.toFixed(2)}% loss (${this._dailyPnL.toFixed(2)})`);
     }
     this.lastUpdated = new Date().toISOString();
   }
@@ -255,21 +292,21 @@ class AdvanceRiskEngine {
     };
   }
 
-  setAccountBalance(val) { if (val > 0) this._accountBalance = val; }
-  setRiskPerTradePct(val) { if (val > 0 && val <= 100) this._riskPerTradePct = val; }
-  setMaxDailyLossPct(val) { if (val > 0 && val <= 100) this._maxDailyLossPct = val; }
-  setMaxDailyDrawdownPct(val) { if (val > 0 && val <= 100) this._maxDailyDrawdownPct = val; }
-  setMaxConsecutiveLosses(val) { if (val > 0) this._maxConsecutiveLosses = val; }
-  setConsecutiveCooldownMs(val) { if (val > 0) this._cooldownMs = val; }
+  setAccountBalance(val) { if (isFiniteNumber(val) && val > 0) this._accountBalance = val; }
+  setRiskPerTradePct(val) { if (isFiniteNumber(val) && val > 0 && val <= 100) this._riskPerTradePct = val; }
+  setMaxDailyLossPct(val) { if (isFiniteNumber(val) && val > 0 && val <= 100) this._maxDailyLossPct = val; }
+  setMaxDailyDrawdownPct(val) { if (isFiniteNumber(val) && val > 0 && val <= 100) this._maxDailyDrawdownPct = val; }
+  setMaxConsecutiveLosses(val) { if (isFiniteNumber(val) && val > 0) this._maxConsecutiveLosses = val; }
+  setConsecutiveCooldownMs(val) { if (isFiniteNumber(val) && val > 0) this._cooldownMs = val; }
   setSessionMultiplier(session, mult) {
-    if (this._sessionMultipliers[session] !== undefined && mult >= 0 && mult <= 5) {
+    if (this._sessionMultipliers[session] !== undefined && isFiniteNumber(mult) && mult >= 0 && mult <= 5) {
       this._sessionMultipliers[session] = mult;
     }
   }
-  setAtrMultTrending(val) { if (val > 0) this._atrMultTrending = val; }
-  setAtrMultRanging(val) { if (val > 0) this._atrMultRanging = val; }
-  setRrTrending(val) { if (val > 0) this._rrTrending = val; }
-  setRrRanging(val) { if (val > 0) this._rrRanging = val; }
+  setAtrMultTrending(val) { if (isFiniteNumber(val) && val > 0) this._atrMultTrending = val; }
+  setAtrMultRanging(val) { if (isFiniteNumber(val) && val > 0) this._atrMultRanging = val; }
+  setRrTrending(val) { if (isFiniteNumber(val) && val > 0) this._rrTrending = val; }
+  setRrRanging(val) { if (isFiniteNumber(val) && val > 0) this._rrRanging = val; }
   enableTrading() { this._tradingEnabled = true; }
   disableTrading() { this._tradingEnabled = false; }
   resetDaily() {
@@ -318,13 +355,13 @@ class AdvanceRiskEngine {
 
   _validateInputs(params) {
     if (!params) return this._rejected(this.symbol, null, null, null, 'No parameters provided');
-    if (params.entryPrice == null || params.entryPrice <= 0) {
+    if (!isFiniteNumber(params.entryPrice) || params.entryPrice <= 0) {
       return this._rejected(params.symbol || this.symbol, params.timeframe, null, params.direction, 'Invalid entry price');
     }
     if (!params.direction || !['BUY', 'SELL'].includes(params.direction)) {
       return this._rejected(params.symbol || this.symbol, params.timeframe, params.entryPrice, null, 'Direction must be BUY or SELL');
     }
-    if (!params.atr || !params.atr.ready || params.atr.atr == null || params.atr.atr <= 0) {
+    if (!params.atr || !params.atr.ready || !isFiniteNumber(params.atr.atr) || params.atr.atr <= 0) {
       return this._rejected(params.symbol || this.symbol, params.timeframe, params.entryPrice, params.direction, 'ATR not ready or invalid');
     }
     return null;
@@ -361,6 +398,12 @@ class AdvanceRiskEngine {
       lastUpdated: new Date().toISOString(),
       calculationTime: this.calculationTime,
     };
+  }
+
+  _calculationRejected(start, symbol, timeframe, entryPrice, direction, reason) {
+    this.calculationTime = Date.now() - start;
+    this.lastUpdated = new Date().toISOString();
+    return this._rejected(symbol || this.symbol, timeframe, entryPrice, direction, reason);
   }
 
   _round(value) {

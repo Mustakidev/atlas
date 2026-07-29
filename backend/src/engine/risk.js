@@ -17,6 +17,8 @@ const DEFAULT_MAX_VOLATILITY_PCT = 5;
 const DEFAULT_STOP_LOSS_ATR_MULT = 2;
 const DEFAULT_TAKE_PROFIT_ATR_MULT = 4;
 
+const isFiniteNumber = (value) => typeof value === 'number' && Number.isFinite(value);
+
 class RiskEngine {
   constructor({ logger, symbol }) {
     this.logger = logger;
@@ -64,7 +66,15 @@ class RiskEngine {
     }
 
     // --- Check confluence confidence threshold ---
-    const confConfidence = confluence?.confidence ?? 0;
+    const confConfidence = confluence?.confidence;
+    if (!isFiniteNumber(confConfidence) || confConfidence > 100) {
+      this.calculationTime = Date.now() - start;
+      this.lastUpdated = new Date().toISOString();
+      return this._rejected(
+        symbol || this.symbol, timeframe, entryPrice, direction,
+        'Invalid confluence confidence'
+      );
+    }
     if (confConfidence < this._minConfidence) {
       this.calculationTime = Date.now() - start;
       this.lastUpdated = new Date().toISOString();
@@ -75,7 +85,15 @@ class RiskEngine {
     }
 
     // --- Check volatility threshold ---
-    const atrPct = atr?.atrPercentage ?? 0;
+    const atrPct = atr?.atrPercentage;
+    if (!isFiniteNumber(atrPct) || atrPct < 0) {
+      this.calculationTime = Date.now() - start;
+      this.lastUpdated = new Date().toISOString();
+      return this._rejected(
+        symbol || this.symbol, timeframe, entryPrice, direction,
+        'Invalid ATR percentage'
+      );
+    }
     if (atrPct > this._maxVolatilityPct) {
       this.calculationTime = Date.now() - start;
       this.lastUpdated = new Date().toISOString();
@@ -86,7 +104,7 @@ class RiskEngine {
     }
 
     // --- Compute ATR-based levels ---
-    const atrValue = atr?.atr ?? 0;
+    const atrValue = atr.atr;
     const isBuy = direction === 'BUY';
 
     const stopLoss = isBuy
@@ -100,17 +118,40 @@ class RiskEngine {
     const risk = Math.abs(entryPrice - stopLoss);
     const reward = Math.abs(takeProfit - entryPrice);
     const riskReward = risk > 0 ? this._round(reward / risk) : 0;
+    const roundedEntryPrice = this._round(entryPrice);
+    const roundedRisk = this._round(risk);
+    const roundedReward = this._round(reward);
+
+    if (![roundedEntryPrice, stopLoss, takeProfit, riskReward, roundedRisk, roundedReward,
+      atrValue, this._slAtrMult, this._tpAtrMult, confConfidence, atrPct]
+      .every(Number.isFinite)) {
+      this.calculationTime = Date.now() - start;
+      this.lastUpdated = new Date().toISOString();
+      return this._rejected(
+        symbol || this.symbol, timeframe, entryPrice, direction,
+        'Risk calculation produced non-finite value'
+      );
+    }
+
+    if (!(risk > 0) || !(roundedRisk > 0)) {
+      this.calculationTime = Date.now() - start;
+      this.lastUpdated = new Date().toISOString();
+      return this._rejected(
+        symbol || this.symbol, timeframe, entryPrice, direction,
+        'Risk distance must be finite and greater than zero'
+      );
+    }
 
     const result = {
       symbol: symbol || this.symbol,
       timeframe,
-      entryPrice: this._round(entryPrice),
+      entryPrice: roundedEntryPrice,
       direction,
       stopLoss,
       takeProfit,
       riskReward,
-      risk: this._round(risk),
-      reward: this._round(reward),
+      risk: roundedRisk,
+      reward: roundedReward,
       atrUsed: atrValue,
       atrMultiplierSL: this._slAtrMult,
       atrMultiplierTP: this._tpAtrMult,
@@ -149,20 +190,20 @@ class RiskEngine {
   // ---------------------------------------------------------------------------
 
   setRiskRewardRatio(ratio) {
-    if (typeof ratio === 'number' && ratio > 0) {
+    if (isFiniteNumber(ratio) && ratio > 0) {
       this._riskRewardRatio = ratio;
       this._tpAtrMult = this._slAtrMult * ratio;
     }
   }
 
   setMinConfidence(val) {
-    if (typeof val === 'number' && val >= 0 && val <= 100) {
+    if (isFiniteNumber(val) && val >= 0 && val <= 100) {
       this._minConfidence = val;
     }
   }
 
   setMaxVolatilityPct(val) {
-    if (typeof val === 'number' && val > 0) {
+    if (isFiniteNumber(val) && val > 0) {
       this._maxVolatilityPct = val;
     }
   }
@@ -173,13 +214,13 @@ class RiskEngine {
 
   _validateInputs(params) {
     if (!params) return this._rejected(this.symbol, null, null, null, 'No parameters provided');
-    if (params.entryPrice == null || params.entryPrice <= 0) {
+    if (!isFiniteNumber(params.entryPrice) || params.entryPrice <= 0) {
       return this._rejected(params.symbol || this.symbol, params.timeframe, null, params.direction, 'Invalid entry price');
     }
     if (!params.direction || !['BUY', 'SELL'].includes(params.direction)) {
       return this._rejected(params.symbol || this.symbol, params.timeframe, params.entryPrice, null, 'Direction must be BUY or SELL');
     }
-    if (!params.atr || !params.atr.ready || params.atr.atr == null || params.atr.atr <= 0) {
+    if (!params.atr || !params.atr.ready || !isFiniteNumber(params.atr.atr) || params.atr.atr <= 0) {
       return this._rejected(params.symbol || this.symbol, params.timeframe, params.entryPrice, params.direction, 'ATR not ready or invalid');
     }
     return null;
