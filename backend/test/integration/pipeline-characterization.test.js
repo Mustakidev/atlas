@@ -28,7 +28,7 @@ function config() {
 function createHarness(overrides = {}) {
   const candles = fresh(bullishCandles, 40);
   const errors = [];
-  const state = { signals: [], evaluations: 0, closedPnLs: [], candleClosures: 0 };
+  const state = { signals: [], executionPlans: [], evaluations: 0, closedPnLs: [], candleClosures: 0 };
   const active = overrides.activeCandle ? { ...candles[candles.length - 1], openTime: candles[candles.length - 1].openTime + 3600000 } : null;
   const deps = {
     config: config(),
@@ -55,8 +55,9 @@ function createHarness(overrides = {}) {
     },
     mtfEngine: { calculate: () => ({ overallBias: 'Bullish' }) },
     paperTradeEngine: {
-      signal: (engines, price, timeframe, direction) => {
-        const trade = { tradeId: `T-${state.signals.length + 1}`, direction, entryPrice: price, stopLoss: 96, takeProfit: 112, riskReward: 3, positionSize: 1, confidence: 80, reason: 'Accepted' };
+      signal: (engines, price, timeframe, direction, executionPlan) => {
+        state.executionPlans.push(executionPlan);
+        const trade = { tradeId: `T-${state.signals.length + 1}`, direction, entryPrice: price, stopLoss: executionPlan?.stopLoss ?? 96, takeProfit: executionPlan?.takeProfit ?? 112, riskReward: executionPlan?.riskReward ?? 3, positionSize: executionPlan?.positionSize ?? 1, confidence: 80, reason: 'Accepted' };
         state.signals.push(trade);
         return trade;
       },
@@ -115,6 +116,32 @@ test('preserves BUY and SELL execution decision fields', () => {
   assert.equal(sellDecision.verdict.trade.direction, 'SELL');
 });
 
+test('passes the approved AdvanceRisk execution plan to the opened trade', () => {
+  const plan = { tradeAllowed: true, positionSize: 33.33, stopLoss: 97, takeProfit: 105.4, riskReward: 1.8, session: 'ASIAN' };
+  const harness = createHarness({
+    advanceRiskEngine: {
+      evaluate: () => plan,
+      onTradeClosed() {},
+    },
+  });
+
+  const decision = run(harness);
+
+  assert.equal(harness.state.executionPlans.length, 1);
+  assert.strictEqual(harness.state.executionPlans[0], plan);
+  assert.deepEqual({
+    stopLoss: decision.risk.stopLoss,
+    takeProfit: decision.risk.takeProfit,
+    riskReward: decision.risk.riskReward,
+    positionSize: decision.risk.positionSize,
+  }, {
+    stopLoss: decision.verdict.trade.stopLoss,
+    takeProfit: decision.verdict.trade.takeProfit,
+    riskReward: decision.verdict.trade.riskReward,
+    positionSize: decision.verdict.trade.positionSize,
+  });
+});
+
 test('preserves neutral rejection and gate fields', () => {
   const harness = createHarness({ confluenceEngine: { calculate: () => ({ score: 50, bias: 'Neutral', confidence: 50, components: {}, missing: [] }) } });
   const decision = run(harness);
@@ -158,6 +185,7 @@ test('preserves regime, MTF, advance-risk, and paper-trade rejection order', () 
 
   const risk = createHarness({ advanceRiskEngine: { evaluate: () => ({ tradeAllowed: false, rejectionReason: 'Daily limit reached' }), onTradeClosed() {} } });
   assert.equal(run(risk).verdict.rejectionReason, 'AdvanceRisk: Daily limit reached');
+  assert.equal(risk.state.signals.length, 0);
 
   const paper = createHarness({ paperTradeEngine: { signal: () => null, evaluateTrades: () => [], onCandle: () => ({ closed: [] }), open: () => [], closed: () => [], getBalance: () => 10000 } });
   assert.equal(run(paper).verdict.rejectionReason, 'paperTradeEngine.signal() rejected — internal analysis: direction neutral or confidence < 30%');
