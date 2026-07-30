@@ -15,8 +15,8 @@ const config = {
   },
 };
 
-function candles(direction = 'up') {
-  return Array.from({ length: 52 }, (_, index) => {
+function candles(direction = 'up', length = 52) {
+  return Array.from({ length }, (_, index) => {
     const close = direction === 'up' ? 100 + index : 200 - index;
     return {
       open: close,
@@ -83,6 +83,27 @@ function makeReplay({ riskPolicySource, sourceMtf, lowerOpposition = false } = {
   replay._analyzeEngines = () => ({ direction: 'BUY', confidence: 80, reason: 'controlled replay', buyRatio: 0.8, sellRatio: 0.2 });
 
   return { replay, risk, mtf };
+}
+
+function makeRiskPolicy({ maxConsecutiveLosses = 3, cooldownMs = 3600000 } = {}) {
+  const source = new AdvanceRiskEngine({ logger, symbol: 'BTCUSDT', paperTradeEngine: {}, config });
+  source.setMaxDailyLossPct(100);
+  source.setMaxDailyDrawdownPct(100);
+  source.setMaxConsecutiveLosses(maxConsecutiveLosses);
+  source.setConsecutiveCooldownMs(cooldownMs);
+  return source;
+}
+
+function instrumentReplayRisk(replay) {
+  const risk = replay._createReplayRiskEngine();
+  const closedPnLs = [];
+  const onTradeClosed = risk.onTradeClosed.bind(risk);
+  risk.onTradeClosed = pnl => {
+    closedPnLs.push(pnl);
+    return onTradeClosed(pnl);
+  };
+  replay._createReplayRiskEngine = () => risk;
+  return { risk, closedPnLs };
 }
 
 function resultSummary(result) {
@@ -296,4 +317,115 @@ test('clean replay trade lifecycle and statistics remain unchanged', () => {
   assert.equal(result.stats.totalTrades, 1);
   assert.equal(result.stats.wins, 1);
   assert.equal(result.stats.totalRejections, 0);
+});
+
+test('stop-loss closure advances replay risk exactly once', () => {
+  const source = makeRiskPolicy();
+  const { replay } = makeReplay({ riskPolicySource: source });
+  const { closedPnLs } = instrumentReplayRisk(replay);
+  const input = candles('up');
+  Object.assign(input[51], { high: 150, low: 147, close: 149 });
+
+  const result = replay.run(input, '1h');
+
+  assert.deepEqual(closedPnLs, [-100]);
+  assert.equal(result.trades.length, 1);
+  assert.equal(result.trades[0].exitReason, 'Stop Loss');
+  assert.equal(result.stats.totalTrades, 1);
+});
+
+test('take-profit closure advances replay risk exactly once', () => {
+  const source = makeRiskPolicy();
+  const { replay } = makeReplay({ riskPolicySource: source });
+  const { closedPnLs } = instrumentReplayRisk(replay);
+  const input = candles('up');
+  Object.assign(input[51], { high: 156, low: 150, close: 151 });
+
+  const result = replay.run(input, '1h');
+
+  assert.deepEqual(closedPnLs, [300]);
+  assert.equal(result.trades.length, 1);
+  assert.equal(result.trades[0].exitReason, 'Take Profit');
+  assert.equal(result.trades[0].win, true);
+  assert.equal(result.stats.totalTrades, 1);
+});
+
+test('end-of-data closure advances replay risk exactly once', () => {
+  const source = makeRiskPolicy();
+  const { replay } = makeReplay({ riskPolicySource: source });
+  const { closedPnLs } = instrumentReplayRisk(replay);
+
+  const result = replay.run(candles('up'), '1h');
+
+  assert.deepEqual(closedPnLs, [50]);
+  assert.equal(result.trades.length, 1);
+  assert.equal(result.trades[0].exitReason, 'End of Data');
+  assert.equal(result.stats.totalTrades, 1);
+});
+
+test('consecutive loss pause rejects following signals without reporting rejected trades', () => {
+  const source = makeRiskPolicy({ maxConsecutiveLosses: 1, cooldownMs: 60000 });
+  const { replay } = makeReplay({ riskPolicySource: source });
+  const { risk, closedPnLs } = instrumentReplayRisk(replay);
+  const input = candles('up', 54);
+  Object.assign(input[51], { high: 150, low: 147, close: 149 });
+
+  const result = replay.run(input, '1h');
+
+  assert.deepEqual(closedPnLs, [-100]);
+  assert.equal(result.trades.length, 1);
+  assert.ok(result.rejections.length >= 1);
+  assert.ok(result.rejections.every(rejection => rejection.reason.includes('Consecutive loss pause active')));
+  assert.equal(risk.getConsecutiveLosses(), 1);
+});
+
+test('winning replay trade resets consecutive-loss state', () => {
+  const source = makeRiskPolicy({ maxConsecutiveLosses: 3, cooldownMs: 60000 });
+  const { replay } = makeReplay({ riskPolicySource: source });
+  const { risk, closedPnLs } = instrumentReplayRisk(replay);
+  const input = candles('up', 54);
+  Object.assign(input[51], { high: 150, low: 147, close: 149 });
+  Object.assign(input[52], { high: 153, low: 151, close: 152 });
+  Object.assign(input[53], { high: 158, low: 152, close: 157 });
+
+  const result = replay.run(input, '1h');
+
+  assert.deepEqual(closedPnLs, [-100, 300]);
+  assert.equal(result.trades.length, 2);
+  assert.equal(result.trades[0].exitReason, 'Stop Loss');
+  assert.equal(result.trades[1].exitReason, 'Take Profit');
+  assert.equal(risk.getConsecutiveLosses(), 0);
+});
+
+test('replay closures update daily PnL and drawdown state', () => {
+  const source = makeRiskPolicy();
+  const { replay } = makeReplay({ riskPolicySource: source });
+  const { risk, closedPnLs } = instrumentReplayRisk(replay);
+  const input = candles('up');
+  Object.assign(input[51], { high: 150, low: 149, close: 149 });
+
+  const result = replay.run(input, '1h');
+  const state = risk.getState();
+
+  assert.deepEqual(closedPnLs, [-50]);
+  assert.equal(state.dailyPnL, -50);
+  assert.equal(state.dailyDrawdownPct, 0.5);
+  assert.equal(result.stats.netPnl, -50);
+});
+
+test('replay closure reporting does not mutate the source risk engine', () => {
+  const source = makeRiskPolicy({ maxConsecutiveLosses: 1, cooldownMs: 60000 });
+  const before = source.getState();
+  const { replay } = makeReplay({ riskPolicySource: source });
+  instrumentReplayRisk(replay);
+  const input = candles('up');
+  Object.assign(input[51], { high: 150, low: 147, close: 149 });
+
+  replay.run(input, '1h');
+
+  const after = source.getState();
+  assert.equal(after.dailyPnL, before.dailyPnL);
+  assert.equal(after.dailyDrawdownPct, before.dailyDrawdownPct);
+  assert.equal(after.consecutiveLosses, before.consecutiveLosses);
+  assert.equal(after.lossPauseRemainingMs, before.lossPauseRemainingMs);
 });
