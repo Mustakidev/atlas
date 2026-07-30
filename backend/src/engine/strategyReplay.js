@@ -235,7 +235,6 @@ class StrategyReplayEngine {
         continue;
       }
 
-      tradeCounter++;
       const riskSize = riskResult.riskPerUnit;
       const levels = {
         stopLoss: riskResult.stopLoss,
@@ -245,6 +244,19 @@ class StrategyReplayEngine {
       const positionSize = riskResult.positionSize;
 
       const regimeDecision = this._runRegimeDecision(marketRegime, signalDirection, confluence.score);
+
+      if (regimeDecision.allowTrade === false) {
+        rejections.push({
+          timestamp: candle.timestamp,
+          reason: `Regime Decision: ${regimeDecision.reason || 'Trade rejected by regime gate'}`,
+          score: confluence.score,
+          bias: confluence.bias,
+          direction: signalDirection,
+        });
+        continue;
+      }
+
+      tradeCounter++;
 
       openTrade = {
         tradeId: `SR-${tradeCounter}`,
