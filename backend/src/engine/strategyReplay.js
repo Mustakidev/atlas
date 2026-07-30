@@ -83,33 +83,25 @@ class StrategyReplayEngine {
         const closedByTP = !closedBySL ? this._checkTP(openTrade, candle) : null;
 
         if (closedBySL) {
-          openTrade.exit = closedBySL.exit;
-          openTrade.exitTime = candle.timestamp;
-          openTrade.exitReason = 'Stop Loss';
-          openTrade.win = false;
-          openTrade.duration = i - openTrade.entryIndex;
-          openTrade.rMultiple = this._round(this._directionPnL(openTrade.direction, closedBySL.exit, openTrade.entry) / openTrade.riskSize);
-          openTrade.pnl = this._round((openTrade.direction === 'BUY'
-            ? closedBySL.exit - openTrade.entry
-            : openTrade.entry - closedBySL.exit) * openTrade.positionSize);
-          openTrade.pnlPercent = this._round(((closedBySL.exit - openTrade.entry) / openTrade.entry) * 100 * (openTrade.direction === 'BUY' ? 1 : -1));
-          trades.push({ ...openTrade });
+          this._finalizeTrade(openTrade, {
+            exit: closedBySL.exit,
+            exitTime: candle.timestamp,
+            exitReason: 'Stop Loss',
+            win: false,
+            duration: i - openTrade.entryIndex,
+          }, advanceRiskEngine, trades);
           openTrade = null;
           continue;
         }
 
         if (closedByTP) {
-          openTrade.exit = closedByTP.exit;
-          openTrade.exitTime = candle.timestamp;
-          openTrade.exitReason = 'Take Profit';
-          openTrade.win = true;
-          openTrade.duration = i - openTrade.entryIndex;
-          openTrade.rMultiple = this._round(this._directionPnL(openTrade.direction, closedByTP.exit, openTrade.entry) / openTrade.riskSize);
-          openTrade.pnl = this._round((openTrade.direction === 'BUY'
-            ? closedByTP.exit - openTrade.entry
-            : openTrade.entry - closedByTP.exit) * openTrade.positionSize);
-          openTrade.pnlPercent = this._round(((closedByTP.exit - openTrade.entry) / openTrade.entry) * 100 * (openTrade.direction === 'BUY' ? 1 : -1));
-          trades.push({ ...openTrade });
+          this._finalizeTrade(openTrade, {
+            exit: closedByTP.exit,
+            exitTime: candle.timestamp,
+            exitReason: 'Take Profit',
+            win: true,
+            duration: i - openTrade.entryIndex,
+          }, advanceRiskEngine, trades);
           openTrade = null;
           continue;
         }
@@ -289,18 +281,18 @@ class StrategyReplayEngine {
 
     if (openTrade) {
       const lastCandle = candles[candles.length - 1];
-      openTrade.exit = this._round(lastCandle.close);
-      openTrade.exitTime = lastCandle.timestamp;
-      openTrade.exitReason = 'End of Data';
-      openTrade.win = lastCandle.close > openTrade.entry;
-      if (openTrade.direction === 'SELL') openTrade.win = lastCandle.close < openTrade.entry;
-      openTrade.duration = candles.length - 1 - openTrade.entryIndex;
-      openTrade.rMultiple = this._round(this._directionPnL(openTrade.direction, lastCandle.close, openTrade.entry) / openTrade.riskSize);
-      openTrade.pnl = this._round((openTrade.direction === 'BUY'
-        ? lastCandle.close - openTrade.entry
-        : openTrade.entry - lastCandle.close) * openTrade.positionSize);
-      openTrade.pnlPercent = this._round(((lastCandle.close - openTrade.entry) / openTrade.entry) * 100 * (openTrade.direction === 'BUY' ? 1 : -1));
-      trades.push({ ...openTrade });
+      const exit = this._round(lastCandle.close);
+      const win = openTrade.direction === 'SELL'
+        ? lastCandle.close < openTrade.entry
+        : lastCandle.close > openTrade.entry;
+      this._finalizeTrade(openTrade, {
+        exit,
+        exitTime: lastCandle.timestamp,
+        exitReason: 'End of Data',
+        win,
+        duration: candles.length - 1 - openTrade.entryIndex,
+        pnlExit: lastCandle.close,
+      }, advanceRiskEngine, trades);
     }
 
     const stats = this._computeStats(trades, rejections);
@@ -722,6 +714,23 @@ class StrategyReplayEngine {
   // ---------------------------------------------------------------------------
   // SL/TP Computation and Trade Lifecycle
   // ---------------------------------------------------------------------------
+
+  _finalizeTrade(trade, { exit, exitTime, exitReason, win, duration, pnlExit = exit }, advanceRiskEngine, trades) {
+    trade.exit = exit;
+    trade.exitTime = exitTime;
+    trade.exitReason = exitReason;
+    trade.win = win;
+    trade.duration = duration;
+    trade.rMultiple = this._round(this._directionPnL(trade.direction, pnlExit, trade.entry) / trade.riskSize);
+    trade.pnl = this._round((trade.direction === 'BUY'
+      ? pnlExit - trade.entry
+      : trade.entry - pnlExit) * trade.positionSize);
+    trade.pnlPercent = this._round(((pnlExit - trade.entry) / trade.entry) * 100 * (trade.direction === 'BUY' ? 1 : -1));
+
+    const finalizedPnl = trade.pnl;
+    trades.push({ ...trade });
+    advanceRiskEngine.onTradeClosed(finalizedPnl);
+  }
 
   _computeLevels(price, direction, atr) {
     const atrValue = atr?.ready ? atr.atr : null;
