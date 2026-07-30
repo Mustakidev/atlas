@@ -1,5 +1,15 @@
 const { getFinalizedCandles } = require('../engine/candleUtils');
 
+function isValidCandle(candle) {
+  return Boolean(candle)
+    && Number.isFinite(candle.high)
+    && Number.isFinite(candle.low)
+    && Number.isFinite(candle.close)
+    && candle.high >= candle.low
+    && candle.close >= candle.low
+    && candle.close <= candle.high;
+}
+
 function createExecutionPipeline({
   config,
   logger,
@@ -43,6 +53,26 @@ function createExecutionPipeline({
     }
   }
 
+  function processTradeLifecycle(price, activeCandle) {
+    const closed = safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
+    if (closed.length > 0) {
+      for (const t of closed) {
+        safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl), undefined);
+        console.log(`  Trade Closed: ${t.tradeId} | ${t.exitReason} | Entry=$${t.entryPrice} → Exit=$${t.exitPrice} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
+      }
+    }
+
+    if (!isValidCandle(activeCandle)) return;
+
+    const candleResult = safeExecute('PaperTrading', () => paperTradeEngine.onCandle(activeCandle), null);
+    if (candleResult && candleResult.closed && candleResult.closed.length > 0) {
+      for (const t of candleResult.closed) {
+        safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl), undefined);
+        console.log(`  Trade Closed (candle): ${t.tradeId} | ${t.exitReason} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
+      }
+    }
+  }
+
   function run(snapshot) {
     pipelineCycleCount++;
     const tf = '1h';
@@ -69,7 +99,7 @@ function createExecutionPipeline({
       verdict: { tradeOpened: false, rejectionReason: null, trade: null },
     };
 
-    if (!price || price <= 0) {
+    if (!Number.isFinite(price) || price <= 0) {
       decision.verdict.rejectionReason = 'No valid price data';
       lastDecision = decision;
       console.log(`  Confluence Score: --`);
@@ -80,6 +110,9 @@ function createExecutionPipeline({
       console.log(divider);
       return;
     }
+
+    const activeCandle = candleEngine.getActive(tf);
+    processTradeLifecycle(price, activeCandle);
 
     const finalized = getFinalizedCandles(candleEngine, tf, 500);
 
@@ -196,7 +229,6 @@ function createExecutionPipeline({
       console.log(`  Execution Triggered: NO`);
       console.log(`  Reason: ${biasReason}`);
       console.log(divider);
-      safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
       return;
     }
 
@@ -226,7 +258,6 @@ function createExecutionPipeline({
       console.log(`  Trade Allowed: NO`);
       console.log(`  Execution Triggered: NO`);
       console.log(divider);
-      safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
       return;
     }
 
@@ -259,7 +290,6 @@ function createExecutionPipeline({
       console.log(`  Trade Allowed: NO`);
       console.log(`  Execution Triggered: NO`);
       console.log(divider);
-      safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
       return;
     }
 
@@ -286,7 +316,6 @@ function createExecutionPipeline({
       console.log(`  Execution Triggered: NO`);
       console.log(`  Reason: ${riskResult.rejectionReason}`);
       console.log(divider);
-      safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
       return;
     }
 
@@ -298,7 +327,6 @@ function createExecutionPipeline({
       console.log(`  Execution Triggered: NO`);
       console.log(`  Reason: Cooldown active — ${waitSec}s remaining (min 60s between trades)`);
       console.log(divider);
-      safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
       return;
     }
 
@@ -326,25 +354,6 @@ function createExecutionPipeline({
       console.log(`  Execution Triggered: YES`);
       console.log(`  Trade Opened: NO`);
       console.log(`  Reason: paperTradeEngine.signal() rejected — internal analysis: direction neutral or confidence < 30%`);
-    }
-
-    const closed = safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
-    if (closed.length > 0) {
-      for (const t of closed) {
-        safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl), undefined);
-        console.log(`  Trade Closed: ${t.tradeId} | ${t.exitReason} | Entry=$${t.entryPrice} → Exit=$${t.exitPrice} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
-      }
-    }
-
-    const activeCandle = candleEngine.getActive(tf);
-    if (activeCandle) {
-      const candleResult = safeExecute('PaperTrading', () => paperTradeEngine.onCandle(activeCandle), null);
-      if (candleResult && candleResult.closed && candleResult.closed.length > 0) {
-        for (const t of candleResult.closed) {
-          safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl), undefined);
-          console.log(`  Trade Closed (candle): ${t.tradeId} | ${t.exitReason} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
-        }
-      }
     }
 
     const openCount = paperTradeEngine.open().length;
