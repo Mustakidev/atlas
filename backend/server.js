@@ -5,7 +5,7 @@ const { HistoryEngine } = require('./src/engine/history');
 const { MarketAnalyzer } = require('./src/engine/analyzer');
 const { RetryHandler } = require('./src/network/retry');
 const { ApiManager } = require('./src/network/apiManager');
-const { CandleEngine } = require('./src/engine/candles');
+const { CandleEngine, sortHistoricalOhlcRows } = require('./src/engine/candles');
 const { EventBus } = require('./src/core/eventBus');
 const { createIndicatorRegistry } = require('./src/engine/indicators');
 const { getFinalizedCandles } = require('./src/engine/candleUtils');
@@ -422,14 +422,16 @@ async function seedHistoricalCandles() {
     const ohlcRes = await fetch(`${baseUrl}/coins/${coinId}/ohlc?vs_currency=${vsCurrency}&days=30`);
     if (ohlcRes.ok) {
       const ohlcData = await ohlcRes.json();
-      for (const [ts, open, high, low, close] of ohlcData) {
-        const avgPrice = (open + high + low + close) / 4;
-        candleEngine.ingest({
-          symbol,
-          price: close,
+      if (!Array.isArray(ohlcData)) {
+        throw new TypeError('Historical OHLC response must be an array');
+      }
+      const sortedOhlcData = sortHistoricalOhlcRows(ohlcData);
+      for (const [ts, open, high, low, close] of sortedOhlcData) {
+        candleEngine.ingestHistoricalCandle('4h', {
           open: open,
           high: high,
           low: low,
+          close,
           volume: 0,
           timestamp: new Date(ts).toISOString(),
         });
