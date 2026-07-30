@@ -85,6 +85,28 @@ function makeReplay({ riskPolicySource, sourceMtf, lowerOpposition = false } = {
   return { replay, risk, mtf };
 }
 
+function setRegimeScenario(replay, { regime, confluenceScore, direction }) {
+  replay._runMarketRegime = () => ({
+    regime,
+    confidence: 80,
+    trendScore: 80,
+    rangeScore: 20,
+    volatility: regime === 'HIGH_VOLATILITY' ? 'HIGH' : 'LOW',
+  });
+  replay._runConfluence = () => ({
+    score: confluenceScore,
+    bias: direction === 'BUY' ? 'Bullish' : 'Bearish',
+    confidence: 80,
+  });
+  replay._analyzeEngines = () => ({
+    direction,
+    confidence: 80,
+    reason: 'controlled regime-gate replay',
+    buyRatio: direction === 'BUY' ? 0.8 : 0.2,
+    sellRatio: direction === 'SELL' ? 0.8 : 0.2,
+  });
+}
+
 function makeRiskPolicy({ maxConsecutiveLosses = 3, cooldownMs = 3600000 } = {}) {
   const source = new AdvanceRiskEngine({ logger, symbol: 'BTCUSDT', paperTradeEngine: {}, config });
   source.setMaxDailyLossPct(100);
@@ -181,6 +203,106 @@ test('replay ignores production regime dependencies and uses replay-local regime
 
   assert.equal(productionRegimeCalls, 0);
   assert.equal(result.regimeHistory[0].regime, 'TRENDING_BULL');
+});
+
+test('replay rejects HIGH_VOLATILITY BUY signals at the regime gate', () => {
+  const { replay } = makeReplay();
+  setRegimeScenario(replay, { regime: 'HIGH_VOLATILITY', confluenceScore: 65, direction: 'BUY' });
+
+  const regimeDecision = replay._runRegimeDecision(
+    { regime: 'HIGH_VOLATILITY', confidence: 80 },
+    'BUY',
+    65,
+  );
+  const result = replay.run(candles('up', 51), '1h');
+
+  assert.equal(regimeDecision.allowTrade, false);
+  assert.equal(result.trades.length, 0);
+  assert.equal(result.stats.totalTrades, 0);
+  assert.equal(result.stats.wins, 0);
+  assert.equal(result.stats.losses, 0);
+  assert.equal(result.stats.totalRejections, 1);
+  assert.equal(result.rejections.length, 1);
+  assert.equal(result.rejections[0].direction, 'BUY');
+  assert.match(result.rejections[0].reason, /Regime Decision: High volatility/);
+  assert.match(result.rejections[0].reason, /confluence 65 < required 70/);
+});
+
+test('replay rejects HIGH_VOLATILITY SELL signals at the regime gate', () => {
+  const { replay } = makeReplay();
+  setRegimeScenario(replay, { regime: 'HIGH_VOLATILITY', confluenceScore: 65, direction: 'SELL' });
+  const createReplayDependencies = replay._createReplayDependencies.bind(replay);
+  replay._createReplayDependencies = () => {
+    const dependencies = createReplayDependencies();
+    dependencies.mtfConfirmationEngine = { evaluate: () => ({ mtfAllowed: true }) };
+    return dependencies;
+  };
+
+  const regimeDecision = replay._runRegimeDecision(
+    { regime: 'HIGH_VOLATILITY', confidence: 80 },
+    'SELL',
+    65,
+  );
+  const result = replay.run(candles('down', 51), '1h');
+
+  assert.equal(regimeDecision.allowTrade, false);
+  assert.equal(result.trades.length, 0);
+  assert.equal(result.stats.totalTrades, 0);
+  assert.equal(result.stats.totalRejections, 1);
+  assert.equal(result.rejections[0].direction, 'SELL');
+  assert.match(result.rejections[0].reason, /Regime Decision: High volatility/);
+});
+
+test('replay accepts HIGH_VOLATILITY trades at the confluence boundary', () => {
+  const { replay } = makeReplay();
+  setRegimeScenario(replay, { regime: 'HIGH_VOLATILITY', confluenceScore: 70, direction: 'BUY' });
+
+  const result = replay.run(candles('up'), '1h');
+  const trade = result.trades[0];
+
+  assert.ok(trade);
+  assert.equal(result.rejections.length, 0);
+  assert.equal(result.stats.totalTrades, 1);
+  assert.equal(trade.regimeDecision.allowTrade, true);
+  assert.equal(trade.regimeDecision.preferredDirection, 'BUY');
+  assert.equal(trade.stopLoss, 148.5);
+  assert.equal(trade.takeProfit, 154.5);
+  assert.equal(trade.positionSize, 33.34);
+  assert.equal(trade.riskReward, 3);
+});
+
+test('rejected regime decisions do not consume trade ids or advance closure risk state', () => {
+  const source = makeRiskPolicy();
+  const { replay } = makeReplay({ riskPolicySource: source });
+  const { risk, closedPnLs } = instrumentReplayRisk(replay);
+  let regimeCalls = 0;
+
+  replay._runMarketRegime = () => ({
+    regime: regimeCalls++ === 0 ? 'HIGH_VOLATILITY' : 'TRENDING_BULL',
+    confidence: 80,
+    trendScore: 80,
+    rangeScore: 20,
+    volatility: 'HIGH',
+  });
+  replay._runConfluence = () => ({ score: 65, bias: 'Bullish', confidence: 80 });
+  replay._analyzeEngines = () => ({
+    direction: 'BUY',
+    confidence: 80,
+    reason: 'controlled regime-gate replay',
+    buyRatio: 0.8,
+    sellRatio: 0.2,
+  });
+
+  const result = replay.run(candles('up', 53), '1h');
+
+  assert.equal(result.rejections.length, 1);
+  assert.equal(result.trades.length, 1);
+  assert.equal(result.trades[0].tradeId, 'SR-1');
+  assert.equal(result.stats.totalTrades, 1);
+  assert.equal(result.stats.totalRejections, 1);
+  assert.deepEqual(closedPnLs, [50]);
+  assert.equal(risk.getDailyPnL(), 50);
+  assert.equal(risk.getConsecutiveLosses(), 0);
 });
 
 test('replay creates fresh MTF state and explicitly requests normal mode', () => {
