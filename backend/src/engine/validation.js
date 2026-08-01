@@ -1818,15 +1818,24 @@ class ValidationEngine {
 
       const midCandle = { open: 55100, high: 55200, low: 55050, close: 55150, volume: 100, timestamp: new Date().toISOString() };
       engine.onCandle(midCandle);
-      if (trade.status !== 'ACTIVE') return { status: 'FAIL', reason: `Expected ACTIVE after onCandle, got ${trade.status}` };
+      const activeTrade = engine.getTrade(trade.tradeId);
+      if (!activeTrade || activeTrade.status !== 'ACTIVE') return { status: 'FAIL', reason: `Expected ACTIVE after onCandle, got ${activeTrade?.status}` };
 
       const tpCandle = { open: trade.takeProfit - 10, high: trade.takeProfit + 100, low: trade.takeProfit - 20, close: trade.takeProfit + 50, volume: 100, timestamp: new Date().toISOString() };
       const result = engine.onCandle(tpCandle);
-      if (trade.status !== 'CLOSED') return { status: 'FAIL', reason: `Expected CLOSED after TP hit, got ${trade.status}` };
-      if (trade.exitReason !== 'Take Profit') return { status: 'FAIL', reason: `Expected exitReason=Take Profit, got ${trade.exitReason}` };
-      if (trade.pnl <= 0) return { status: 'FAIL', reason: `TP should have positive PnL, got ${trade.pnl}` };
       if (result.closed.length !== 1) return { status: 'FAIL', reason: `Expected 1 closed in result, got ${result.closed.length}` };
-      return { status: 'PASS', reason: `Full lifecycle: OPEN→ACTIVE→CLOSED via TP, pnl=${trade.pnl}` };
+      const closedTrade = result.closed[0];
+      if (closedTrade.status !== 'CLOSED') return { status: 'FAIL', reason: `Expected CLOSED after TP hit, got ${closedTrade.status}` };
+      if (closedTrade.exitReason !== 'Take Profit') return { status: 'FAIL', reason: `Expected exitReason=Take Profit, got ${closedTrade.exitReason}` };
+      if (closedTrade.pnl <= 0) return { status: 'FAIL', reason: `TP should have positive PnL, got ${closedTrade.pnl}` };
+      const currentTrade = engine.getTrade(trade.tradeId);
+      if (!currentTrade || currentTrade.status !== 'CLOSED') return { status: 'FAIL', reason: `Expected stored trade CLOSED, got ${currentTrade?.status}` };
+      if (currentTrade.exitPrice !== closedTrade.exitPrice) return { status: 'FAIL', reason: 'Stored exitPrice does not match closure result' };
+      if (currentTrade.exitTime !== closedTrade.exitTime) return { status: 'FAIL', reason: 'Stored exitTime does not match closure result' };
+      if (currentTrade.exitReason !== closedTrade.exitReason) return { status: 'FAIL', reason: 'Stored exitReason does not match closure result' };
+      if (currentTrade.duration !== closedTrade.duration) return { status: 'FAIL', reason: 'Stored duration does not match closure result' };
+      if (currentTrade.pnl !== closedTrade.pnl || currentTrade.pnlPercent !== closedTrade.pnlPercent) return { status: 'FAIL', reason: 'Stored PnL does not match closure result' };
+      return { status: 'PASS', reason: `Full lifecycle: OPEN→ACTIVE→CLOSED via TP, pnl=${closedTrade.pnl}` };
     }));
 
     // Test 16: onCandle SL closes trade
@@ -1836,11 +1845,19 @@ class ValidationEngine {
       if (!trade) return { status: 'FAIL', reason: 'No trade opened' };
 
       const slCandle = { open: trade.stopLoss + 10, high: trade.stopLoss + 20, low: trade.stopLoss - 100, close: trade.stopLoss - 50, volume: 100, timestamp: new Date().toISOString() };
-      engine.onCandle(slCandle);
-      if (trade.status !== 'CLOSED') return { status: 'FAIL', reason: `Expected CLOSED, got ${trade.status}` };
-      if (trade.exitReason !== 'Stop Loss') return { status: 'FAIL', reason: `Expected Stop Loss, got ${trade.exitReason}` };
-      if (trade.pnl >= 0) return { status: 'FAIL', reason: `SL should have negative PnL, got ${trade.pnl}` };
-      return { status: 'PASS', reason: `SL closed: pnl=${trade.pnl}, reason=${trade.exitReason}` };
+      const result = engine.onCandle(slCandle);
+      const closedTrade = result.closed[0];
+      if (!closedTrade || closedTrade.status !== 'CLOSED') return { status: 'FAIL', reason: `Expected CLOSED, got ${closedTrade?.status}` };
+      if (closedTrade.exitReason !== 'Stop Loss') return { status: 'FAIL', reason: `Expected Stop Loss, got ${closedTrade.exitReason}` };
+      if (closedTrade.pnl >= 0) return { status: 'FAIL', reason: `SL should have negative PnL, got ${closedTrade.pnl}` };
+      const currentTrade = engine.getTrade(trade.tradeId);
+      if (!currentTrade || currentTrade.status !== 'CLOSED') return { status: 'FAIL', reason: `Expected stored trade CLOSED, got ${currentTrade?.status}` };
+      if (currentTrade.exitPrice !== closedTrade.exitPrice) return { status: 'FAIL', reason: 'Stored exitPrice does not match closure result' };
+      if (currentTrade.exitTime !== closedTrade.exitTime) return { status: 'FAIL', reason: 'Stored exitTime does not match closure result' };
+      if (currentTrade.exitReason !== closedTrade.exitReason) return { status: 'FAIL', reason: 'Stored exitReason does not match closure result' };
+      if (currentTrade.duration !== closedTrade.duration) return { status: 'FAIL', reason: 'Stored duration does not match closure result' };
+      if (currentTrade.pnl !== closedTrade.pnl || currentTrade.pnlPercent !== closedTrade.pnlPercent) return { status: 'FAIL', reason: 'Stored PnL does not match closure result' };
+      return { status: 'PASS', reason: `SL closed: pnl=${closedTrade.pnl}, reason=${closedTrade.exitReason}` };
     }));
 
     // Test 17: Manual close via close()
@@ -1854,6 +1871,13 @@ class ValidationEngine {
       if (closed.status !== 'CLOSED') return { status: 'FAIL', reason: `Expected CLOSED, got ${closed.status}` };
       if (closed.exitReason !== 'Manual') return { status: 'FAIL', reason: `Expected Manual, got ${closed.exitReason}` };
       if (closed.pnl <= 0) return { status: 'FAIL', reason: `Manual close at 55500 should have positive PnL, got ${closed.pnl}` };
+      const currentTrade = engine.getTrade(trade.tradeId);
+      if (!currentTrade || currentTrade.status !== 'CLOSED') return { status: 'FAIL', reason: `Expected stored trade CLOSED, got ${currentTrade?.status}` };
+      if (currentTrade.exitPrice !== closed.exitPrice) return { status: 'FAIL', reason: 'Stored exitPrice does not match close result' };
+      if (currentTrade.exitTime !== closed.exitTime) return { status: 'FAIL', reason: 'Stored exitTime does not match close result' };
+      if (currentTrade.exitReason !== closed.exitReason) return { status: 'FAIL', reason: 'Stored exitReason does not match close result' };
+      if (currentTrade.duration !== closed.duration) return { status: 'FAIL', reason: 'Stored duration does not match close result' };
+      if (currentTrade.pnl !== closed.pnl || currentTrade.pnlPercent !== closed.pnlPercent) return { status: 'FAIL', reason: 'Stored PnL does not match close result' };
       return { status: 'PASS', reason: `Manual close: pnl=${closed.pnl}` };
     }));
 
@@ -1913,13 +1937,14 @@ class ValidationEngine {
       for (const field of required) {
         if (!(field in trade)) return { status: 'FAIL', reason: `Missing field: ${field}` };
       }
-      engine.close(trade.tradeId, 'Manual');
-      if (trade.exitPrice == null) return { status: 'FAIL', reason: 'exitPrice should be set after close' };
-      if (trade.exitTime == null) return { status: 'FAIL', reason: 'exitTime should be set after close' };
-      if (trade.exitReason !== 'Manual') return { status: 'FAIL', reason: `exitReason should be Manual, got ${trade.exitReason}` };
-      if (trade.duration == null || trade.duration < 0) return { status: 'FAIL', reason: `duration should be >= 0, got ${trade.duration}` };
-      if (trade.pnl == null) return { status: 'FAIL', reason: 'pnl should be set after close' };
-      if (trade.pnlPercent == null) return { status: 'FAIL', reason: 'pnlPercent should be set after close' };
+      const closedTrade = engine.close(trade.tradeId, 'Manual');
+      if (!closedTrade) return { status: 'FAIL', reason: 'close() returned null' };
+      if (closedTrade.exitPrice == null) return { status: 'FAIL', reason: 'exitPrice should be set after close' };
+      if (closedTrade.exitTime == null) return { status: 'FAIL', reason: 'exitTime should be set after close' };
+      if (closedTrade.exitReason !== 'Manual') return { status: 'FAIL', reason: `exitReason should be Manual, got ${closedTrade.exitReason}` };
+      if (closedTrade.duration == null || closedTrade.duration < 0) return { status: 'FAIL', reason: `duration should be >= 0, got ${closedTrade.duration}` };
+      if (closedTrade.pnl == null) return { status: 'FAIL', reason: 'pnl should be set after close' };
+      if (closedTrade.pnlPercent == null) return { status: 'FAIL', reason: 'pnlPercent should be set after close' };
       return { status: 'PASS', reason: `All ${required.length} fields present, lifecycle fields set after close` };
     }));
 
@@ -1978,11 +2003,19 @@ class ValidationEngine {
       if (trade.direction !== 'SELL') return { status: 'FAIL', reason: `Expected SELL, got ${trade.direction}` };
 
       const tpCandle = { open: trade.takeProfit + 10, high: trade.takeProfit + 20, low: trade.takeProfit - 100, close: trade.takeProfit - 50, volume: 100, timestamp: new Date().toISOString() };
-      engine.onCandle(tpCandle);
-      if (trade.status !== 'CLOSED') return { status: 'FAIL', reason: `Expected CLOSED, got ${trade.status}` };
-      if (trade.exitReason !== 'Take Profit') return { status: 'FAIL', reason: `Expected Take Profit, got ${trade.exitReason}` };
-      if (trade.pnl <= 0) return { status: 'FAIL', reason: `SELL TP should have positive PnL, got ${trade.pnl}` };
-      return { status: 'PASS', reason: `SELL TP: pnl=${trade.pnl}` };
+      const result = engine.onCandle(tpCandle);
+      const closedTrade = result.closed[0];
+      if (!closedTrade || closedTrade.status !== 'CLOSED') return { status: 'FAIL', reason: `Expected CLOSED, got ${closedTrade?.status}` };
+      if (closedTrade.exitReason !== 'Take Profit') return { status: 'FAIL', reason: `Expected Take Profit, got ${closedTrade.exitReason}` };
+      if (closedTrade.pnl <= 0) return { status: 'FAIL', reason: `SELL TP should have positive PnL, got ${closedTrade.pnl}` };
+      const currentTrade = engine.getTrade(trade.tradeId);
+      if (!currentTrade || currentTrade.status !== 'CLOSED') return { status: 'FAIL', reason: `Expected stored trade CLOSED, got ${currentTrade?.status}` };
+      if (currentTrade.exitPrice !== closedTrade.exitPrice) return { status: 'FAIL', reason: 'Stored exitPrice does not match closure result' };
+      if (currentTrade.exitTime !== closedTrade.exitTime) return { status: 'FAIL', reason: 'Stored exitTime does not match closure result' };
+      if (currentTrade.exitReason !== closedTrade.exitReason) return { status: 'FAIL', reason: 'Stored exitReason does not match closure result' };
+      if (currentTrade.duration !== closedTrade.duration) return { status: 'FAIL', reason: 'Stored duration does not match closure result' };
+      if (currentTrade.pnl !== closedTrade.pnl || currentTrade.pnlPercent !== closedTrade.pnlPercent) return { status: 'FAIL', reason: 'Stored PnL does not match closure result' };
+      return { status: 'PASS', reason: `SELL TP: pnl=${closedTrade.pnl}` };
     }));
 
     // Test 27: No open() on already-closed trades
