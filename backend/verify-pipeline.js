@@ -42,6 +42,10 @@ function fetchJSON(urlPath) {
       let data = '';
       res.on('data', (chunk) => data += chunk);
       res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(`HTTP ${res.statusCode} for ${urlPath}`));
+          return;
+        }
         try {
           resolve(JSON.parse(data));
         } catch (e) {
@@ -54,6 +58,135 @@ function fetchJSON(urlPath) {
   });
 }
 
+const IMMUTABLE_TRADE_FIELDS = ['side', 'entry', 'sl', 'tp', 'size', 'rr', 'openedAt'];
+const CLOSURE_TRADE_FIELDS = ['exit', 'pnl', 'closedAt'];
+
+function isValidTimestamp(value) {
+  return typeof value === 'string' && value.length > 0 && Number.isFinite(Date.parse(value));
+}
+
+function requireFiniteNumber(value, fieldName) {
+  if (!Number.isFinite(value)) {
+    throw new Error(`Invalid paper trade ${fieldName}`);
+  }
+}
+
+function normalizeTrade(trade, collection) {
+  if (!trade || typeof trade !== 'object' || Array.isArray(trade)) {
+    throw new Error('Invalid paper trade entry');
+  }
+
+  if (typeof trade.tradeId !== 'string' || trade.tradeId.trim() === '') {
+    throw new Error('Paper trade is missing tradeId');
+  }
+  if (!['BUY', 'SELL'].includes(trade.direction)) {
+    throw new Error(`Invalid paper trade direction for ${trade.tradeId}`);
+  }
+  if (!['OPEN', 'ACTIVE', 'CLOSED'].includes(trade.status)) {
+    throw new Error(`Invalid paper trade status for ${trade.tradeId}`);
+  }
+  if (collection === 'open' && trade.status === 'CLOSED') {
+    throw new Error(`Closed paper trade present in open collection: ${trade.tradeId}`);
+  }
+  if (collection === 'closed' && trade.status !== 'CLOSED') {
+    throw new Error(`Open paper trade present in closed collection: ${trade.tradeId}`);
+  }
+
+  for (const [field, value] of [
+    ['entryPrice', trade.entryPrice],
+    ['stopLoss', trade.stopLoss],
+    ['takeProfit', trade.takeProfit],
+    ['positionSize', trade.positionSize],
+    ['riskReward', trade.riskReward],
+  ]) {
+    requireFiniteNumber(value, field);
+  }
+  if (!isValidTimestamp(trade.entryTime) || !isValidTimestamp(trade.timestamp)) {
+    throw new Error(`Invalid paper trade timestamp for ${trade.tradeId}`);
+  }
+
+  const isClosed = trade.status === 'CLOSED';
+  if (isClosed) {
+    requireFiniteNumber(trade.exitPrice, 'exitPrice');
+    requireFiniteNumber(trade.pnl, 'pnl');
+    if (!isValidTimestamp(trade.exitTime)) {
+      throw new Error(`Invalid paper trade exitTime for ${trade.tradeId}`);
+    }
+  } else {
+    if (trade.exitPrice !== null && trade.exitPrice !== undefined) {
+      requireFiniteNumber(trade.exitPrice, 'exitPrice');
+    }
+    if (trade.pnl !== null && trade.pnl !== undefined) {
+      requireFiniteNumber(trade.pnl, 'pnl');
+    }
+    if (trade.exitTime !== null && trade.exitTime !== undefined && !isValidTimestamp(trade.exitTime)) {
+      throw new Error(`Invalid paper trade exitTime for ${trade.tradeId}`);
+    }
+  }
+
+  return {
+    id: trade.tradeId,
+    type: isClosed ? 'closed' : 'opened',
+    side: trade.direction,
+    entry: trade.entryPrice,
+    exit: trade.exitPrice ?? null,
+    sl: trade.stopLoss,
+    tp: trade.takeProfit,
+    size: trade.positionSize,
+    rr: trade.riskReward,
+    pnl: trade.pnl ?? null,
+    openedAt: trade.entryTime,
+    closedAt: trade.exitTime ?? null,
+    timestamp: trade.timestamp,
+  };
+}
+
+function normalizePaperTradeResponse(response) {
+  if (!response || typeof response !== 'object' || Array.isArray(response)) {
+    throw new Error('Invalid paper trades response object');
+  }
+  if (!Object.hasOwn(response, 'open') || !Object.hasOwn(response, 'closed')) {
+    throw new Error('Paper trades response must contain open and closed arrays');
+  }
+  if (!Array.isArray(response.open) || !Array.isArray(response.closed)) {
+    throw new Error('Paper trades response open and closed fields must be arrays');
+  }
+
+  return {
+    open: response.open.map(trade => normalizeTrade(trade, 'open')),
+    closed: response.closed.map(trade => normalizeTrade(trade, 'closed')),
+  };
+}
+
+function assertCompatibleTrade(existing, incoming, fields) {
+  for (const field of fields) {
+    if (!Object.is(existing[field], incoming[field])) {
+      throw new Error(`Conflicting paper trade ${field} for ${incoming.id}`);
+    }
+  }
+}
+
+function mergeTradeObservation(tradesById, observation) {
+  const existing = tradesById.get(observation.id);
+  if (!existing) {
+    tradesById.set(observation.id, { ...observation });
+    return;
+  }
+
+  assertCompatibleTrade(existing, observation, IMMUTABLE_TRADE_FIELDS);
+
+  if (observation.type === 'closed') {
+    if (existing.type === 'closed') {
+      assertCompatibleTrade(existing, observation, CLOSURE_TRADE_FIELDS);
+    } else {
+      existing.type = 'closed';
+      existing.exit = observation.exit;
+      existing.pnl = observation.pnl;
+      existing.closedAt = observation.closedAt;
+    }
+  }
+}
+
 function formatTime(ms) {
   const s = Math.floor(ms / 1000);
   const m = Math.floor(s / 60);
@@ -61,7 +194,48 @@ function formatTime(ms) {
   return `${h}h ${m % 60}m ${s % 60}s`;
 }
 
-function generateReport(cycles, trades, startTime, endTime) {
+function evaluateChecks(cycles, trades, verificationState = {}) {
+  const totalCycles = cycles.length;
+  const cyclesWithPrice = cycles.filter(c => c.price != null);
+  const cyclesNoPrice = cycles.filter(c => c.price == null);
+  const confluenceScores = cyclesWithPrice.map(c => c.confluenceScore).filter(s => s != null);
+  const biasCounts = {};
+  const rejectionReasons = {};
+  cycles.forEach(c => {
+    const bias = c.bias || 'Unknown';
+    biasCounts[bias] = (biasCounts[bias] || 0) + 1;
+    if (!c.tradeOpened) {
+      const reason = c.rejectionReason || 'Unknown';
+      rejectionReasons[reason] = (rejectionReasons[reason] || 0) + 1;
+    }
+  });
+  const gateNotEval = {};
+  const gateNames = ['confluenceBias', 'trend', 'structure', 'rsi', 'ema', 'macd', 'atr', 'bollinger', 'riskEngine'];
+  gateNames.forEach(g => { gateNotEval[g] = 0; });
+  cycles.forEach(c => {
+    if (c.gates) {
+      gateNames.forEach(g => {
+        if (!c.gates[g]) gateNotEval[g]++;
+      });
+    }
+  });
+
+  const checks = [
+    { name: 'Pipeline running (cycles > 0)', pass: totalCycles > 0 },
+    { name: 'Price data available', pass: cyclesWithPrice.length > 0 },
+    { name: 'Confluence scores computed', pass: confluenceScores.length > 0 },
+    { name: 'All gates evaluated (no stale --)', pass: gateNotEval.confluenceBias === 0 || cyclesNoPrice.length === gateNotEval.confluenceBias },
+    { name: 'Bias distribution valid (no Unknown)', pass: !biasCounts['Unknown'] || biasCounts['Unknown'] === 0 },
+    { name: 'Rejection reasons recorded', pass: Object.keys(rejectionReasons).length > 0 },
+    { name: 'Consistent cycle count', pass: totalCycles >= (DURATION_MIN * 60 / POLL_INTERVAL_SEC * 0.8) },
+    { name: 'Pipeline endpoint contract', pass: !verificationState.inspectorFailed },
+    { name: 'Paper trades response contract', pass: !verificationState.paperContractFailed },
+  ];
+
+  return { checks, allPass: checks.every(c => c.pass) };
+}
+
+function generateReport(cycles, trades, startTime, endTime, verificationState = {}) {
   const totalCycles = cycles.length;
   const durationMs = endTime - startTime;
 
@@ -116,7 +290,7 @@ function generateReport(cycles, trades, startTime, endTime) {
   const minConfluence = confluenceScores.length ? Math.min(...confluenceScores) : 'N/A';
   const maxConfluence = confluenceScores.length ? Math.max(...confluenceScores) : 'N/A';
 
-  const tradesOpened = trades.filter(t => t.type === 'opened');
+  const tradesOpened = trades;
   const tradesClosed = trades.filter(t => t.type === 'closed');
   const totalTradesOpened = tradesOpened.length;
   const totalTradesClosed = tradesClosed.length;
@@ -242,21 +416,13 @@ function generateReport(cycles, trades, startTime, endTime) {
   }
 
   md += `## Verification Checks\n\n`;
-  const checks = [];
-  checks.push({ name: 'Pipeline running (cycles > 0)', pass: totalCycles > 0 });
-  checks.push({ name: 'Price data available', pass: cyclesWithPrice.length > 0 });
-  checks.push({ name: 'Confluence scores computed', pass: confluenceScores.length > 0 });
-  checks.push({ name: 'All gates evaluated (no stale --)', pass: gateNotEval.confluenceBias === 0 || cyclesNoPrice.length === gateNotEval.confluenceBias });
-  checks.push({ name: 'Bias distribution valid (no Unknown)', pass: !biasCounts['Unknown'] || biasCounts['Unknown'] === 0 });
-  checks.push({ name: 'Rejection reasons recorded', pass: Object.keys(rejectionReasons).length > 0 });
-  checks.push({ name: 'Consistent cycle count', pass: totalCycles >= (DURATION_MIN * 60 / POLL_INTERVAL_SEC * 0.8) });
+  const { checks, allPass } = evaluateChecks(cycles, trades, verificationState);
 
   md += `| Check | Status |\n`;
   md += `|---|---|\n`;
   checks.forEach(c => {
     md += `| ${c.name} | ${c.pass ? '✅ PASS' : '❌ FAIL'} |\n`;
   });
-  const allPass = checks.every(c => c.pass);
   md += `\n**Overall:** ${allPass ? '✅ ALL CHECKS PASSED' : '❌ SOME CHECKS FAILED'}\n`;
 
   md += `\n---\n*Report generated by Atlas Pipeline Verification Script*\n`;
@@ -285,10 +451,16 @@ async function main() {
 
   const startTime = Date.now();
   const cycles = [];
-  const trades = [];
+  const tradesById = new Map();
   const seenCycles = new Set();
   let pollCount = 0;
   let errorCount = 0;
+  const verificationState = {
+    paperContractFailed: false,
+    inspectorFailed: false,
+    firstPaperFailure: null,
+    firstInspectorFailure: null,
+  };
 
   console.log(`\nRecording started at ${new Date(startTime).toISOString()}`);
   console.log(`Output: ${OUTPUT_FILE}\n`);
@@ -299,10 +471,25 @@ async function main() {
   while (Date.now() < endTime) {
     pollCount++;
     try {
-      const [inspector, paperTrades] = await Promise.all([
+      const [inspectorResult, paperTradesResult] = await Promise.allSettled([
         fetchJSON('/api/signal/inspector'),
         fetchJSON('/api/paper-trades')
       ]);
+
+      if (inspectorResult.status === 'rejected') {
+        verificationState.inspectorFailed = true;
+        verificationState.firstInspectorFailure = verificationState.firstInspectorFailure || inspectorResult.reason.message;
+      }
+      if (paperTradesResult.status === 'rejected') {
+        verificationState.paperContractFailed = true;
+        verificationState.firstPaperFailure = verificationState.firstPaperFailure || paperTradesResult.reason.message;
+      }
+      if (inspectorResult.status === 'rejected' || paperTradesResult.status === 'rejected') {
+        throw inspectorResult.status === 'rejected' ? inspectorResult.reason : paperTradesResult.reason;
+      }
+
+      const inspector = inspectorResult.value;
+      const paperTrades = paperTradesResult.value;
 
       if (inspector && inspector.available) {
         const cycleKey = `${inspector.cycle}-${inspector.timestamp}`;
@@ -325,32 +512,14 @@ async function main() {
         }
       }
 
-      if (paperTrades && Array.isArray(paperTrades)) {
-        paperTrades.forEach(t => {
-          const existing = trades.find(x => x.id === t.id);
-          if (!existing) {
-            trades.push({
-              id: t.id,
-              type: t.status === 'closed' ? 'closed' : 'opened',
-              side: t.side,
-              entry: t.entry,
-              exit: t.exit,
-              sl: t.sl,
-              tp: t.tp,
-              size: t.size,
-              rr: t.rr,
-              pnl: t.pnl,
-              openedAt: t.openedAt,
-              closedAt: t.closedAt,
-              timestamp: t.timestamp,
-            });
-          } else if (t.status === 'closed' && existing.type !== 'closed') {
-            existing.type = 'closed';
-            existing.exit = t.exit;
-            existing.pnl = t.pnl;
-            existing.closedAt = t.closedAt;
-          }
-        });
+      try {
+        const normalizedPaperTrades = normalizePaperTradeResponse(paperTrades);
+        normalizedPaperTrades.open.forEach(trade => mergeTradeObservation(tradesById, trade));
+        normalizedPaperTrades.closed.forEach(trade => mergeTradeObservation(tradesById, trade));
+      } catch (e) {
+        verificationState.paperContractFailed = true;
+        verificationState.firstPaperFailure = verificationState.firstPaperFailure || e.message;
+        throw e;
       }
 
       const elapsed = Date.now() - startTime;
@@ -358,7 +527,7 @@ async function main() {
       if (elapsedMin > lastProgressPrint) {
         lastProgressPrint = elapsedMin;
         const pct = (elapsed / DURATION_MS * 100).toFixed(1);
-        console.log(`[${new Date().toLocaleTimeString()}] ${pct}% | Cycles: ${cycles.length} | Trades: ${trades.length} | Errors: ${errorCount}`);
+        console.log(`[${new Date().toLocaleTimeString()}] ${pct}% | Cycles: ${cycles.length} | Trades: ${tradesById.size} | Errors: ${errorCount}`);
       }
     } catch (e) {
       errorCount++;
@@ -373,6 +542,7 @@ async function main() {
   const actualEndTime = Date.now();
   console.log(`\n═══════════════════════════════════════════════`);
   console.log(`  Recording complete: ${formatTime(actualEndTime - startTime)}`);
+  const trades = Array.from(tradesById.values());
   console.log(`  Cycles: ${cycles.length} | Trades: ${trades.length} | Errors: ${errorCount}`);
   console.log(`═══════════════════════════════════════════════\n`);
 
@@ -381,15 +551,29 @@ async function main() {
   console.log(`Raw data saved: ${OUTPUT_FILE}`);
 
   // Generate and save report
-  const report = generateReport(cycles, trades, startTime, actualEndTime);
+  const report = generateReport(cycles, trades, startTime, actualEndTime, verificationState);
   fs.writeFileSync(REPORT_FILE, report);
   console.log(`Report saved: ${REPORT_FILE}\n`);
 
   // Print report to console
   console.log(report);
+
+  const { allPass } = evaluateChecks(cycles, trades, verificationState);
+  if (!allPass) process.exitCode = 1;
 }
 
-main().catch(e => {
-  console.error('Fatal error:', e.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(e => {
+    console.error('Fatal error:', e.message);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  evaluateChecks,
+  fetchJSON,
+  generateReport,
+  mergeTradeObservation,
+  normalizePaperTradeResponse,
+  normalizeTrade,
+};
