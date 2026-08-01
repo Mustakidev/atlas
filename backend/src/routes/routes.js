@@ -2,6 +2,12 @@ const express = require('express');
 const { sanitizeQuery } = require('../middleware/validate');
 const { getFinalizedCandles } = require('../engine/candleUtils');
 
+function asyncHandler(handler) {
+  return function wrappedAsyncHandler(req, res, next) {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
+
 function createRouter(deps) {
   const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, strategyReplayEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision } = deps;
   const router = express.Router();
@@ -963,7 +969,7 @@ function createRouter(deps) {
   // Strategy Replay — historical execution pipeline replay
   // ---------------------------------------------------------------------------
 
-  router.get('/strategy/replay', async (req, res) => {
+  router.get('/strategy/replay', asyncHandler(async (req, res) => {
     if (!strategyReplayEngine) {
       return res.status(503).json({ error: 'Strategy replay engine not available' });
     }
@@ -979,21 +985,17 @@ function createRouter(deps) {
     let candles = getFinalizedCandles(candleEngine, tf, 500);
 
     if (candles.length === 0) {
-      try {
-        const fetch = require('node-fetch');
-        const baseUrl = 'https://api.coingecko.com/api/v3';
-        const ohlcRes = await fetch(`${baseUrl}/coins/bitcoin/ohlc?vs_currency=usd&days=${days}`);
-        if (ohlcRes.ok) {
-          const ohlcData = await ohlcRes.json();
-          candles = ohlcData.map(([ts, open, high, low, close]) => ({
-            openTime: ts,
-            timestamp: new Date(ts).toISOString(),
-            open, high, low, close,
-            volume: 0,
-          }));
-        }
-      } catch (e) {
-        return res.status(500).json({ error: `Failed to fetch historical data: ${e.message}` });
+      const fetch = require('node-fetch');
+      const baseUrl = 'https://api.coingecko.com/api/v3';
+      const ohlcRes = await fetch(`${baseUrl}/coins/bitcoin/ohlc?vs_currency=usd&days=${days}`);
+      if (ohlcRes.ok) {
+        const ohlcData = await ohlcRes.json();
+        candles = ohlcData.map(([ts, open, high, low, close]) => ({
+          openTime: ts,
+          timestamp: new Date(ts).toISOString(),
+          open, high, low, close,
+          volume: 0,
+        }));
       }
     }
 
@@ -1008,7 +1010,7 @@ function createRouter(deps) {
     logger.info('StrategyReplay', `Replay complete | trades=${result.stats.totalTrades} | winRate=${result.stats.winRate}% | PF=${result.stats.profitFactor} | ${result.calculationTime}ms`);
 
     res.json(result);
-  });
+  }));
 
   return router;
 }
