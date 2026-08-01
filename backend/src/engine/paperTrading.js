@@ -132,7 +132,7 @@ class PaperTradingEngine {
 
     this.lastUpdated = new Date().toISOString();
     this.calculationTime = Date.now() - start;
-    return trade;
+    return this._copyTrade(trade);
   }
 
   _isValidExecutionPlan(plan, entryPrice, direction) {
@@ -195,7 +195,7 @@ class PaperTradingEngine {
       }
     }
 
-    return { opened: [], closed };
+    return { opened: [], closed: this._copyTrades(closed) };
   }
 
   close(tradeId, reason) {
@@ -204,7 +204,7 @@ class PaperTradingEngine {
     if (trade.status === TRADE_STATES.CLOSED) return null;
 
     const price = this._lastPrice || trade.currentPrice || trade.entryPrice;
-    return this._closeTrade(trade, price, reason || EXIT_REASONS.MANUAL);
+    return this._copyTrade(this._closeTrade(trade, price, reason || EXIT_REASONS.MANUAL));
   }
 
   invalidate(tradeId) {
@@ -212,7 +212,7 @@ class PaperTradingEngine {
     if (!trade) return null;
     if (trade.status === TRADE_STATES.CLOSED) return null;
 
-    return this._closeTrade(trade, trade.entryPrice, EXIT_REASONS.INVALIDATED);
+    return this._copyTrade(this._closeTrade(trade, trade.entryPrice, EXIT_REASONS.INVALIDATED));
   }
 
   evaluateTrades(currentPrice) {
@@ -242,7 +242,7 @@ class PaperTradingEngine {
       }
     }
 
-    return closed;
+    return this._copyTrades(closed);
   }
 
   // ---------------------------------------------------------------------------
@@ -250,28 +250,28 @@ class PaperTradingEngine {
   // ---------------------------------------------------------------------------
 
   all() {
-    return [...this._trades];
+    return this._copyTrades(this._trades);
   }
 
   open() {
-    return this._trades.filter(t => t.status === TRADE_STATES.OPEN || t.status === TRADE_STATES.ACTIVE);
+    return this._copyTrades(this._trades.filter(t => t.status === TRADE_STATES.OPEN || t.status === TRADE_STATES.ACTIVE));
   }
 
   pending() {
-    return this._trades.filter(t => t.status === TRADE_STATES.PENDING);
+    return this._copyTrades(this._trades.filter(t => t.status === TRADE_STATES.PENDING));
   }
 
   closed() {
-    return [...this._closedTrades];
+    return this._copyTrades(this._closedTrades);
   }
 
   history(limit) {
-    if (limit && limit > 0) return this._closedTrades.slice(-limit);
-    return [...this._closedTrades];
+    if (limit && limit > 0) return this._copyTrades(this._closedTrades.slice(-limit));
+    return this._copyTrades(this._closedTrades);
   }
 
   getTrade(tradeId) {
-    return this._trades.find(t => t.tradeId === tradeId) || null;
+    return this._copyTrade(this._trades.find(t => t.tradeId === tradeId) || null);
   }
 
   getBalance() {
@@ -284,7 +284,7 @@ class PaperTradingEngine {
 
   stats() {
     const allTrades = this._trades;
-    const open = this.open();
+    const open = this._trades.filter(t => t.status === TRADE_STATES.OPEN || t.status === TRADE_STATES.ACTIVE);
     const closed = this._closedTrades;
 
     if (closed.length === 0) {
@@ -365,7 +365,7 @@ class PaperTradingEngine {
       totalTrades: allTrades.length,
       openTrades: open.length,
       closedTrades: closed.length,
-      pendingTrades: this.pending().length,
+      pendingTrades: this._trades.filter(t => t.status === TRADE_STATES.PENDING).length,
 
       winRate: this._round(winRate),
       lossRate: this._round((losses.length / closed.length) * 100),
@@ -469,7 +469,7 @@ class PaperTradingEngine {
   }
 
   getLastAnalysis() {
-    return this._lastAnalysis || null;
+    return this._copyAnalysis(this._lastAnalysis || null);
   }
 
   // ---------------------------------------------------------------------------
@@ -762,7 +762,7 @@ class PaperTradingEngine {
       totalTrades: allTrades.length,
       openTrades: open.length,
       closedTrades: 0,
-      pendingTrades: this.pending().length,
+      pendingTrades: this._trades.filter(t => t.status === TRADE_STATES.PENDING).length,
       winRate: 0, lossRate: 0, breakevenRate: 0,
       totalPnl: 0, totalPnlPercent: 0, averagePnl: 0, averagePnlPercent: 0,
       grossProfit: 0, grossLoss: 0, profitFactor: 0, netReturnPct: 0,
@@ -784,6 +784,48 @@ class PaperTradingEngine {
 
   _round(value) {
     return Math.round(value * 100) / 100;
+  }
+
+  _copyTrade(trade) {
+    if (trade == null) return trade;
+
+    return {
+      tradeId: trade.tradeId,
+      symbol: trade.symbol,
+      timeframe: trade.timeframe,
+      direction: trade.direction,
+      entryPrice: trade.entryPrice,
+      entryTime: trade.entryTime,
+      stopLoss: trade.stopLoss,
+      takeProfit: trade.takeProfit,
+      riskReward: trade.riskReward,
+      positionSize: trade.positionSize,
+      currentPrice: trade.currentPrice,
+      status: trade.status,
+      exitPrice: trade.exitPrice,
+      exitTime: trade.exitTime,
+      exitReason: trade.exitReason,
+      duration: trade.duration,
+      pnl: trade.pnl,
+      pnlPercent: trade.pnlPercent,
+      confidence: trade.confidence,
+      reason: trade.reason,
+      timestamp: trade.timestamp,
+    };
+  }
+
+  _copyTrades(trades) {
+    if (trades == null) return [];
+    return trades.map(trade => this._copyTrade(trade));
+  }
+
+  _copyAnalysis(analysis) {
+    if (analysis == null) return analysis;
+    return {
+      direction: analysis.direction,
+      confidence: analysis.confidence,
+      reason: analysis.reason,
+    };
   }
 }
 
