@@ -130,6 +130,7 @@ const app = createApp({
   config,
   logger,
   routes: {
+    config,
     logger,
     apiManager,
     history,
