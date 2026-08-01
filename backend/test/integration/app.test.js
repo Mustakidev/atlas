@@ -1,14 +1,15 @@
 const http = require('node:http');
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const express = require('express');
 
-const { createApp } = require('../../src/app');
+const { createApp, createErrorHandler } = require('../../src/app');
 const { cloneFixture, validMarketSnapshot } = require('../fixtures/market');
 
 const API_KEY = 'integration-test-key';
 const ALLOWED_ORIGIN = 'http://allowed.test';
 
-function config() {
+function config(state = {}) {
   const values = {
     API_KEY,
     CORS_ORIGIN: ALLOWED_ORIGIN,
@@ -16,6 +17,15 @@ function config() {
     RATE_LIMIT_WINDOW_MS: 60 * 1000,
     RATE_LIMIT_MAX_REQUESTS: 1000,
     RATE_LIMIT_EXPENSIVE_MAX: 1000,
+    PORT: 3000,
+    REFRESH_INTERVAL: 2000,
+    CACHE_TTL: 30000,
+    MAX_HISTORY: 500,
+    LOG_LEVEL: 'INFO',
+    REQUEST_TIMEOUT: 10000,
+    MAX_RETRIES: 5,
+    INITIAL_BACKOFF: 1000,
+    ...state.configValues,
   };
 
   return {
@@ -24,8 +34,16 @@ function config() {
   };
 }
 
-function logger() {
-  return { info() {}, warn() {}, error() {}, system() {} };
+function logger(state) {
+  return {
+    info() {},
+    warn() {},
+    error(module, message, data) {
+      state.errors = state.errors || [];
+      state.errors.push({ module, message, data });
+    },
+    system() {},
+  };
 }
 
 function createTestApp(state) {
@@ -33,10 +51,16 @@ function createTestApp(state) {
   const deps = {
     apiManager: {
       isConnected: () => true,
-      getHealth: () => ({ connected: true, consecutiveFailures: 0 }),
+      getHealth: () => {
+        if (state.throwHealth) throw new Error(state.errorMessage);
+        return { connected: true, consecutiveFailures: 0 };
+      },
     },
     history: {
-      latest: () => cloneFixture(snapshot),
+      latest: () => {
+        if (state.throwHistory) throw new Error(state.errorMessage);
+        return cloneFixture(snapshot);
+      },
       last: () => [cloneFixture(snapshot)],
       size: () => 1,
     },
@@ -46,8 +70,8 @@ function createTestApp(state) {
       getCandles: () => [],
       getActive: () => null,
     },
-    logger: logger(),
-    config: config(),
+    logger: logger(state),
+    config: config(state),
     eventBus: {},
     cache: { getAge: () => 100 },
     indicatorRegistry: {
@@ -77,7 +101,13 @@ function createTestApp(state) {
       },
     },
     riskEngine: null,
-    strategyReplayEngine: null,
+    strategyReplayEngine: {
+      run: () => ({
+        stats: { totalTrades: 0, winRate: 0, profitFactor: 0 },
+        calculationTime: 0,
+        trades: [],
+      }),
+    },
     regimeEngine: null,
     regimeDecisionEngine: null,
     advanceRiskEngine: null,
@@ -126,6 +156,25 @@ function request(server, { method = 'GET', path, headers = {}, body, rawBody } =
     if (payload) req.write(payload);
     req.end();
   });
+}
+
+const NODE_FETCH_PATH = require.resolve('node-fetch');
+
+async function withFetchMock(mock, callback) {
+  const original = require.cache[NODE_FETCH_PATH];
+  require.cache[NODE_FETCH_PATH] = {
+    id: NODE_FETCH_PATH,
+    filename: NODE_FETCH_PATH,
+    loaded: true,
+    exports: mock,
+  };
+
+  try {
+    return await callback();
+  } finally {
+    if (original) require.cache[NODE_FETCH_PATH] = original;
+    else delete require.cache[NODE_FETCH_PATH];
+  }
 }
 
 async function startApp(state) {
@@ -213,8 +262,6 @@ test('CORS with a disallowed origin does not grant an allow-origin header', asyn
 
 test('JSON parsing occurs before protected route authentication', async () => {
   const server = await startApp({});
-  const originalError = console.error;
-  console.error = () => {};
   try {
     const result = await request(server, {
       method: 'POST',
@@ -224,9 +271,9 @@ test('JSON parsing occurs before protected route authentication', async () => {
     });
 
     assert.equal(result.statusCode, 400);
-    await new Promise(resolve => setImmediate(resolve));
+    assert.match(result.headers['content-type'], /^application\/json/);
+    assert.deepEqual(result.json(), { error: 'Invalid JSON payload' });
   } finally {
-    console.error = originalError;
     await stopApp(server);
   }
 });
@@ -263,4 +310,239 @@ test('real Express app preserves representative route errors', async () => {
   } finally {
     await stopApp(server);
   }
+});
+
+test('synchronous route throws use the generic JSON 500 boundary', async () => {
+  const errors = [];
+  const app = express();
+  app.get('/sync-throw', () => {
+    throw new Error('secret direct route failure /repository/backend/src/app.js:321');
+  });
+  app.use(createErrorHandler({
+    error(module, message, data) {
+      errors.push({ module, message, data });
+    },
+  }));
+
+  const server = http.createServer(app);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+
+  try {
+    const result = await request(server, { path: '/sync-throw' });
+
+    assert.equal(result.statusCode, 500);
+    assert.match(result.headers['content-type'], /^application\/json/);
+    assert.deepEqual(result.json(), { error: 'Internal server error' });
+    assert.equal(result.text.includes('secret direct route failure'), false);
+    assert.ok(errors.some(entry => entry.data.category === 'unhandled'));
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('synchronous dependency failures return a generic JSON 500 and preserve process health', async () => {
+  const state = {
+    throwHistory: true,
+    errorMessage: 'secret /repository/backend/src/routes/routes.js:123',
+  };
+  const server = await startApp(state);
+  try {
+    const result = await request(server, {
+      path: '/api/market',
+      headers: { 'x-api-key': API_KEY },
+    });
+
+    assert.equal(result.statusCode, 500);
+    assert.match(result.headers['content-type'], /^application\/json/);
+    assert.deepEqual(result.json(), { error: 'Internal server error' });
+    assert.equal(result.text.includes('<html'), false);
+    assert.equal(result.text.includes('secret'), false);
+    assert.equal(result.text.includes('routes.js'), false);
+    assert.equal(result.text.includes('/repository/'), false);
+    assert.equal(result.text.includes('Error:'), false);
+    assert.ok(state.errors.some(entry => (
+      entry.module === 'ErrorBoundary'
+      && entry.data.path === '/api/market'
+      && entry.data.status === 500
+      && entry.data.category === 'unhandled'
+    )));
+
+    state.throwHistory = false;
+    const health = await request(server, { path: '/api/status' });
+    assert.equal(health.statusCode, 200);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('async replay rejection before response returns a generic JSON 500', async () => {
+  const server = await startApp({});
+  try {
+    const result = await withFetchMock(async () => {
+      throw new Error('secret fetch failure /repository/backend/server.js:456');
+    }, () => request(server, {
+      path: '/api/strategy/replay?timeframe=1h&days=1',
+      headers: { 'x-api-key': API_KEY },
+    }));
+
+    assert.equal(result.statusCode, 500);
+    assert.match(result.headers['content-type'], /^application\/json/);
+    assert.deepEqual(result.json(), { error: 'Internal server error' });
+    assert.equal(result.text.includes('secret fetch failure'), false);
+    assert.equal(result.text.includes('<html'), false);
+
+    const health = await request(server, { path: '/api/status' });
+    assert.equal(health.statusCode, 200);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('async replay rejection after awaited fallback work returns a generic JSON 500', async () => {
+  const server = await startApp({});
+  try {
+    const result = await withFetchMock(async () => ({
+      ok: true,
+      async json() {
+        await new Promise(resolve => setImmediate(resolve));
+        throw new Error('secret parser failure /repository/backend/src/routes/routes.js:789');
+      },
+    }), () => request(server, {
+      path: '/api/strategy/replay?timeframe=1h&days=1',
+      headers: { 'x-api-key': API_KEY },
+    }));
+
+    assert.equal(result.statusCode, 500);
+    assert.match(result.headers['content-type'], /^application\/json/);
+    assert.deepEqual(result.json(), { error: 'Internal server error' });
+    assert.equal(result.text.includes('secret parser failure'), false);
+    assert.equal(result.text.includes('routes.js'), false);
+
+    const health = await request(server, { path: '/api/status' });
+    assert.equal(health.statusCode, 200);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('malformed JSON returns the exact controlled JSON contract', async () => {
+  const state = {};
+  const server = await startApp(state);
+  try {
+    const result = await request(server, {
+      method: 'POST',
+      path: '/api/paper-trades/close',
+      rawBody: '{invalid}',
+      headers: { 'content-type': 'application/json' },
+    });
+
+    assert.equal(result.statusCode, 400);
+    assert.match(result.headers['content-type'], /^application\/json/);
+    assert.deepEqual(result.json(), { error: 'Invalid JSON payload' });
+    assert.ok(state.errors.some(entry => (
+      entry.data.category === 'malformed-json' && entry.data.status === 400
+    )));
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('validation errors remain explicit 400 responses', async () => {
+  const server = await startApp({});
+  try {
+    const result = await request(server, {
+      path: '/api/candles?timeframe=invalid',
+      headers: { 'x-api-key': API_KEY },
+    });
+
+    assert.equal(result.statusCode, 400);
+    assert.deepEqual(result.json(), { error: 'Invalid timeframe', supported: ['1h'] });
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('rate limiting remains an explicit 429 response', async () => {
+  const server = await startApp({ configValues: { RATE_LIMIT_MAX_REQUESTS: 1 } });
+  try {
+    const first = await request(server, { path: '/api/status' });
+    const second = await request(server, { path: '/api/status' });
+
+    assert.equal(first.statusCode, 200);
+    assert.equal(second.statusCode, 429);
+    assert.equal(second.json().error, 'Rate limit exceeded');
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('unknown routes preserve the existing 404 behavior', async () => {
+  const server = await startApp({});
+  try {
+    const result = await request(server, {
+      path: '/api/does-not-exist',
+      headers: { 'x-api-key': API_KEY },
+    });
+
+    assert.equal(result.statusCode, 404);
+    assert.match(result.text, /Cannot GET \/api\/does-not-exist/);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('/api/config remains a successful 200 response', async () => {
+  const server = await startApp({});
+  try {
+    const result = await request(server, {
+      path: '/api/config',
+      headers: { 'x-api-key': API_KEY },
+    });
+
+    assert.equal(result.statusCode, 200);
+    assert.match(result.headers['content-type'], /^application\/json/);
+    assert.equal(result.json().port, 3000);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('headers-sent errors delegate to Express without a second write', () => {
+  const errors = [];
+  const logger = {
+    error(module, message, data) {
+      errors.push({ module, message, data });
+    },
+  };
+  const error = new Error('secret internal failure');
+  const nextCalls = [];
+  const res = {
+    headersSent: true,
+    status() {
+      throw new Error('headers-sent handler attempted a second write');
+    },
+    json() {
+      throw new Error('headers-sent handler attempted a second write');
+    },
+  };
+
+  createErrorHandler(logger)(error, {
+    method: 'GET',
+    path: '/api/partial',
+  }, res, forwardedError => nextCalls.push(forwardedError));
+
+  assert.deepEqual(nextCalls, [error]);
+  assert.deepEqual(errors, [{
+    module: 'ErrorBoundary',
+    message: 'Request error',
+    data: {
+      method: 'GET',
+      path: '/api/partial',
+      status: 500,
+      category: 'unhandled',
+    },
+  }]);
 });

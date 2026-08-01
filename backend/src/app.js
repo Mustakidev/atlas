@@ -7,6 +7,34 @@ const { createAuth } = require('./middleware/auth');
 const { createGlobalLimiter, createExpensiveLimiter, createConditionalExpensive } = require('./middleware/rateLimit');
 const { createRouter } = require('./routes/routes');
 
+function isMalformedJsonError(error) {
+  return error instanceof SyntaxError
+    && error.status === 400
+    && error.statusCode === 400
+    && error.type === 'entity.parse.failed';
+}
+
+function createErrorHandler(logger) {
+  return function errorHandler(error, req, res, next) {
+    const malformedJson = isMalformedJsonError(error);
+    const status = malformedJson ? 400 : 500;
+    const category = malformedJson ? 'malformed-json' : 'unhandled';
+
+    logger.error('ErrorBoundary', 'Request error', {
+      method: req.method,
+      path: req.path,
+      status,
+      category,
+    });
+
+    if (res.headersSent) return next(error);
+
+    return res.status(status).json({
+      error: malformedJson ? 'Invalid JSON payload' : 'Internal server error',
+    });
+  };
+}
+
 function createApp({ config, logger, routes, getLastDecision, getPipelineHealth }) {
   const app = express();
   const auth = createAuth(config, logger);
@@ -45,8 +73,9 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth 
     getPipelineHealth,
   });
   app.use('/api', expensiveLimiter, auth, router);
+  app.use(createErrorHandler(logger));
 
   return app;
 }
 
-module.exports = { createApp };
+module.exports = { createApp, createErrorHandler };
