@@ -22,6 +22,36 @@ const TIMESTAMP = new Date().toISOString().replace(/[:.]/g, '-');
 const OUTPUT_FILE = path.join(OUTPUT_DIR, `verify-${TIMESTAMP}.json`);
 const REPORT_FILE = path.join(OUTPUT_DIR, `verify-${TIMESTAMP}.md`);
 
+const CANONICAL_GATE_NAMES = [
+  'trend',
+  'structure',
+  'rsi',
+  'ema',
+  'macd',
+  'atr',
+  'bollinger',
+  'confluenceBias',
+  'regimeDecision',
+  'mtfConfirmation',
+  'advanceRisk',
+];
+const BASE_GATE_NAMES = CANONICAL_GATE_NAMES.slice(0, 7);
+const AVAILABLE_INSPECTOR_FIELDS = [
+  'available',
+  'timestamp',
+  'cycle',
+  'price',
+  'timeframe',
+  'confluence',
+  'thresholds',
+  'gates',
+  'engines',
+  'marketRegime',
+  'risk',
+  'verdict',
+];
+const UNAVAILABLE_INSPECTOR_MESSAGE = 'No decision data yet — waiting for first pipeline cycle';
+
 function parseArgs() {
   const args = {};
   for (let i = 2; i < process.argv.length; i++) {
@@ -187,6 +217,304 @@ function mergeTradeObservation(tradesById, observation) {
   }
 }
 
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function inspectorError(message) {
+  return new Error(`Invalid inspector response: ${message}`);
+}
+
+function requireInspectorField(response, field) {
+  if (!Object.hasOwn(response, field)) {
+    throw inspectorError(`missing ${field}`);
+  }
+}
+
+function validateInspectorTrade(trade) {
+  if (!isObject(trade)) throw inspectorError('verdict.trade must be an object when a trade opens');
+  if (typeof trade.tradeId !== 'string' || trade.tradeId.trim() === '') {
+    throw inspectorError('verdict.trade.tradeId must be a non-empty string');
+  }
+  if (!['BUY', 'SELL'].includes(trade.direction)) {
+    throw inspectorError(`verdict.trade.direction must be BUY or SELL for ${trade.tradeId}`);
+  }
+  for (const field of ['entryPrice', 'stopLoss', 'takeProfit', 'riskReward', 'positionSize', 'confidence']) {
+    if (!Number.isFinite(trade[field])) {
+      throw inspectorError(`verdict.trade.${field} must be finite for ${trade.tradeId}`);
+    }
+  }
+  if (typeof trade.reason !== 'string') {
+    throw inspectorError(`verdict.trade.reason must be a string for ${trade.tradeId}`);
+  }
+}
+
+function validateInspectorGates(gates) {
+  if (!isObject(gates)) throw inspectorError('gates must be an object');
+
+  for (const gateName of Object.keys(gates)) {
+    if (!CANONICAL_GATE_NAMES.includes(gateName)) {
+      throw inspectorError(`unknown gate ${gateName}`);
+    }
+
+    const gate = gates[gateName];
+    if (!isObject(gate) || typeof gate.pass !== 'boolean' || !Object.hasOwn(gate, 'value') || typeof gate.detail !== 'string') {
+      throw inspectorError(`malformed gate ${gateName}`);
+    }
+  }
+}
+
+function normalizeInspectorResponse(response) {
+  if (!isObject(response)) throw inspectorError('response must be an object');
+
+  if (response.available === false) {
+    if (Object.keys(response).length !== 2
+      || response.message !== UNAVAILABLE_INSPECTOR_MESSAGE) {
+      throw inspectorError('unavailable response does not match the canonical shape');
+    }
+    return { ...response };
+  }
+
+  if (response.available !== true) {
+    throw inspectorError('available must be true or false');
+  }
+  if (Object.hasOwn(response, 'trade')) {
+    throw inspectorError('top-level trade is not canonical; use verdict.trade');
+  }
+
+  for (const field of AVAILABLE_INSPECTOR_FIELDS) requireInspectorField(response, field);
+
+  if (!isValidTimestamp(response.timestamp)) throw inspectorError('timestamp must be a valid timestamp');
+  if (!Number.isInteger(response.cycle) || response.cycle < 1) throw inspectorError('cycle must be a positive integer');
+  if (response.price !== null && (!Number.isFinite(response.price) || response.price <= 0)) {
+    throw inspectorError('price must be null or a positive finite number');
+  }
+  if (typeof response.timeframe !== 'string' || response.timeframe.trim() === '') {
+    throw inspectorError('timeframe must be a non-empty string');
+  }
+  if (response.confluence !== null && !isObject(response.confluence)) {
+    throw inspectorError('confluence must be an object or null');
+  }
+  if (!isObject(response.thresholds)
+    || !Number.isFinite(response.thresholds.bullish)
+    || !Number.isFinite(response.thresholds.bearish)) {
+    throw inspectorError('thresholds must contain finite bullish and bearish values');
+  }
+  if (!isObject(response.engines)) throw inspectorError('engines must be an object');
+  if (response.marketRegime !== null && !isObject(response.marketRegime)) {
+    throw inspectorError('marketRegime must be an object or null');
+  }
+  if (response.risk !== null && !isObject(response.risk)) {
+    throw inspectorError('risk must be an object or null');
+  }
+  if (Object.hasOwn(response, 'regimeDecision') && !isObject(response.regimeDecision)) {
+    throw inspectorError('regimeDecision must be an object when present');
+  }
+  if (Object.hasOwn(response, 'mtfConfirmation') && !isObject(response.mtfConfirmation)) {
+    throw inspectorError('mtfConfirmation must be an object when present');
+  }
+
+  validateInspectorGates(response.gates);
+
+  if (!isObject(response.verdict) || typeof response.verdict.tradeOpened !== 'boolean') {
+    throw inspectorError('verdict must contain boolean tradeOpened');
+  }
+  if (!Object.hasOwn(response.verdict, 'rejectionReason') || !Object.hasOwn(response.verdict, 'trade')) {
+    throw inspectorError('verdict must contain rejectionReason and trade');
+  }
+
+  if (response.verdict.tradeOpened) {
+    if (response.verdict.rejectionReason !== null) {
+      throw inspectorError('tradeOpened true requires a null rejectionReason');
+    }
+    validateInspectorTrade(response.verdict.trade);
+  } else {
+    if (response.verdict.trade !== null) {
+      throw inspectorError('tradeOpened false requires a null trade');
+    }
+    if (typeof response.verdict.rejectionReason !== 'string' || response.verdict.rejectionReason.trim() === '') {
+      throw inspectorError('tradeOpened false requires a non-empty rejectionReason');
+    }
+  }
+
+  return { ...response };
+}
+
+function gateIsExplicitlySkipped(gate) {
+  return gate
+    && gate.pass === false
+    && gate.value === '--'
+    && /^Skipped\b/.test(gate.detail);
+}
+
+function sameKeys(actual, expected) {
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function copyJsonValue(value) {
+  if (Array.isArray(value)) return value.map(copyJsonValue);
+  if (isObject(value)) {
+    return Object.fromEntries(Object.entries(value).map(([key, nestedValue]) => [key, copyJsonValue(nestedValue)]));
+  }
+  return value;
+}
+
+function coverageError(result, message) {
+  result.errors.push(message);
+  return result;
+}
+
+function evaluateGateCoverage(inspector) {
+  const result = {
+    valid: true,
+    path: null,
+    statuses: {},
+    errors: [],
+  };
+  const gates = inspector.gates || {};
+  const gateKeys = Object.keys(gates);
+  const verdict = inspector.verdict || {
+    tradeOpened: inspector.tradeOpened,
+    rejectionReason: inspector.rejectionReason,
+    trade: inspector.tradeDetails,
+  };
+  const confluence = inspector.confluence || (
+    Object.hasOwn(inspector, 'confluenceScore') && inspector.confluenceScore != null
+      ? { score: inspector.confluenceScore, bias: inspector.bias }
+      : null
+  );
+
+  for (const gateName of gateKeys) {
+    if (!CANONICAL_GATE_NAMES.includes(gateName)) {
+      result.statuses[gateName] = 'unknown';
+      coverageError(result, `Unknown gate ${gateName}`);
+    } else if (!isObject(gates[gateName]) || typeof gates[gateName].pass !== 'boolean') {
+      result.statuses[gateName] = 'malformed';
+      coverageError(result, `Malformed gate ${gateName}`);
+    } else if (gateIsExplicitlySkipped(gates[gateName])) {
+      result.statuses[gateName] = 'skipped';
+    } else if (gates[gateName].pass) {
+      result.statuses[gateName] = 'evaluated-pass';
+    } else {
+      result.statuses[gateName] = 'evaluated-fail';
+    }
+  }
+
+  if (gateKeys.length === 0) {
+    const engines = isObject(inspector.engines) ? inspector.engines : {};
+    const hasProgressedState = confluence !== null
+      || inspector.marketRegime != null
+      || inspector.risk != null
+      || Object.keys(engines).length > 0
+      || Object.hasOwn(inspector, 'regimeDecision')
+      || Object.hasOwn(inspector, 'mtfConfirmation');
+
+    result.path = 'early-rejection';
+    if (verdict.tradeOpened !== false) coverageError(result, 'Early rejection must not open a trade');
+    if (verdict.trade !== null) coverageError(result, 'Early rejection requires a null trade');
+    if (typeof verdict.rejectionReason !== 'string' || verdict.rejectionReason.trim() === '') {
+      coverageError(result, 'Early rejection requires a non-empty rejectionReason');
+    }
+    if (hasProgressedState) coverageError(result, 'Early rejection contains progressed decision state');
+    result.valid = result.errors.length === 0;
+    return result;
+  }
+
+  const baseAndConfluence = [...BASE_GATE_NAMES, 'confluenceBias'];
+  for (const gateName of baseAndConfluence) {
+    if (!Object.hasOwn(gates, gateName)) {
+      result.statuses[gateName] = 'missing';
+      coverageError(result, `Missing mandatory gate ${gateName}`);
+    }
+  }
+
+  if (!Object.hasOwn(gates, 'regimeDecision')) {
+    result.statuses.regimeDecision = 'missing';
+    coverageError(result, 'Missing mandatory gate regimeDecision');
+  }
+
+  const confluenceGate = gates.confluenceBias;
+  const regimeGate = gates.regimeDecision;
+  const neutral = confluenceGate?.value === 'Neutral' && confluenceGate.pass === false;
+
+  if (neutral) {
+    result.path = 'neutral';
+    if (!gateIsExplicitlySkipped(gates.mtfConfirmation)) {
+      result.statuses.mtfConfirmation = Object.hasOwn(gates, 'mtfConfirmation') ? 'evaluated-fail' : 'missing';
+      coverageError(result, 'Neutral path requires explicitly skipped mtfConfirmation');
+    }
+    if (!gateIsExplicitlySkipped(gates.advanceRisk)) {
+      result.statuses.advanceRisk = Object.hasOwn(gates, 'advanceRisk') ? 'evaluated-fail' : 'missing';
+      coverageError(result, 'Neutral path requires explicitly skipped advanceRisk');
+    }
+    if (!regimeGate || regimeGate.value !== 'NEUTRAL' || !regimeGate.pass) {
+      coverageError(result, 'Neutral path requires a passing NEUTRAL regimeDecision');
+    }
+    if (verdict.tradeOpened) coverageError(result, 'Neutral path cannot open a trade');
+  } else if (confluenceGate?.pass === true && ['Bullish', 'Bearish'].includes(confluenceGate.value)) {
+    if (!regimeGate) {
+      result.path = 'directional-invalid';
+    } else if (!regimeGate.pass) {
+      result.path = 'regime-rejection';
+      result.statuses.mtfConfirmation = 'legitimately-absent';
+      result.statuses.advanceRisk = 'legitimately-absent';
+      if (Object.hasOwn(gates, 'mtfConfirmation') || Object.hasOwn(gates, 'advanceRisk')) {
+        coverageError(result, 'Regime rejection must not evaluate downstream gates');
+      }
+      if (verdict.tradeOpened) coverageError(result, 'Regime rejection cannot open a trade');
+    } else if (!Object.hasOwn(gates, 'mtfConfirmation')) {
+      result.path = 'mtf-missing';
+      coverageError(result, 'Passing regimeDecision requires mtfConfirmation');
+    } else if (!gates.mtfConfirmation.pass) {
+      result.path = 'mtf-rejection';
+      result.statuses.advanceRisk = 'legitimately-absent';
+      if (Object.hasOwn(gates, 'advanceRisk')) coverageError(result, 'MTF rejection must not evaluate advanceRisk');
+      if (verdict.tradeOpened) coverageError(result, 'MTF rejection cannot open a trade');
+    } else if (!Object.hasOwn(gates, 'advanceRisk')) {
+      result.path = 'advance-risk-missing';
+      coverageError(result, 'Passing mtfConfirmation requires advanceRisk');
+    } else {
+      result.path = 'advance-risk';
+      if (!gates.advanceRisk.pass && verdict.tradeOpened) {
+        coverageError(result, 'Rejected advanceRisk cannot open a trade');
+      }
+    }
+  } else {
+    result.path = 'invalid-direction-path';
+    coverageError(result, 'confluenceBias does not describe a recognized neutral or directional path');
+  }
+
+  const expectedKeys = {
+    neutral: [...baseAndConfluence, 'mtfConfirmation', 'advanceRisk', 'regimeDecision'],
+    'regime-rejection': [...baseAndConfluence, 'regimeDecision'],
+    'mtf-rejection': [...baseAndConfluence, 'regimeDecision', 'mtfConfirmation'],
+    'advance-risk': [...baseAndConfluence, 'regimeDecision', 'mtfConfirmation', 'advanceRisk'],
+  }[result.path];
+  if (expectedKeys && !sameKeys(gateKeys, expectedKeys)) {
+    coverageError(result, `Gate order or set mismatch for ${result.path}`);
+  }
+
+  result.valid = result.errors.length === 0;
+  return result;
+}
+
+function buildCycleRecord(inspector) {
+  const record = {
+    cycle: inspector.cycle,
+    timestamp: inspector.timestamp,
+    price: inspector.price,
+    confluenceScore: inspector.confluence?.score,
+    bias: inspector.confluence?.bias,
+    confidence: inspector.confluence?.confidence,
+    gates: copyJsonValue(inspector.gates || {}),
+    verdict: copyJsonValue(inspector.verdict || {}),
+    tradeOpened: inspector.verdict?.tradeOpened || false,
+    rejectionReason: inspector.verdict?.rejectionReason || null,
+    tradeDetails: inspector.verdict?.trade ? copyJsonValue(inspector.verdict.trade) : null,
+  };
+  return record;
+}
+
 function formatTime(ms) {
   const s = Math.floor(ms / 1000);
   const m = Math.floor(s / 60);
@@ -199,6 +527,7 @@ function evaluateChecks(cycles, trades, verificationState = {}) {
   const cyclesWithPrice = cycles.filter(c => c.price != null);
   const cyclesNoPrice = cycles.filter(c => c.price == null);
   const confluenceScores = cyclesWithPrice.map(c => c.confluenceScore).filter(s => s != null);
+  const gateCoverage = cycles.map(c => evaluateGateCoverage(c));
   const biasCounts = {};
   const rejectionReasons = {};
   cycles.forEach(c => {
@@ -210,21 +539,22 @@ function evaluateChecks(cycles, trades, verificationState = {}) {
     }
   });
   const gateNotEval = {};
-  const gateNames = ['confluenceBias', 'trend', 'structure', 'rsi', 'ema', 'macd', 'atr', 'bollinger', 'riskEngine'];
+  const gateNames = CANONICAL_GATE_NAMES;
   gateNames.forEach(g => { gateNotEval[g] = 0; });
-  cycles.forEach(c => {
-    if (c.gates) {
-      gateNames.forEach(g => {
-        if (!c.gates[g]) gateNotEval[g]++;
-      });
-    }
+  cycles.forEach((c, index) => {
+    gateNames.forEach(g => {
+      const status = gateCoverage[index].statuses[g];
+      if (!status || status === 'skipped' || status === 'legitimately-absent' || status === 'missing') {
+        gateNotEval[g]++;
+      }
+    });
   });
 
   const checks = [
     { name: 'Pipeline running (cycles > 0)', pass: totalCycles > 0 },
     { name: 'Price data available', pass: cyclesWithPrice.length > 0 },
     { name: 'Confluence scores computed', pass: confluenceScores.length > 0 },
-    { name: 'All gates evaluated (no stale --)', pass: gateNotEval.confluenceBias === 0 || cyclesNoPrice.length === gateNotEval.confluenceBias },
+    { name: 'Gate coverage contract', pass: gateCoverage.every(result => result.valid) },
     { name: 'Bias distribution valid (no Unknown)', pass: !biasCounts['Unknown'] || biasCounts['Unknown'] === 0 },
     { name: 'Rejection reasons recorded', pass: Object.keys(rejectionReasons).length > 0 },
     { name: 'Consistent cycle count', pass: totalCycles >= (DURATION_MIN * 60 / POLL_INTERVAL_SEC * 0.8) },
@@ -259,21 +589,21 @@ function generateReport(cycles, trades, startTime, endTime, verificationState = 
   const gatePassCounts = {};
   const gateFailCounts = {};
   const gateNotEval = {};
-  const gateNames = ['confluenceBias', 'trend', 'structure', 'rsi', 'ema', 'macd', 'atr', 'bollinger', 'riskEngine'];
+  const gateNames = CANONICAL_GATE_NAMES;
   gateNames.forEach(g => { gatePassCounts[g] = 0; gateFailCounts[g] = 0; gateNotEval[g] = 0; });
 
   cycles.forEach(c => {
-    if (c.gates) {
-      gateNames.forEach(g => {
-        if (!c.gates[g]) {
-          gateNotEval[g]++;
-        } else if (c.gates[g].pass) {
-          gatePassCounts[g]++;
-        } else {
-          gateFailCounts[g]++;
-        }
-      });
-    }
+    const coverage = evaluateGateCoverage(c);
+    gateNames.forEach(g => {
+      const status = coverage.statuses[g];
+      if (status === 'evaluated-pass') {
+        gatePassCounts[g]++;
+      } else if (status === 'evaluated-fail') {
+        gateFailCounts[g]++;
+      } else {
+        gateNotEval[g]++;
+      }
+    });
   });
 
   const prices = cyclesWithPrice.map(c => c.price);
@@ -488,28 +818,26 @@ async function main() {
         throw inspectorResult.status === 'rejected' ? inspectorResult.reason : paperTradesResult.reason;
       }
 
-      const inspector = inspectorResult.value;
+      let inspector;
       const paperTrades = paperTradesResult.value;
 
-      if (inspector && inspector.available) {
-        const cycleKey = `${inspector.cycle}-${inspector.timestamp}`;
-        if (!seenCycles.has(cycleKey)) {
-          seenCycles.add(cycleKey);
-          const record = {
-            cycle: inspector.cycle,
-            timestamp: inspector.timestamp,
-            price: inspector.price,
-            confluenceScore: inspector.confluence?.score,
-            bias: inspector.confluence?.bias,
-            confidence: inspector.confluence?.confidence,
-            gates: inspector.gates || {},
-            verdict: inspector.verdict || {},
-            tradeOpened: inspector.verdict?.tradeOpened || false,
-            rejectionReason: inspector.verdict?.rejectionReason || null,
-            tradeDetails: inspector.trade || null,
-          };
-          cycles.push(record);
+      try {
+        inspector = normalizeInspectorResponse(inspectorResult.value);
+        if (inspector.available) {
+          const coverage = evaluateGateCoverage(inspector);
+          if (!coverage.valid) throw inspectorError(`gate coverage failed: ${coverage.errors.join('; ')}`);
+
+          const cycleKey = `${inspector.cycle}-${inspector.timestamp}`;
+          if (!seenCycles.has(cycleKey)) {
+            seenCycles.add(cycleKey);
+            const record = buildCycleRecord(inspector);
+            cycles.push(record);
+          }
         }
+      } catch (e) {
+        verificationState.inspectorFailed = true;
+        verificationState.firstInspectorFailure = verificationState.firstInspectorFailure || e.message;
+        throw e;
       }
 
       try {
@@ -571,9 +899,12 @@ if (require.main === module) {
 
 module.exports = {
   evaluateChecks,
+  evaluateGateCoverage,
   fetchJSON,
+  buildCycleRecord,
   generateReport,
   mergeTradeObservation,
+  normalizeInspectorResponse,
   normalizePaperTradeResponse,
   normalizeTrade,
 };
