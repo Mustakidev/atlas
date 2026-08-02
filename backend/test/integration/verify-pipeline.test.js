@@ -4,9 +4,12 @@ const test = require('node:test');
 
 const {
   evaluateChecks,
+  evaluateGateCoverage,
   fetchJSON,
+  buildCycleRecord,
   generateReport,
   mergeTradeObservation,
+  normalizeInspectorResponse,
   normalizePaperTradeResponse,
 } = require('../../verify-pipeline');
 
@@ -51,6 +54,119 @@ function closedTrade(overrides = {}) {
     pnlPercent: 10,
     currentPrice: 110,
     ...overrides,
+  });
+}
+
+function inspectorGate(pass, value, detail = pass ? 'accepted' : 'rejected') {
+  return { pass, value, detail };
+}
+
+function inspectorResponse(overrides = {}) {
+  const base = {
+    available: true,
+    timestamp: OPENED_AT,
+    cycle: 1,
+    price: 100,
+    timeframe: '1h',
+    confluence: { score: 70, bias: 'Bullish', confidence: 80, components: {} },
+    thresholds: { bullish: 65, bearish: 35 },
+    gates: {
+      trend: inspectorGate(true, 'Bullish'),
+      structure: inspectorGate(true, 'bullish'),
+      rsi: inspectorGate(true, 70),
+      ema: inspectorGate(true, 'Above'),
+      macd: inspectorGate(true, 'Bullish'),
+      atr: inspectorGate(true, '$2'),
+      bollinger: inspectorGate(true, 'Above Upper'),
+      confluenceBias: inspectorGate(true, 'Bullish'),
+      regimeDecision: inspectorGate(true, 'ALLOWED'),
+      mtfConfirmation: inspectorGate(true, 'ALLOWED'),
+      advanceRisk: inspectorGate(true, 'ALLOWED'),
+    },
+    engines: {},
+    marketRegime: { regime: 'TRENDING_BULL', confidence: 80 },
+    risk: { tradeAllowed: true, positionSize: 10, stopLoss: 95, takeProfit: 110, riskReward: 2 },
+    regimeDecision: { allowTrade: true, reason: 'Allowed' },
+    mtfConfirmation: { mtfAllowed: true, confidence: 80, alignmentScore: 100 },
+    verdict: {
+      tradeOpened: true,
+      rejectionReason: null,
+      trade: {
+        tradeId: 'PT-1',
+        direction: 'BUY',
+        entryPrice: 100,
+        stopLoss: 95,
+        takeProfit: 110,
+        riskReward: 2,
+        positionSize: 10,
+        confidence: 80,
+        reason: 'Accepted',
+      },
+    },
+  };
+
+  return {
+    ...base,
+    ...overrides,
+    gates: { ...base.gates, ...(overrides.gates || {}) },
+    verdict: { ...base.verdict, ...(overrides.verdict || {}) },
+  };
+}
+
+function removeGates(response, names) {
+  const excluded = new Set(names);
+  const gates = Object.fromEntries(Object.entries(response.gates).filter(([name]) => !excluded.has(name)));
+  return { ...response, gates };
+}
+
+function neutralInspector() {
+  const response = inspectorResponse({
+    confluence: { score: 50, bias: 'Neutral', confidence: 50, components: {} },
+    gates: {
+      confluenceBias: inspectorGate(false, 'Neutral', 'Score 50 is between thresholds (35-65)'),
+      mtfConfirmation: inspectorGate(false, '--', 'Skipped (no direction)'),
+      advanceRisk: inspectorGate(false, '--', 'Skipped (confluence is Neutral)'),
+      regimeDecision: inspectorGate(true, 'NEUTRAL', '[TRENDING_BULL] Neutral'),
+    },
+    verdict: { tradeOpened: false, rejectionReason: 'Confluence bias: Score 50 is between thresholds (35-65)', trade: null },
+  });
+  const { regimeDecision, ...gatesWithoutRegime } = response.gates;
+  return { ...response, gates: { ...gatesWithoutRegime, regimeDecision } };
+}
+
+function earlyInspector(overrides = {}) {
+  const response = inspectorResponse({
+    confluence: null,
+    marketRegime: null,
+    risk: null,
+    verdict: { tradeOpened: false, rejectionReason: 'early rejection', trade: null },
+    ...overrides,
+  });
+  response.gates = {};
+  delete response.regimeDecision;
+  delete response.mtfConfirmation;
+  return response;
+}
+
+function regimeRejectedInspector() {
+  return removeGates(inspectorResponse({
+    gates: { regimeDecision: inspectorGate(false, 'BLOCKED', 'Wrong regime') },
+    verdict: { tradeOpened: false, rejectionReason: 'Regime Decision: Wrong regime', trade: null },
+  }), ['mtfConfirmation', 'advanceRisk']);
+}
+
+function mtfRejectedInspector() {
+  return removeGates(inspectorResponse({
+    gates: { mtfConfirmation: inspectorGate(false, 'BLOCKED', '1h disagrees') },
+    verdict: { tradeOpened: false, rejectionReason: '1h disagrees', trade: null },
+  }), ['advanceRisk']);
+}
+
+function advanceRiskRejectedInspector() {
+  return inspectorResponse({
+    gates: { advanceRisk: inspectorGate(false, 'BLOCKED', 'Daily limit reached') },
+    risk: { tradeAllowed: false, rejectionReason: 'Daily limit reached' },
+    verdict: { tradeOpened: false, rejectionReason: 'AdvanceRisk: Daily limit reached', trade: null },
   });
 }
 
@@ -191,6 +307,253 @@ test('incompatible paper response shapes fail validation', () => {
   for (const response of [null, [], {}, { open: [], closed: null }, { open: {}, closed: [] }]) {
     assert.throws(() => normalizePaperTradeResponse(response));
   }
+});
+
+test('valid available inspector response is accepted with the canonical advanceRisk gate', () => {
+  const response = inspectorResponse();
+  const normalized = normalizeInspectorResponse(response);
+  const coverage = evaluateGateCoverage(normalized);
+
+  assert.equal(normalized.available, true);
+  assert.equal(normalized.gates.advanceRisk.value, 'ALLOWED');
+  assert.equal(coverage.valid, true);
+  assert.equal(coverage.path, 'advance-risk');
+});
+
+test('exact unavailable inspector response is accepted as unavailable', () => {
+  const response = {
+    available: false,
+    message: 'No decision data yet — waiting for first pipeline cycle',
+  };
+
+  assert.deepEqual(normalizeInspectorResponse(response), response);
+});
+
+test('malformed available inspector response is rejected', () => {
+  const { gates, ...malformed } = inspectorResponse();
+  assert.throws(() => normalizeInspectorResponse(malformed), /missing gates/);
+});
+
+test('riskEngine-only and riskEngine-plus-advanceRisk responses are rejected', () => {
+  const response = inspectorResponse();
+  const { advanceRisk, ...staleGates } = response.gates;
+  assert.throws(() => normalizeInspectorResponse({
+    ...response,
+    gates: { ...staleGates, riskEngine: inspectorGate(true, 'ALLOWED') },
+  }), /unknown gate riskEngine/);
+  assert.throws(() => normalizeInspectorResponse({
+    ...response,
+    gates: { ...response.gates, riskEngine: inspectorGate(true, 'ALLOWED') },
+  }), /unknown gate riskEngine/);
+});
+
+test('successful verdict.trade is captured in tradeDetails without mutating the inspector', () => {
+  const response = inspectorResponse();
+  response.gates.trend.diagnostics = { values: [1, { source: 'inspector' }] };
+  response.verdict.audit = { flags: ['opened'] };
+  response.verdict.trade.metadata = { tags: ['live'] };
+  const record = buildCycleRecord(normalizeInspectorResponse(response));
+
+  assert.deepEqual(record.tradeDetails, response.verdict.trade);
+  assert.notStrictEqual(record.gates, response.gates);
+  assert.notStrictEqual(record.gates.trend, response.gates.trend);
+  assert.notStrictEqual(record.verdict, response.verdict);
+  assert.notStrictEqual(record.verdict.trade, response.verdict.trade);
+  assert.notStrictEqual(record.tradeDetails, response.verdict.trade);
+  assert.notStrictEqual(record.gates.trend.diagnostics, response.gates.trend.diagnostics);
+  assert.notStrictEqual(record.verdict.audit, response.verdict.audit);
+  assert.notStrictEqual(record.verdict.trade.metadata, response.verdict.trade.metadata);
+
+  record.tradeDetails.direction = 'SELL';
+  record.gates.trend.diagnostics.values[1].source = 'record';
+  record.verdict.audit.flags[0] = 'record';
+  record.verdict.trade.metadata.tags[0] = 'record';
+  assert.equal(response.verdict.trade.direction, 'BUY');
+  assert.equal(response.gates.trend.diagnostics.values[1].source, 'inspector');
+  assert.equal(response.verdict.audit.flags[0], 'opened');
+  assert.equal(response.verdict.trade.metadata.tags[0], 'live');
+
+  response.gates.trend.diagnostics.values[0] = 2;
+  response.verdict.audit.flags.push('inspector');
+  response.verdict.trade.metadata.tags.push('inspector');
+  assert.equal(record.gates.trend.diagnostics.values[0], 1);
+  assert.deepEqual(record.verdict.audit.flags, ['record']);
+  assert.deepEqual(record.verdict.trade.metadata.tags, ['record']);
+});
+
+test('no-trade cycle records preserve null tradeDetails and isolate verdict data', () => {
+  const response = neutralInspector();
+  const record = buildCycleRecord(normalizeInspectorResponse(response));
+
+  assert.equal(record.tradeDetails, null);
+  assert.notStrictEqual(record.gates, response.gates);
+  assert.notStrictEqual(record.verdict, response.verdict);
+  record.verdict.rejectionReason = 'record';
+  assert.equal(response.verdict.rejectionReason, 'Confluence bias: Score 50 is between thresholds (35-65)');
+});
+
+test('contradictory opened-trade verdicts are rejected', () => {
+  assert.throws(() => normalizeInspectorResponse(inspectorResponse({
+    verdict: { tradeOpened: true, rejectionReason: null, trade: null },
+  })), /verdict\.trade must be an object/);
+  assert.throws(() => normalizeInspectorResponse(inspectorResponse({
+    verdict: { tradeOpened: true, rejectionReason: 'blocked' },
+  })), /tradeOpened true requires a null rejectionReason/);
+});
+
+test('contradictory rejected-trade verdicts are rejected', () => {
+  assert.throws(() => normalizeInspectorResponse(inspectorResponse({
+    verdict: { tradeOpened: false, rejectionReason: 'blocked', trade: inspectorResponse().verdict.trade },
+  })), /tradeOpened false requires a null trade/);
+  assert.throws(() => normalizeInspectorResponse(inspectorResponse({
+    verdict: { tradeOpened: false, rejectionReason: null, trade: null },
+  })), /tradeOpened false requires a non-empty rejectionReason/);
+});
+
+test('invalid-price and insufficient-candle early paths require no gates', () => {
+  const response = earlyInspector({
+    price: null,
+    verdict: { tradeOpened: false, rejectionReason: 'No valid price data', trade: null },
+  });
+  assert.equal(evaluateGateCoverage(normalizeInspectorResponse(response)).path, 'early-rejection');
+
+  const changedPriceWording = earlyInspector({
+    price: null,
+    verdict: { tradeOpened: false, rejectionReason: 'price feed unavailable', trade: null },
+  });
+  assert.equal(evaluateGateCoverage(normalizeInspectorResponse(changedPriceWording)).valid, true);
+
+  const insufficient = earlyInspector({
+    verdict: { tradeOpened: false, rejectionReason: 'Insufficient candles (10/15 minimum)', trade: null },
+  });
+  assert.equal(evaluateGateCoverage(normalizeInspectorResponse(insufficient)).valid, true);
+
+  const changedInsufficientWording = earlyInspector({
+    verdict: { tradeOpened: false, rejectionReason: 'Data warm-up is still in progress', trade: null },
+  });
+  assert.equal(evaluateGateCoverage(normalizeInspectorResponse(changedInsufficientWording)).valid, true);
+});
+
+test('early structural coverage rejects empty reasons, trades, and progressed state', () => {
+  assert.throws(() => normalizeInspectorResponse(earlyInspector({
+    verdict: { tradeOpened: false, rejectionReason: '', trade: null },
+  })), /non-empty rejectionReason/);
+
+  const opened = earlyInspector({
+    verdict: { tradeOpened: true, rejectionReason: null },
+  });
+  assert.equal(evaluateGateCoverage(normalizeInspectorResponse(opened)).valid, false);
+
+  assert.throws(() => normalizeInspectorResponse(earlyInspector({
+    verdict: { tradeOpened: false, rejectionReason: 'blocked', trade: inspectorResponse().verdict.trade },
+  })), /tradeOpened false requires a null trade/);
+
+  const progressedRisk = earlyInspector({
+    risk: { tradeAllowed: false },
+    verdict: { tradeOpened: false, rejectionReason: 'risk state present', trade: null },
+  });
+  assert.equal(evaluateGateCoverage(normalizeInspectorResponse(progressedRisk)).valid, false);
+
+  const progressedDecision = earlyInspector({
+    verdict: { tradeOpened: false, rejectionReason: 'decision state present', trade: null },
+  });
+  progressedDecision.regimeDecision = { allowTrade: false };
+  assert.equal(evaluateGateCoverage(normalizeInspectorResponse(progressedDecision)).valid, false);
+});
+
+test('neutral path accepts explicitly skipped downstream gates', () => {
+  const coverage = evaluateGateCoverage(normalizeInspectorResponse(neutralInspector()));
+  assert.equal(coverage.valid, true);
+  assert.equal(coverage.path, 'neutral');
+  assert.equal(coverage.statuses.mtfConfirmation, 'skipped');
+  assert.equal(coverage.statuses.advanceRisk, 'skipped');
+});
+
+test('regime rejection accepts legitimate downstream gate absence', () => {
+  const coverage = evaluateGateCoverage(normalizeInspectorResponse(regimeRejectedInspector()));
+  assert.equal(coverage.valid, true);
+  assert.equal(coverage.path, 'regime-rejection');
+  assert.equal(coverage.statuses.mtfConfirmation, 'legitimately-absent');
+  assert.equal(coverage.statuses.advanceRisk, 'legitimately-absent');
+});
+
+test('MTF rejection accepts missing AdvanceRisk', () => {
+  const coverage = evaluateGateCoverage(normalizeInspectorResponse(mtfRejectedInspector()));
+  assert.equal(coverage.valid, true);
+  assert.equal(coverage.path, 'mtf-rejection');
+  assert.equal(coverage.statuses.advanceRisk, 'legitimately-absent');
+});
+
+test('AdvanceRisk rejection is an evaluated rejection', () => {
+  const coverage = evaluateGateCoverage(normalizeInspectorResponse(advanceRiskRejectedInspector()));
+  assert.equal(coverage.valid, true);
+  assert.equal(coverage.statuses.advanceRisk, 'evaluated-fail');
+});
+
+test('fully evaluated opened-trade path accepts all canonical gates', () => {
+  const response = inspectorResponse();
+  const coverage = evaluateGateCoverage(normalizeInspectorResponse(response));
+  assert.equal(coverage.valid, true);
+  assert.deepEqual(Object.keys(response.gates), [
+    'trend', 'structure', 'rsi', 'ema', 'macd', 'atr', 'bollinger',
+    'confluenceBias', 'regimeDecision', 'mtfConfirmation', 'advanceRisk',
+  ]);
+});
+
+test('missing mandatory and downstream gates fail coverage', () => {
+  const missingBase = removeGates(inspectorResponse(), ['trend']);
+  assert.equal(evaluateGateCoverage(normalizeInspectorResponse(missingBase)).valid, false);
+
+  const missingDownstream = removeGates(inspectorResponse(), ['mtfConfirmation']);
+  const coverage = evaluateGateCoverage(normalizeInspectorResponse(missingDownstream));
+  assert.equal(coverage.valid, false);
+  assert.match(coverage.errors.join(' '), /requires mtfConfirmation/);
+});
+
+test('unknown extra gates and malformed gate objects fail validation', () => {
+  assert.throws(() => normalizeInspectorResponse({
+    ...inspectorResponse(),
+    gates: { ...inspectorResponse().gates, extraGate: inspectorGate(true, 'ALLOWED') },
+  }), /unknown gate extraGate/);
+  assert.throws(() => normalizeInspectorResponse({
+    ...inspectorResponse(),
+    gates: { ...inspectorResponse().gates, advanceRisk: { pass: 'true', value: 'ALLOWED', detail: 'bad' } },
+  }), /malformed gate advanceRisk/);
+});
+
+test('pass:false is evaluated, while not-ready diagnostic values remain valid', () => {
+  const response = advanceRiskRejectedInspector();
+  response.gates.rsi = inspectorGate(false, '--', 'Not ready');
+  response.gates.ema = inspectorGate(false, 'N/A', 'Not ready');
+  response.gates.macd = inspectorGate(false, 'Neutral', 'Not ready');
+  response.gates.atr = inspectorGate(false, '--', 'Not ready');
+  response.gates.bollinger = inspectorGate(false, 'Inside Bands', 'Not ready');
+  const coverage = evaluateGateCoverage(normalizeInspectorResponse(response));
+
+  assert.equal(coverage.valid, true);
+  assert.equal(coverage.statuses.advanceRisk, 'evaluated-fail');
+  assert.equal(coverage.statuses.rsi, 'evaluated-fail');
+});
+
+test('report uses canonical gate names and the gate coverage check', () => {
+  const cycle = buildCycleRecord(normalizeInspectorResponse(neutralInspector()));
+  const report = generateReport([cycle], [], Date.parse(OPENED_AT), Date.parse(CLOSED_AT), { failed: false });
+
+  assert.match(report, /\| advanceRisk \|/);
+  assert.match(report, /\| regimeDecision \|/);
+  assert.match(report, /\| mtfConfirmation \|/);
+  assert.doesNotMatch(report, /\| riskEngine \|/);
+  assert.match(report, /Gate coverage contract/);
+  assert.doesNotMatch(report, /All gates evaluated \(no stale --\)/);
+});
+
+test('gate coverage does not depend only on confluenceBias', () => {
+  const response = removeGates(inspectorResponse(), ['trend']);
+  const coverage = evaluateGateCoverage(normalizeInspectorResponse(response));
+
+  assert.equal(response.gates.confluenceBias.pass, true);
+  assert.equal(coverage.valid, false);
+  assert.match(coverage.errors.join(' '), /Missing mandatory gate trend/);
 });
 
 test('open trade disappearance does not delete the logical record', () => {
