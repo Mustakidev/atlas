@@ -9,15 +9,21 @@
  */
 
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
 const ARGS = parseArgs();
 const DURATION_MIN = ARGS.duration || 60;
 const POLL_INTERVAL_SEC = ARGS.interval || 3;
-const DURATION_MS = DURATION_MIN * 60 * 1000;
-const BASE_URL = 'http://localhost:3000';
-const OUTPUT_DIR = path.join(__dirname, '..', 'verification-reports');
+const DURATION_MS = resolvePositiveIntegerOverride('ATLAS_VERIFY_DURATION_MS')
+  ?? DURATION_MIN * 60 * 1000;
+const POLL_INTERVAL_MS = resolvePositiveIntegerOverride('ATLAS_VERIFY_INTERVAL_MS')
+  ?? POLL_INTERVAL_SEC * 1000;
+const REPORT_DURATION_MIN = DURATION_MS / (60 * 1000);
+const REPORT_INTERVAL_SEC = POLL_INTERVAL_MS / 1000;
+const BASE_URL = resolveBaseUrl();
+const OUTPUT_DIR = resolveOutputDirectory();
 const TIMESTAMP = new Date().toISOString().replace(/[:.]/g, '-');
 const OUTPUT_FILE = path.join(OUTPUT_DIR, `verify-${TIMESTAMP}.json`);
 const REPORT_FILE = path.join(OUTPUT_DIR, `verify-${TIMESTAMP}.md`);
@@ -66,9 +72,63 @@ function parseArgs() {
   return args;
 }
 
+function resolvePositiveIntegerOverride(name) {
+  if (!Object.hasOwn(process.env, name)) return null;
+
+  const value = process.env[name];
+  if (!/^[1-9]\d*$/.test(value)) {
+    throw new Error(`${name} must be a positive safe integer`);
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive safe integer`);
+  }
+
+  return parsed;
+}
+
+function resolveBaseUrl() {
+  const value = Object.hasOwn(process.env, 'ATLAS_VERIFY_BASE_URL')
+    ? process.env.ATLAS_VERIFY_BASE_URL
+    : 'http://localhost:3000';
+
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch (error) {
+    throw new Error('ATLAS_VERIFY_BASE_URL must be a valid HTTP or HTTPS URL');
+  }
+
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.search || parsed.hash) {
+    throw new Error('ATLAS_VERIFY_BASE_URL must be a valid HTTP or HTTPS URL without query or hash components');
+  }
+
+  return parsed.toString().replace(/\/+$/, '');
+}
+
+function resolveOutputDirectory() {
+  if (Object.hasOwn(process.env, 'ATLAS_VERIFY_OUTPUT_DIR')) {
+    const value = process.env.ATLAS_VERIFY_OUTPUT_DIR;
+    if (typeof value !== 'string' || value.trim() === '') {
+      throw new Error('ATLAS_VERIFY_OUTPUT_DIR must be a non-empty path');
+    }
+    return path.resolve(value);
+  }
+
+  return path.join(__dirname, '..', 'verification-reports');
+}
+
+function getHttpTransport(url) {
+  if (url.protocol === 'http:') return http;
+  if (url.protocol === 'https:') return https;
+  throw new Error(`Unsupported URL protocol: ${url.protocol}`);
+}
+
 function fetchJSON(urlPath) {
   return new Promise((resolve, reject) => {
-    const req = http.get(`${BASE_URL}${urlPath}`, { timeout: 5000 }, (res) => {
+    const requestUrl = new URL(`${BASE_URL}${urlPath}`);
+    const req = getHttpTransport(requestUrl).get(requestUrl, { timeout: 5000 }, (res) => {
       let data = '';
       res.on('data', (chunk) => data += chunk);
       res.on('end', () => {
@@ -919,8 +979,8 @@ function generateReport(cycles, trades, startTime, endTime, verificationState = 
 
   let md = `# Atlas Pipeline Verification Report\n\n`;
   md += `**Generated:** ${new Date(endTime).toISOString()}\n`;
-  md += `**Duration:** ${formatTime(durationMs)} (${DURATION_MIN} min target)\n`;
-  md += `**Poll Interval:** ${POLL_INTERVAL_SEC}s\n`;
+  md += `**Duration:** ${formatTime(durationMs)} (${REPORT_DURATION_MIN} min target)\n`;
+  md += `**Poll Interval:** ${REPORT_INTERVAL_SEC}s\n`;
   md += `**Symbol:** BTC/USDT\n\n`;
   md += `Gap, stall, and polling-drift values are telemetry only. They do not independently fail verification, and no configured hard threshold currently applies.\n\n`;
 
@@ -1088,7 +1148,7 @@ function generateReport(cycles, trades, startTime, endTime, verificationState = 
 async function main() {
   console.log('═══════════════════════════════════════════════');
   console.log('  Atlas Pipeline End-to-End Verification');
-  console.log(`  Duration: ${DURATION_MIN} min | Interval: ${POLL_INTERVAL_SEC}s`);
+  console.log(`  Duration: ${REPORT_DURATION_MIN} min | Interval: ${REPORT_INTERVAL_SEC}s`);
   console.log('═══════════════════════════════════════════════\n');
 
   // Check server is running
@@ -1110,7 +1170,7 @@ async function main() {
   const verificationMetrics = createVerificationMetrics({
     startTime,
     requestedDurationMs: DURATION_MS,
-    pollIntervalMs: POLL_INTERVAL_SEC * 1000,
+    pollIntervalMs: POLL_INTERVAL_MS,
   });
   let errorCount = 0;
   const verificationState = {
@@ -1161,7 +1221,7 @@ async function main() {
       }
     }
 
-    await new Promise(r => setTimeout(r, POLL_INTERVAL_SEC * 1000));
+    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
   }
 
   const actualEndTime = Date.now();
