@@ -79,7 +79,9 @@ function fetchJSON(urlPath) {
         try {
           resolve(JSON.parse(data));
         } catch (e) {
-          reject(new Error(`JSON parse error: ${e.message}`));
+          const error = new Error(`JSON parse error: ${e.message}`);
+          error.code = 'INVALID_JSON_RESPONSE';
+          reject(error);
         }
       });
     });
@@ -285,7 +287,7 @@ function normalizeInspectorResponse(response) {
   for (const field of AVAILABLE_INSPECTOR_FIELDS) requireInspectorField(response, field);
 
   if (!isValidTimestamp(response.timestamp)) throw inspectorError('timestamp must be a valid timestamp');
-  if (!Number.isInteger(response.cycle) || response.cycle < 1) throw inspectorError('cycle must be a positive integer');
+  if (!Number.isSafeInteger(response.cycle) || response.cycle < 1) throw inspectorError('cycle must be a positive integer');
   if (response.price !== null && (!Number.isFinite(response.price) || response.price <= 0)) {
     throw inspectorError('price must be null or a positive finite number');
   }
@@ -357,6 +359,248 @@ function copyJsonValue(value) {
     return Object.fromEntries(Object.entries(value).map(([key, nestedValue]) => [key, copyJsonValue(nestedValue)]));
   }
   return value;
+}
+
+const VERIFICATION_ERROR_CATEGORIES = [
+  'inspectorEndpoint',
+  'inspectorContract',
+  'paperEndpoint',
+  'paperContract',
+];
+
+function createVerificationMetrics({ startTime, requestedDurationMs, pollIntervalMs }) {
+  const errors = {};
+  VERIFICATION_ERROR_CATEGORIES.forEach(category => {
+    errors[category] = { count: 0, firstMessage: null, firstTimestamp: null };
+  });
+
+  return {
+    polling: {
+      pollAttempts: 0,
+      successfulInspectorPolls: 0,
+      validInspectorResponses: 0,
+      availableInspectorPolls: 0,
+      unavailableInspectorPolls: 0,
+      successfulPaperPolls: 0,
+      expectedPollAttempts: pollIntervalMs > 0 ? Math.ceil(requestedDurationMs / pollIntervalMs) : 0,
+      pollingDriftMs: 0,
+    },
+    errors,
+    source: {
+      uniqueSourceCycles: 0,
+      duplicateSourceObservations: 0,
+      firstSourceCycle: null,
+      lastSourceCycle: null,
+      missingSourceCycleCount: 0,
+      missingSourceCycleRanges: [],
+      sourceCycleRegressions: 0,
+      sourceCycleRegressionDetails: [],
+      maximumObservedSourceStallMs: 0,
+      finalSourceStallMs: null,
+      firstUniqueSourceObservedAt: null,
+      lastUniqueSourceObservedAt: null,
+    },
+    runtime: {
+      requestedDurationMs,
+      actualElapsedMs: null,
+      runCompleted: false,
+    },
+    _startTime: startTime,
+    _pollIntervalMs: pollIntervalMs,
+    _lastUniqueSourceObservedAt: null,
+  };
+}
+
+function recordPollAttempt(metrics, receiptTimestamp) {
+  const polling = metrics.polling;
+  polling.pollAttempts++;
+  const plannedTimestamp = metrics._startTime + ((polling.pollAttempts - 1) * metrics._pollIntervalMs);
+  polling.pollingDriftMs = Math.max(
+    polling.pollingDriftMs,
+    Math.max(0, receiptTimestamp - plannedTimestamp),
+  );
+}
+
+function recordVerificationFailure(metrics, category, message, timestamp) {
+  const failure = metrics.errors[category];
+  if (!failure) throw new Error(`Unknown verification failure category: ${category}`);
+  failure.count++;
+  if (failure.firstMessage === null) {
+    failure.firstMessage = message;
+    failure.firstTimestamp = timestamp;
+  }
+}
+
+function recordSuccessfulInspectorPoll(metrics) {
+  metrics.polling.successfulInspectorPolls++;
+}
+
+function recordInspectorResponse(metrics, inspector, receiptTimestamp) {
+  metrics.polling.validInspectorResponses++;
+  if (inspector.available) {
+    metrics.polling.availableInspectorPolls++;
+    return recordSourceObservation(metrics, inspector, receiptTimestamp);
+  }
+  metrics.polling.unavailableInspectorPolls++;
+  return { type: 'unavailable' };
+}
+
+function recordSuccessfulPaperPoll(metrics) {
+  metrics.polling.successfulPaperPolls++;
+}
+
+function recordSourceObservation(metrics, inspector, receiptTimestamp) {
+  const source = metrics.source;
+  const cycle = inspector.cycle;
+  if (!Number.isSafeInteger(cycle) || cycle < 1) {
+    throw inspectorError('cycle must be a positive safe integer');
+  }
+
+  if (source.lastSourceCycle === cycle) {
+    source.duplicateSourceObservations++;
+    return { type: 'duplicate', cycle };
+  }
+
+  if (source.lastSourceCycle !== null && cycle < source.lastSourceCycle) {
+    source.sourceCycleRegressions++;
+    source.sourceCycleRegressionDetails.push({
+      previousCycle: source.lastSourceCycle,
+      cycle,
+      observedAt: receiptTimestamp,
+    });
+    return { type: 'regression', cycle, previousCycle: source.lastSourceCycle };
+  }
+
+  const previousCycle = source.lastSourceCycle;
+  if (previousCycle !== null && cycle > previousCycle + 1) {
+    const from = previousCycle + 1;
+    const to = cycle - 1;
+    const count = to - from + 1;
+    source.missingSourceCycleCount += count;
+    source.missingSourceCycleRanges.push({ from, to, count });
+  }
+
+  source.uniqueSourceCycles++;
+  if (source.firstSourceCycle === null) source.firstSourceCycle = cycle;
+  source.lastSourceCycle = cycle;
+  if (source.firstUniqueSourceObservedAt === null) {
+    source.firstUniqueSourceObservedAt = receiptTimestamp;
+  }
+  if (metrics._lastUniqueSourceObservedAt !== null) {
+    const stallMs = Math.max(0, receiptTimestamp - metrics._lastUniqueSourceObservedAt);
+    source.maximumObservedSourceStallMs = Math.max(source.maximumObservedSourceStallMs, stallMs);
+  }
+  metrics._lastUniqueSourceObservedAt = receiptTimestamp;
+  source.lastUniqueSourceObservedAt = receiptTimestamp;
+
+  return { type: 'unique', cycle, previousCycle };
+}
+
+function finalizeVerificationMetrics(metrics, endTime) {
+  const runtime = metrics.runtime;
+  runtime.actualElapsedMs = endTime - metrics._startTime;
+  runtime.runCompleted = runtime.actualElapsedMs >= runtime.requestedDurationMs;
+  if (metrics._lastUniqueSourceObservedAt !== null) {
+    metrics.source.finalSourceStallMs = Math.max(0, endTime - metrics._lastUniqueSourceObservedAt);
+  }
+  return metrics;
+}
+
+function serializeVerificationMetrics(metrics) {
+  return {
+    polling: { ...metrics.polling },
+    errors: Object.fromEntries(Object.entries(metrics.errors).map(([category, failure]) => [category, { ...failure }])),
+    source: {
+      ...metrics.source,
+      missingSourceCycleRanges: metrics.source.missingSourceCycleRanges.map(range => ({ ...range })),
+      sourceCycleRegressionDetails: metrics.source.sourceCycleRegressionDetails.map(detail => ({ ...detail })),
+    },
+    runtime: { ...metrics.runtime },
+  };
+}
+
+function getVerificationMetrics(verificationState = {}) {
+  return verificationState.metrics || verificationState.verification || null;
+}
+
+function processPollResults({
+  inspectorResult,
+  paperTradesResult,
+  metrics,
+  verificationState,
+  cycles,
+  tradesById,
+  inspectorReceiptTimestamp,
+  paperReceiptTimestamp,
+}) {
+  const errors = [];
+  if (inspectorResult.status === 'fulfilled') recordSuccessfulInspectorPoll(metrics);
+  const recordFailure = (result, endpointCategory, contractCategory, stateKey, firstFailureKey, timestamp) => {
+    const reason = result.reason;
+    const isParseFailure = reason?.code === 'INVALID_JSON_RESPONSE';
+    const category = isParseFailure ? contractCategory : endpointCategory;
+    const message = reason?.message || String(reason);
+    verificationState[stateKey] = true;
+    verificationState[firstFailureKey] = verificationState[firstFailureKey] || message;
+    recordVerificationFailure(metrics, category, message, timestamp);
+    errors.push(message);
+  };
+
+  if (inspectorResult.status === 'rejected') {
+    recordFailure(
+      inspectorResult,
+      'inspectorEndpoint',
+      'inspectorContract',
+      'inspectorFailed',
+      'firstInspectorFailure',
+      inspectorReceiptTimestamp,
+    );
+  } else {
+    try {
+      const inspector = normalizeInspectorResponse(inspectorResult.value);
+      if (!inspector.available) {
+        recordInspectorResponse(metrics, inspector, inspectorReceiptTimestamp);
+      } else {
+        const coverage = evaluateGateCoverage(inspector);
+        if (!coverage.valid) throw inspectorError(`gate coverage failed: ${coverage.errors.join('; ')}`);
+
+        const sourceObservation = recordInspectorResponse(metrics, inspector, inspectorReceiptTimestamp);
+        if (sourceObservation.type === 'unique') {
+          cycles.push(buildCycleRecord(inspector));
+        }
+      }
+    } catch (e) {
+      verificationState.inspectorFailed = true;
+      verificationState.firstInspectorFailure = verificationState.firstInspectorFailure || e.message;
+      recordVerificationFailure(metrics, 'inspectorContract', e.message, inspectorReceiptTimestamp);
+      errors.push(e.message);
+    }
+  }
+
+  if (paperTradesResult.status === 'rejected') {
+    recordFailure(
+      paperTradesResult,
+      'paperEndpoint',
+      'paperContract',
+      'paperContractFailed',
+      'firstPaperFailure',
+      paperReceiptTimestamp,
+    );
+  } else {
+    try {
+      const normalizedPaperTrades = normalizePaperTradeResponse(paperTradesResult.value);
+      normalizedPaperTrades.open.forEach(trade => mergeTradeObservation(tradesById, trade));
+      normalizedPaperTrades.closed.forEach(trade => mergeTradeObservation(tradesById, trade));
+      recordSuccessfulPaperPoll(metrics);
+    } catch (e) {
+      verificationState.paperContractFailed = true;
+      verificationState.firstPaperFailure = verificationState.firstPaperFailure || e.message;
+      recordVerificationFailure(metrics, 'paperContract', e.message, paperReceiptTimestamp);
+      errors.push(e.message);
+    }
+  }
+
+  return { failed: errors.length > 0, errors };
 }
 
 function coverageError(result, message) {
@@ -525,9 +769,12 @@ function formatTime(ms) {
 function evaluateChecks(cycles, trades, verificationState = {}) {
   const totalCycles = cycles.length;
   const cyclesWithPrice = cycles.filter(c => c.price != null);
-  const cyclesNoPrice = cycles.filter(c => c.price == null);
   const confluenceScores = cyclesWithPrice.map(c => c.confluenceScore).filter(s => s != null);
   const gateCoverage = cycles.map(c => evaluateGateCoverage(c));
+  const metrics = getVerificationMetrics(verificationState);
+  const source = metrics?.source;
+  const runtime = metrics?.runtime;
+  const errors = metrics?.errors;
   const biasCounts = {};
   const rejectionReasons = {};
   cycles.forEach(c => {
@@ -550,16 +797,37 @@ function evaluateChecks(cycles, trades, verificationState = {}) {
     });
   });
 
+  const sourceProgress = source
+    ? source.uniqueSourceCycles >= 2 && source.lastSourceCycle > source.firstSourceCycle
+    : totalCycles > 0;
+  const sourceProgressDetail = source
+    ? source.uniqueSourceCycles === 0
+      ? 'No unique available source cycles observed'
+      : source.uniqueSourceCycles === 1
+        ? 'Inconclusive: one unique source cycle is insufficient to prove progress'
+        : `Observed ${source.uniqueSourceCycles} unique source cycles from ${source.firstSourceCycle} to ${source.lastSourceCycle}`
+    : 'Source telemetry was not provided to this direct helper call';
+  const endpointPass = category => errors
+    ? errors[category].count === 0
+    : category === 'inspectorEndpoint' ? !verificationState.inspectorFailed : !verificationState.paperContractFailed;
+  const schemaPass = category => errors
+    ? errors[category].count === 0
+    : category === 'inspectorContract' ? !verificationState.inspectorFailed : !verificationState.paperContractFailed;
+  const runtimePass = runtime ? runtime.runCompleted : true;
   const checks = [
-    { name: 'Pipeline running (cycles > 0)', pass: totalCycles > 0 },
-    { name: 'Price data available', pass: cyclesWithPrice.length > 0 },
-    { name: 'Confluence scores computed', pass: confluenceScores.length > 0 },
-    { name: 'Gate coverage contract', pass: gateCoverage.every(result => result.valid) },
-    { name: 'Bias distribution valid (no Unknown)', pass: !biasCounts['Unknown'] || biasCounts['Unknown'] === 0 },
-    { name: 'Rejection reasons recorded', pass: Object.keys(rejectionReasons).length > 0 },
-    { name: 'Consistent cycle count', pass: totalCycles >= (DURATION_MIN * 60 / POLL_INTERVAL_SEC * 0.8) },
-    { name: 'Pipeline endpoint contract', pass: !verificationState.inspectorFailed },
-    { name: 'Paper trades response contract', pass: !verificationState.paperContractFailed },
+    { name: 'Pipeline running (cycles > 0)', pass: totalCycles > 0, observed: totalCycles, required: '> 0' },
+    { name: 'Price data available', pass: cyclesWithPrice.length > 0, observed: cyclesWithPrice.length, required: '> 0' },
+    { name: 'Confluence scores computed', pass: confluenceScores.length > 0, observed: confluenceScores.length, required: '> 0' },
+    { name: 'Gate coverage contract', pass: gateCoverage.every(result => result.valid), observed: gateCoverage.filter(result => result.valid).length, required: `${gateCoverage.length} valid cycles` },
+    { name: 'Bias distribution valid (no Unknown)', pass: !biasCounts.Unknown, observed: biasCounts.Unknown || 0, required: '0 Unknown cycles' },
+    { name: 'Rejection reasons recorded', pass: Object.keys(rejectionReasons).length > 0, observed: Object.keys(rejectionReasons).length, required: '> 0 reasons' },
+    { name: 'Requested runtime completed', pass: runtimePass, observed: runtime?.actualElapsedMs ?? 'not measured', required: runtime ? `>= ${runtime.requestedDurationMs}ms` : 'run telemetry' },
+    { name: 'Inspector endpoint integrity', pass: endpointPass('inspectorEndpoint'), observed: errors?.inspectorEndpoint.count ?? (verificationState.inspectorFailed ? 1 : 0), required: '0 endpoint errors' },
+    { name: 'Inspector schema integrity', pass: schemaPass('inspectorContract'), observed: errors?.inspectorContract.count ?? (verificationState.inspectorFailed ? 1 : 0), required: '0 contract errors' },
+    { name: 'Paper endpoint integrity', pass: endpointPass('paperEndpoint'), observed: errors?.paperEndpoint.count ?? 0, required: '0 endpoint errors' },
+    { name: 'Paper contract integrity', pass: schemaPass('paperContract'), observed: errors?.paperContract.count ?? (verificationState.paperContractFailed ? 1 : 0), required: '0 contract errors' },
+    { name: 'Source cycle progressed', pass: sourceProgress, observed: source?.uniqueSourceCycles ?? totalCycles, required: 'at least 2 strictly increasing unique cycles', detail: sourceProgressDetail },
+    { name: 'Source cycle continuity', pass: source ? source.sourceCycleRegressions === 0 : true, observed: source?.sourceCycleRegressions ?? 0, required: '0 cycle regressions' },
   ];
 
   return { checks, allPass: checks.every(c => c.pass) };
@@ -568,6 +836,10 @@ function evaluateChecks(cycles, trades, verificationState = {}) {
 function generateReport(cycles, trades, startTime, endTime, verificationState = {}) {
   const totalCycles = cycles.length;
   const durationMs = endTime - startTime;
+  const metrics = getVerificationMetrics(verificationState);
+  const serializedMetrics = metrics
+    ? (verificationState.verification ? metrics : serializeVerificationMetrics(metrics))
+    : null;
 
   const cyclesWithPrice = cycles.filter(c => c.price != null);
   const cyclesNoPrice = cycles.filter(c => c.price == null);
@@ -650,6 +922,59 @@ function generateReport(cycles, trades, startTime, endTime, verificationState = 
   md += `**Duration:** ${formatTime(durationMs)} (${DURATION_MIN} min target)\n`;
   md += `**Poll Interval:** ${POLL_INTERVAL_SEC}s\n`;
   md += `**Symbol:** BTC/USDT\n\n`;
+  md += `Gap, stall, and polling-drift values are telemetry only. They do not independently fail verification, and no configured hard threshold currently applies.\n\n`;
+
+  md += `## Verification Run Metrics\n\n`;
+  if (serializedMetrics) {
+    md += `| Metric | Value |\n|---|---|\n`;
+    md += `| Requested Duration | ${serializedMetrics.runtime.requestedDurationMs}ms |\n`;
+    md += `| Actual Elapsed | ${serializedMetrics.runtime.actualElapsedMs ?? 'not finalized'}ms |\n`;
+    md += `| Run Completed | ${serializedMetrics.runtime.runCompleted} |\n`;
+    md += `| Poll Attempts | ${serializedMetrics.polling.pollAttempts} |\n`;
+    md += `| Expected Poll Attempts | ${serializedMetrics.polling.expectedPollAttempts} |\n`;
+    md += `| Polling Drift (diagnostic only) | ${serializedMetrics.polling.pollingDriftMs}ms |\n\n`;
+  } else {
+    md += `Telemetry was not provided to this direct report call.\n\n`;
+  }
+
+  md += `## Polling Health\n\n`;
+  if (serializedMetrics) {
+    md += `| Metric | Value |\n|---|---|\n`;
+    md += `| Successful Inspector Polls | ${serializedMetrics.polling.successfulInspectorPolls} |\n`;
+    md += `| Valid Inspector Responses | ${serializedMetrics.polling.validInspectorResponses} |\n`;
+    md += `| Available Inspector Polls | ${serializedMetrics.polling.availableInspectorPolls} |\n`;
+    md += `| Unavailable Inspector Polls | ${serializedMetrics.polling.unavailableInspectorPolls} |\n`;
+    md += `| Successful Paper Polls | ${serializedMetrics.polling.successfulPaperPolls} |\n\n`;
+  } else {
+    md += `Telemetry was not provided to this direct report call.\n\n`;
+  }
+
+  md += `## Source Progress and Continuity\n\n`;
+  if (serializedMetrics) {
+    md += `| Metric | Value |\n|---|---|\n`;
+    md += `| Unique Source Cycles | ${serializedMetrics.source.uniqueSourceCycles} |\n`;
+    md += `| Duplicate Source Observations | ${serializedMetrics.source.duplicateSourceObservations} |\n`;
+    md += `| First Source Cycle | ${serializedMetrics.source.firstSourceCycle ?? 'N/A'} |\n`;
+    md += `| Last Source Cycle | ${serializedMetrics.source.lastSourceCycle ?? 'N/A'} |\n`;
+    md += `| Missing Source Cycle Count (diagnostic only) | ${serializedMetrics.source.missingSourceCycleCount} |\n`;
+    md += `| Missing Source Cycle Ranges (diagnostic only) | ${JSON.stringify(serializedMetrics.source.missingSourceCycleRanges)} |\n`;
+    md += `| Source Cycle Regressions | ${serializedMetrics.source.sourceCycleRegressions} |\n`;
+    md += `| Maximum Observed Source Stall (diagnostic only) | ${serializedMetrics.source.maximumObservedSourceStallMs}ms |\n`;
+    md += `| Final Source Stall (diagnostic only) | ${serializedMetrics.source.finalSourceStallMs ?? 'N/A'}ms |\n\n`;
+  } else {
+    md += `Telemetry was not provided to this direct report call.\n\n`;
+  }
+
+  md += `## Failure Summary\n\n`;
+  if (serializedMetrics) {
+    md += `| Category | Count | First Message | First Timestamp |\n|---|---:|---|---|\n`;
+    Object.entries(serializedMetrics.errors).forEach(([category, failure]) => {
+      md += `| ${category} | ${failure.count} | ${failure.firstMessage || 'N/A'} | ${failure.firstTimestamp ?? 'N/A'} |\n`;
+    });
+    md += `\n`;
+  } else {
+    md += `Telemetry was not provided to this direct report call.\n\n`;
+  }
 
   md += `## Summary\n\n`;
   md += `| Metric | Value |\n`;
@@ -748,10 +1073,10 @@ function generateReport(cycles, trades, startTime, endTime, verificationState = 
   md += `## Verification Checks\n\n`;
   const { checks, allPass } = evaluateChecks(cycles, trades, verificationState);
 
-  md += `| Check | Status |\n`;
-  md += `|---|---|\n`;
+  md += `| Check | Status | Observed | Required | Detail |\n`;
+  md += `|---|---|---|---|---|\n`;
   checks.forEach(c => {
-    md += `| ${c.name} | ${c.pass ? '✅ PASS' : '❌ FAIL'} |\n`;
+    md += `| ${c.name} | ${c.pass ? '✅ PASS' : '❌ FAIL'} | ${c.observed ?? 'N/A'} | ${c.required ?? 'N/A'} | ${c.detail || ''} |\n`;
   });
   md += `\n**Overall:** ${allPass ? '✅ ALL CHECKS PASSED' : '❌ SOME CHECKS FAILED'}\n`;
 
@@ -782,10 +1107,14 @@ async function main() {
   const startTime = Date.now();
   const cycles = [];
   const tradesById = new Map();
-  const seenCycles = new Set();
-  let pollCount = 0;
+  const verificationMetrics = createVerificationMetrics({
+    startTime,
+    requestedDurationMs: DURATION_MS,
+    pollIntervalMs: POLL_INTERVAL_SEC * 1000,
+  });
   let errorCount = 0;
   const verificationState = {
+    metrics: verificationMetrics,
     paperContractFailed: false,
     inspectorFailed: false,
     firstPaperFailure: null,
@@ -799,56 +1128,24 @@ async function main() {
   let lastProgressPrint = 0;
 
   while (Date.now() < endTime) {
-    pollCount++;
+    recordPollAttempt(verificationMetrics, Date.now());
     try {
       const [inspectorResult, paperTradesResult] = await Promise.allSettled([
         fetchJSON('/api/signal/inspector'),
         fetchJSON('/api/paper-trades')
       ]);
 
-      if (inspectorResult.status === 'rejected') {
-        verificationState.inspectorFailed = true;
-        verificationState.firstInspectorFailure = verificationState.firstInspectorFailure || inspectorResult.reason.message;
-      }
-      if (paperTradesResult.status === 'rejected') {
-        verificationState.paperContractFailed = true;
-        verificationState.firstPaperFailure = verificationState.firstPaperFailure || paperTradesResult.reason.message;
-      }
-      if (inspectorResult.status === 'rejected' || paperTradesResult.status === 'rejected') {
-        throw inspectorResult.status === 'rejected' ? inspectorResult.reason : paperTradesResult.reason;
-      }
-
-      let inspector;
-      const paperTrades = paperTradesResult.value;
-
-      try {
-        inspector = normalizeInspectorResponse(inspectorResult.value);
-        if (inspector.available) {
-          const coverage = evaluateGateCoverage(inspector);
-          if (!coverage.valid) throw inspectorError(`gate coverage failed: ${coverage.errors.join('; ')}`);
-
-          const cycleKey = `${inspector.cycle}-${inspector.timestamp}`;
-          if (!seenCycles.has(cycleKey)) {
-            seenCycles.add(cycleKey);
-            const record = buildCycleRecord(inspector);
-            cycles.push(record);
-          }
-        }
-      } catch (e) {
-        verificationState.inspectorFailed = true;
-        verificationState.firstInspectorFailure = verificationState.firstInspectorFailure || e.message;
-        throw e;
-      }
-
-      try {
-        const normalizedPaperTrades = normalizePaperTradeResponse(paperTrades);
-        normalizedPaperTrades.open.forEach(trade => mergeTradeObservation(tradesById, trade));
-        normalizedPaperTrades.closed.forEach(trade => mergeTradeObservation(tradesById, trade));
-      } catch (e) {
-        verificationState.paperContractFailed = true;
-        verificationState.firstPaperFailure = verificationState.firstPaperFailure || e.message;
-        throw e;
-      }
+      const pollResult = processPollResults({
+        inspectorResult,
+        paperTradesResult,
+        metrics: verificationMetrics,
+        verificationState,
+        cycles,
+        tradesById,
+        inspectorReceiptTimestamp: Date.now(),
+        paperReceiptTimestamp: Date.now(),
+      });
+      if (pollResult.failed) throw new Error(pollResult.errors.join('; '));
 
       const elapsed = Date.now() - startTime;
       const elapsedMin = Math.floor(elapsed / 60000);
@@ -868,6 +1165,7 @@ async function main() {
   }
 
   const actualEndTime = Date.now();
+  finalizeVerificationMetrics(verificationMetrics, actualEndTime);
   console.log(`\n═══════════════════════════════════════════════`);
   console.log(`  Recording complete: ${formatTime(actualEndTime - startTime)}`);
   const trades = Array.from(tradesById.values());
@@ -875,7 +1173,13 @@ async function main() {
   console.log(`═══════════════════════════════════════════════\n`);
 
   // Save raw data
-  fs.writeFileSync(OUTPUT_FILE, JSON.stringify({ startTime, endTime: actualEndTime, cycles, trades }, null, 2));
+  fs.writeFileSync(OUTPUT_FILE, JSON.stringify({
+    startTime,
+    endTime: actualEndTime,
+    cycles,
+    trades,
+    verification: serializeVerificationMetrics(verificationMetrics),
+  }, null, 2));
   console.log(`Raw data saved: ${OUTPUT_FILE}`);
 
   // Generate and save report
@@ -898,13 +1202,23 @@ if (require.main === module) {
 }
 
 module.exports = {
+  createVerificationMetrics,
   evaluateChecks,
   evaluateGateCoverage,
   fetchJSON,
   buildCycleRecord,
+  finalizeVerificationMetrics,
   generateReport,
   mergeTradeObservation,
   normalizeInspectorResponse,
   normalizePaperTradeResponse,
   normalizeTrade,
+  processPollResults,
+  recordInspectorResponse,
+  recordPollAttempt,
+  recordSuccessfulInspectorPoll,
+  recordSuccessfulPaperPoll,
+  recordSourceObservation,
+  recordVerificationFailure,
+  serializeVerificationMetrics,
 };

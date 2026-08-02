@@ -3,14 +3,24 @@ const http = require('node:http');
 const test = require('node:test');
 
 const {
+  createVerificationMetrics,
   evaluateChecks,
   evaluateGateCoverage,
   fetchJSON,
   buildCycleRecord,
+  finalizeVerificationMetrics,
   generateReport,
   mergeTradeObservation,
   normalizeInspectorResponse,
   normalizePaperTradeResponse,
+  processPollResults,
+  recordPollAttempt,
+  recordInspectorResponse,
+  recordSuccessfulInspectorPoll,
+  recordSuccessfulPaperPoll,
+  recordSourceObservation,
+  recordVerificationFailure,
+  serializeVerificationMetrics,
 } = require('../../verify-pipeline');
 
 const OPENED_AT = '2026-01-01T00:00:00.000Z';
@@ -168,6 +178,57 @@ function advanceRiskRejectedInspector() {
     risk: { tradeAllowed: false, rejectionReason: 'Daily limit reached' },
     verdict: { tradeOpened: false, rejectionReason: 'AdvanceRisk: Daily limit reached', trade: null },
   });
+}
+
+function verificationMetrics() {
+  return createVerificationMetrics({
+    startTime: 1000,
+    requestedDurationMs: 9000,
+    pollIntervalMs: 3000,
+  });
+}
+
+function sourceObservation(cycle) {
+  return { cycle, timestamp: `2026-01-01T00:00:${String(cycle).padStart(2, '0')}.000Z` };
+}
+
+function pollContext() {
+  return {
+    metrics: verificationMetrics(),
+    verificationState: {
+      inspectorFailed: false,
+      paperContractFailed: false,
+      firstInspectorFailure: null,
+      firstPaperFailure: null,
+    },
+    cycles: [],
+    tradesById: new Map(),
+  };
+}
+
+function fulfilled(value) {
+  return { status: 'fulfilled', value };
+}
+
+function rejected(error) {
+  return { status: 'rejected', reason: error };
+}
+
+function invalidJsonError() {
+  const error = new Error('JSON parse error');
+  error.code = 'INVALID_JSON_RESPONSE';
+  return error;
+}
+
+function processPoll(inspectorResult, paperTradesResult, context = pollContext()) {
+  processPollResults({
+    ...context,
+    inspectorResult,
+    paperTradesResult,
+    inspectorReceiptTimestamp: 2000,
+    paperReceiptTimestamp: 2100,
+  });
+  return context;
 }
 
 function mergeResponse(map, response) {
@@ -461,6 +522,387 @@ test('early structural coverage rejects empty reasons, trades, and progressed st
   assert.equal(evaluateGateCoverage(normalizeInspectorResponse(progressedDecision)).valid, false);
 });
 
+test('poll accounting records attempts, expected attempts, and positive schedule drift', () => {
+  const metrics = verificationMetrics();
+
+  recordPollAttempt(metrics, 1000);
+  recordPollAttempt(metrics, 4050);
+  recordPollAttempt(metrics, 7250);
+
+  assert.equal(metrics.polling.pollAttempts, 3);
+  assert.equal(metrics.polling.expectedPollAttempts, 3);
+  assert.equal(metrics.polling.pollingDriftMs, 250);
+});
+
+test('failure accounting keeps independent counts and first details', () => {
+  const metrics = verificationMetrics();
+
+  recordVerificationFailure(metrics, 'inspectorEndpoint', 'HTTP 503', 1100);
+  recordVerificationFailure(metrics, 'inspectorEndpoint', 'timeout', 1200);
+  recordVerificationFailure(metrics, 'inspectorContract', 'missing gates', 1300);
+  recordVerificationFailure(metrics, 'paperEndpoint', 'HTTP 502', 1400);
+  recordVerificationFailure(metrics, 'paperContract', 'closed must be an array', 1500);
+
+  assert.equal(metrics.errors.inspectorEndpoint.count, 2);
+  assert.deepEqual(metrics.errors.inspectorEndpoint, {
+    count: 2,
+    firstMessage: 'HTTP 503',
+    firstTimestamp: 1100,
+  });
+  assert.equal(metrics.errors.inspectorContract.count, 1);
+  assert.equal(metrics.errors.paperEndpoint.count, 1);
+  assert.equal(metrics.errors.paperContract.count, 1);
+});
+
+test('inspector and paper response accounting separates success, availability, and startup', () => {
+  const metrics = verificationMetrics();
+
+  recordSuccessfulInspectorPoll(metrics);
+  recordInspectorResponse(metrics, { available: false }, 1100);
+  recordSuccessfulInspectorPoll(metrics);
+  recordInspectorResponse(metrics, { available: true, cycle: 1 }, 1200);
+  recordSuccessfulPaperPoll(metrics);
+
+  assert.equal(metrics.polling.successfulInspectorPolls, 2);
+  assert.equal(metrics.polling.validInspectorResponses, 2);
+  assert.equal(metrics.polling.unavailableInspectorPolls, 1);
+  assert.equal(metrics.polling.availableInspectorPolls, 1);
+  assert.equal(metrics.polling.successfulPaperPolls, 1);
+  assert.equal(metrics.source.uniqueSourceCycles, 1);
+});
+
+test('source identity uses cycle ID and repeated timestamps or wording remain duplicates', () => {
+  const metrics = verificationMetrics();
+
+  recordSourceObservation(metrics, sourceObservation(7), 1000);
+  recordSourceObservation(metrics, { ...sourceObservation(7), timestamp: 'changed' }, 2000);
+  recordSourceObservation(metrics, sourceObservation(7), 3000);
+
+  assert.equal(metrics.source.uniqueSourceCycles, 1);
+  assert.equal(metrics.source.duplicateSourceObservations, 2);
+  assert.equal(metrics.source.firstSourceCycle, 7);
+  assert.equal(metrics.source.lastSourceCycle, 7);
+  assert.equal(metrics.source.firstUniqueSourceObservedAt, 1000);
+  assert.equal(metrics.source.lastUniqueSourceObservedAt, 1000);
+});
+
+test('slower source progress records gaps without comparing against poll attempts', () => {
+  const metrics = verificationMetrics();
+  recordSourceObservation(metrics, sourceObservation(10), 1000);
+  recordSourceObservation(metrics, sourceObservation(13), 11000);
+
+  assert.equal(metrics.source.uniqueSourceCycles, 2);
+  assert.equal(metrics.source.missingSourceCycleCount, 2);
+  assert.deepEqual(metrics.source.missingSourceCycleRanges, [{ from: 11, to: 12, count: 2 }]);
+  assert.equal(metrics.source.maximumObservedSourceStallMs, 10000);
+
+  const result = evaluateChecks([], [], { metrics });
+  const checks = Object.fromEntries(result.checks.map(check => [check.name, check]));
+  assert.equal(checks['Source cycle progressed'].pass, true);
+  assert.equal(checks['Source cycle continuity'].pass, true);
+  assert.equal(metrics.polling.expectedPollAttempts, 3);
+  assert.equal(metrics.source.uniqueSourceCycles, 2);
+});
+
+test('lower source cycle IDs record a regression and fail continuity', () => {
+  const metrics = verificationMetrics();
+  recordSourceObservation(metrics, sourceObservation(8), 1000);
+  const result = recordSourceObservation(metrics, sourceObservation(3), 2000);
+
+  assert.equal(result.type, 'regression');
+  assert.equal(metrics.source.uniqueSourceCycles, 1);
+  assert.equal(metrics.source.lastSourceCycle, 8);
+  assert.equal(metrics.source.sourceCycleRegressions, 1);
+  assert.deepEqual(metrics.source.sourceCycleRegressionDetails, [{
+    previousCycle: 8,
+    cycle: 3,
+    observedAt: 2000,
+  }]);
+  const checks = Object.fromEntries(evaluateChecks([], [], { metrics }).checks.map(check => [check.name, check]));
+  assert.equal(checks['Source cycle continuity'].pass, false);
+});
+
+test('source stall and final stall use explicit receipt timestamps', () => {
+  const metrics = verificationMetrics();
+  recordSourceObservation(metrics, sourceObservation(1), 1000);
+  recordSourceObservation(metrics, sourceObservation(2), 4500);
+  finalizeVerificationMetrics(metrics, 8000);
+
+  assert.equal(metrics.source.maximumObservedSourceStallMs, 3500);
+  assert.equal(metrics.source.finalSourceStallMs, 3500);
+  assert.equal(metrics.runtime.actualElapsedMs, 7000);
+  assert.equal(metrics.runtime.runCompleted, false);
+});
+
+test('zero and one source cycles are non-passing with explicit progress details', () => {
+  const zero = verificationMetrics();
+  const one = verificationMetrics();
+  recordSourceObservation(one, sourceObservation(1), 1000);
+
+  const zeroCheck = evaluateChecks([], [], { metrics: zero }).checks.find(check => check.name === 'Source cycle progressed');
+  const oneCheck = evaluateChecks([], [], { metrics: one }).checks.find(check => check.name === 'Source cycle progressed');
+  assert.equal(zeroCheck.pass, false);
+  assert.match(zeroCheck.detail, /No unique/);
+  assert.equal(oneCheck.pass, false);
+  assert.match(oneCheck.detail, /Inconclusive/);
+});
+
+test('two monotonic source cycles pass progress and exact runtime boundary passes', () => {
+  const metrics = verificationMetrics();
+  recordSourceObservation(metrics, sourceObservation(1), 1000);
+  recordSourceObservation(metrics, sourceObservation(2), 2000);
+  finalizeVerificationMetrics(metrics, 10000);
+
+  const checks = Object.fromEntries(evaluateChecks([], [], { metrics }).checks.map(check => [check.name, check]));
+  assert.equal(checks['Source cycle progressed'].pass, true);
+  assert.equal(checks['Requested runtime completed'].pass, true);
+  assert.equal(metrics.runtime.actualElapsedMs, metrics.runtime.requestedDurationMs);
+});
+
+test('runtime below the requested boundary fails completion', () => {
+  const metrics = verificationMetrics();
+  finalizeVerificationMetrics(metrics, 9999);
+
+  const check = evaluateChecks([], [], { metrics }).checks.find(item => item.name === 'Requested runtime completed');
+  assert.equal(metrics.runtime.runCompleted, false);
+  assert.equal(check.pass, false);
+});
+
+test('endpoint and contract integrity checks fail independently', () => {
+  const metrics = verificationMetrics();
+  recordVerificationFailure(metrics, 'inspectorEndpoint', 'timeout', 1);
+  recordVerificationFailure(metrics, 'paperContract', 'bad paper shape', 2);
+  const checks = Object.fromEntries(evaluateChecks([], [], { metrics }).checks.map(check => [check.name, check]));
+
+  assert.equal(checks['Inspector endpoint integrity'].pass, false);
+  assert.equal(checks['Inspector schema integrity'].pass, true);
+  assert.equal(checks['Paper endpoint integrity'].pass, true);
+  assert.equal(checks['Paper contract integrity'].pass, false);
+});
+
+test('serialized verification metrics are additive and omit internal state', () => {
+  const metrics = verificationMetrics();
+  recordSourceObservation(metrics, sourceObservation(4), 1000);
+  const serialized = serializeVerificationMetrics(metrics);
+
+  assert.ok(serialized.polling);
+  assert.ok(serialized.errors);
+  assert.ok(serialized.source);
+  assert.ok(serialized.runtime);
+  assert.equal(Object.hasOwn(serialized, '_seenSourceCycles'), false);
+  assert.equal(Object.hasOwn(serialized.source, 'missingSourceCycleIds'), false);
+  assert.deepEqual(serialized.source.missingSourceCycleRanges, []);
+});
+
+test('compact gap diagnostics record exact ranges without enumerating IDs', () => {
+  const metrics = verificationMetrics();
+  recordSourceObservation(metrics, sourceObservation(10), 1000);
+  recordSourceObservation(metrics, sourceObservation(12), 2000);
+
+  assert.equal(metrics.source.missingSourceCycleCount, 1);
+  assert.deepEqual(metrics.source.missingSourceCycleRanges, [{ from: 11, to: 11, count: 1 }]);
+  assert.equal(Object.hasOwn(metrics.source, 'missingSourceCycleIds'), false);
+});
+
+test('large source gaps remain compact, constant-time in representation, and diagnostic only', () => {
+  const metrics = verificationMetrics();
+  recordSourceObservation(metrics, { cycle: 10 }, 1000);
+  recordSourceObservation(metrics, { cycle: 10000000 }, 2000);
+
+  assert.equal(metrics.source.missingSourceCycleCount, 9999989);
+  assert.deepEqual(metrics.source.missingSourceCycleRanges, [{ from: 11, to: 9999999, count: 9999989 }]);
+  assert.equal(metrics.source.missingSourceCycleRanges.length, 1);
+  assert.equal(Object.hasOwn(metrics.source, 'missingSourceCycleIds'), false);
+
+  const checks = Object.fromEntries(evaluateChecks([], [], { metrics }).checks.map(check => [check.name, check]));
+  assert.equal(checks['Source cycle progressed'].pass, true);
+  assert.equal(checks['Source cycle continuity'].pass, true);
+  assert.equal(JSON.stringify(serializeVerificationMetrics(metrics).source.missingSourceCycleRanges).length < 100, true);
+});
+
+test('regressions preserve the monotonic baseline and source timing', () => {
+  const metrics = verificationMetrics();
+  recordSourceObservation(metrics, sourceObservation(8), 1000);
+  recordSourceObservation(metrics, sourceObservation(3), 9000);
+
+  assert.equal(metrics.source.uniqueSourceCycles, 1);
+  assert.equal(metrics.source.lastSourceCycle, 8);
+  assert.equal(metrics.source.sourceCycleRegressions, 1);
+  assert.equal(metrics.source.lastUniqueSourceObservedAt, 1000);
+  assert.equal(metrics.source.maximumObservedSourceStallMs, 0);
+  assert.deepEqual(metrics.source.missingSourceCycleRanges, []);
+});
+
+test('progress after a regression uses the original baseline without a false gap', () => {
+  const metrics = verificationMetrics();
+  recordSourceObservation(metrics, sourceObservation(8), 1000);
+  recordSourceObservation(metrics, sourceObservation(3), 2000);
+  recordSourceObservation(metrics, sourceObservation(9), 3000);
+
+  assert.equal(metrics.source.firstSourceCycle, 8);
+  assert.equal(metrics.source.lastSourceCycle, 9);
+  assert.equal(metrics.source.uniqueSourceCycles, 2);
+  assert.equal(metrics.source.missingSourceCycleCount, 0);
+  assert.deepEqual(metrics.source.missingSourceCycleRanges, []);
+  const checks = Object.fromEntries(evaluateChecks([], [], { metrics }).checks.map(check => [check.name, check]));
+  assert.equal(checks['Source cycle progressed'].pass, true);
+  assert.equal(checks['Source cycle continuity'].pass, false);
+});
+
+test('progress after a regression records only the true forward gap', () => {
+  const metrics = verificationMetrics();
+  recordSourceObservation(metrics, sourceObservation(8), 1000);
+  recordSourceObservation(metrics, sourceObservation(3), 2000);
+  recordSourceObservation(metrics, sourceObservation(10), 3000);
+
+  assert.equal(metrics.source.lastSourceCycle, 10);
+  assert.equal(metrics.source.missingSourceCycleCount, 1);
+  assert.deepEqual(metrics.source.missingSourceCycleRanges, [{ from: 9, to: 9, count: 1 }]);
+  assert.equal(metrics.source.sourceCycleRegressions, 1);
+});
+
+test('repeated regressed cycles remain deterministic and do not reset progress timing', () => {
+  const metrics = verificationMetrics();
+  recordSourceObservation(metrics, sourceObservation(8), 1000);
+  recordSourceObservation(metrics, sourceObservation(3), 2000);
+  recordSourceObservation(metrics, sourceObservation(3), 3000);
+
+  assert.equal(metrics.source.sourceCycleRegressions, 2);
+  assert.equal(metrics.source.uniqueSourceCycles, 1);
+  assert.equal(metrics.source.lastSourceCycle, 8);
+  assert.equal(metrics.source.lastUniqueSourceObservedAt, 1000);
+  assert.equal(metrics.source.maximumObservedSourceStallMs, 0);
+});
+
+test('inspector contract failure does not prevent paper success processing', () => {
+  const context = processPoll(fulfilled(removeGates(inspectorResponse(), ['trend'])), fulfilled({ open: [], closed: [] }));
+
+  assert.equal(context.metrics.errors.inspectorContract.count, 1);
+  assert.equal(context.metrics.polling.successfulPaperPolls, 1);
+  assert.equal(context.metrics.errors.paperContract.count, 0);
+});
+
+test('paper contract failure does not prevent inspector success processing', () => {
+  const context = processPoll(fulfilled(inspectorResponse()), fulfilled({ open: [] }));
+
+  assert.equal(context.metrics.polling.validInspectorResponses, 1);
+  assert.equal(context.metrics.source.uniqueSourceCycles, 1);
+  assert.equal(context.metrics.errors.paperContract.count, 1);
+  assert.equal(context.metrics.polling.successfulPaperPolls, 0);
+});
+
+test('inspector endpoint failure does not prevent paper success processing', () => {
+  const context = processPoll(rejected(new Error('inspector timeout')), fulfilled({ open: [], closed: [] }));
+
+  assert.equal(context.metrics.errors.inspectorEndpoint.count, 1);
+  assert.equal(context.metrics.polling.successfulPaperPolls, 1);
+  assert.equal(context.metrics.errors.paperContract.count, 0);
+});
+
+test('paper endpoint failure does not prevent inspector success processing', () => {
+  const context = processPoll(fulfilled(inspectorResponse()), rejected(new Error('paper connection refused')));
+
+  assert.equal(context.metrics.polling.validInspectorResponses, 1);
+  assert.equal(context.metrics.source.uniqueSourceCycles, 1);
+  assert.equal(context.metrics.errors.paperEndpoint.count, 1);
+});
+
+test('both contract failures are recorded independently in one poll', () => {
+  const context = processPoll(
+    fulfilled(removeGates(inspectorResponse(), ['trend'])),
+    fulfilled({ open: [] }),
+  );
+
+  assert.equal(context.metrics.errors.inspectorContract.count, 1);
+  assert.equal(context.metrics.errors.paperContract.count, 1);
+  assert.equal(context.metrics.polling.successfulPaperPolls, 0);
+  assert.equal(context.metrics.polling.validInspectorResponses, 0);
+});
+
+test('inspector endpoint and paper contract failures remain separate', () => {
+  const context = processPoll(rejected(new Error('inspector refused')), fulfilled({ open: [] }));
+
+  assert.equal(context.metrics.errors.inspectorEndpoint.count, 1);
+  assert.equal(context.metrics.errors.paperContract.count, 1);
+  assert.equal(context.metrics.errors.inspectorContract.count, 0);
+  assert.equal(context.metrics.errors.paperEndpoint.count, 0);
+});
+
+test('inspector contract and paper endpoint failures remain separate', () => {
+  const context = processPoll(fulfilled(removeGates(inspectorResponse(), ['trend'])), rejected(new Error('paper timeout')));
+
+  assert.equal(context.metrics.errors.inspectorContract.count, 1);
+  assert.equal(context.metrics.errors.paperEndpoint.count, 1);
+  assert.equal(context.metrics.errors.inspectorEndpoint.count, 0);
+  assert.equal(context.metrics.errors.paperContract.count, 0);
+});
+
+test('invalid JSON is a contract failure for inspector and paper independently', () => {
+  const inspectorContext = processPoll(rejected(invalidJsonError()), fulfilled({ open: [], closed: [] }));
+  assert.equal(inspectorContext.metrics.errors.inspectorContract.count, 1);
+  assert.equal(inspectorContext.metrics.errors.inspectorEndpoint.count, 0);
+  assert.equal(inspectorContext.metrics.polling.successfulPaperPolls, 1);
+
+  const paperContext = processPoll(fulfilled(inspectorResponse()), rejected(invalidJsonError()));
+  assert.equal(paperContext.metrics.errors.paperContract.count, 1);
+  assert.equal(paperContext.metrics.errors.paperEndpoint.count, 0);
+  assert.equal(paperContext.metrics.polling.validInspectorResponses, 1);
+});
+
+test('timeouts and non-2xx responses remain endpoint failures', () => {
+  const timeout = processPoll(rejected(new Error('Request timeout')), fulfilled({ open: [], closed: [] }));
+  assert.equal(timeout.metrics.errors.inspectorEndpoint.count, 1);
+  assert.equal(timeout.metrics.errors.inspectorContract.count, 0);
+
+  const httpFailure = processPoll(fulfilled(inspectorResponse()), rejected(new Error('HTTP 503 for /api/paper-trades')));
+  assert.equal(httpFailure.metrics.errors.paperEndpoint.count, 1);
+  assert.equal(httpFailure.metrics.errors.paperContract.count, 0);
+});
+
+test('inspector valid counters are recorded only after full validation', () => {
+  const invalid = processPoll(fulfilled(removeGates(inspectorResponse(), ['trend'])), fulfilled({ open: [], closed: [] }));
+  assert.equal(invalid.metrics.polling.validInspectorResponses, 0);
+  assert.equal(invalid.metrics.polling.availableInspectorPolls, 0);
+  assert.equal(invalid.metrics.source.uniqueSourceCycles, 0);
+
+  const available = processPoll(fulfilled(inspectorResponse()), fulfilled({ open: [], closed: [] }));
+  assert.equal(available.metrics.polling.validInspectorResponses, 1);
+  assert.equal(available.metrics.polling.availableInspectorPolls, 1);
+  assert.equal(available.metrics.source.uniqueSourceCycles, 1);
+
+  const unavailable = processPoll(fulfilled({
+    available: false,
+    message: 'No decision data yet — waiting for first pipeline cycle',
+  }), fulfilled({ open: [], closed: [] }));
+  assert.equal(unavailable.metrics.polling.validInspectorResponses, 1);
+  assert.equal(unavailable.metrics.polling.unavailableInspectorPolls, 1);
+  assert.equal(unavailable.metrics.polling.availableInspectorPolls, 0);
+  assert.equal(unavailable.metrics.source.uniqueSourceCycles, 0);
+});
+
+test('report serializes compact diagnostics, failures, and truthful labels without mutation', () => {
+  const metrics = verificationMetrics();
+  recordSourceObservation(metrics, sourceObservation(10), 1000);
+  recordSourceObservation(metrics, sourceObservation(12), 2000);
+  recordVerificationFailure(metrics, 'inspectorEndpoint', 'timeout', 3000);
+  finalizeVerificationMetrics(metrics, 10000);
+  const before = JSON.stringify(serializeVerificationMetrics(metrics));
+
+  const report = generateReport([], [], 1000, 10000, { metrics });
+  evaluateChecks([], [], { metrics });
+  const after = JSON.stringify(serializeVerificationMetrics(metrics));
+
+  assert.equal(after, before);
+  assert.match(report, /Missing Source Cycle Count \(diagnostic only\) \| 1/);
+  assert.match(report, /Missing Source Cycle Ranges \(diagnostic only\).*\"from\":11.*\"to\":11/);
+  assert.match(report, /Maximum Observed Source Stall \(diagnostic only\)/);
+  assert.match(report, /Final Source Stall \(diagnostic only\)/);
+  assert.match(report, /Polling Drift \(diagnostic only\)/);
+  assert.match(report, /do not independently fail verification/);
+  assert.match(report, /inspectorEndpoint \| 1 \| timeout \| 3000/);
+  assert.doesNotMatch(report, /missingSourceCycleIds/);
+});
+
 test('neutral path accepts explicitly skipped downstream gates', () => {
   const coverage = evaluateGateCoverage(normalizeInspectorResponse(neutralInspector()));
   assert.equal(coverage.valid, true);
@@ -611,15 +1053,17 @@ test('report preserves existing headings and logical trade counts', () => {
   assert.match(report, /## Trade Performance/);
   assert.match(report, /## Verification Checks/);
   assert.match(report, /Total Trade Opened \| 1/);
-  assert.match(report, /Pipeline endpoint contract/);
-  assert.match(report, /Paper trades response contract/);
+  assert.match(report, /Inspector endpoint integrity/);
+  assert.match(report, /Paper contract integrity/);
+  assert.doesNotMatch(report, /Consistent cycle count/);
+  assert.doesNotMatch(report, /Maximum source stall check/);
 });
 
 function endpointContractChecks(verificationState) {
   const result = evaluateChecks([], [], verificationState);
   return Object.fromEntries(
     result.checks
-      .filter(check => check.name.endsWith('endpoint contract') || check.name === 'Paper trades response contract')
+      .filter(check => check.name === 'Inspector endpoint integrity' || check.name === 'Paper endpoint integrity')
       .map(check => [check.name, check.pass])
   );
 }
@@ -629,8 +1073,8 @@ test('inspector failure only fails the pipeline endpoint contract', () => {
     inspectorFailed: true,
     paperContractFailed: false,
   }), {
-    'Pipeline endpoint contract': false,
-    'Paper trades response contract': true,
+    'Inspector endpoint integrity': false,
+    'Paper endpoint integrity': true,
   });
 });
 
@@ -639,8 +1083,8 @@ test('paper failure only fails the paper trades response contract', () => {
     inspectorFailed: false,
     paperContractFailed: true,
   }), {
-    'Pipeline endpoint contract': true,
-    'Paper trades response contract': false,
+    'Inspector endpoint integrity': true,
+    'Paper endpoint integrity': false,
   });
 });
 
@@ -649,8 +1093,8 @@ test('both endpoint failures fail both endpoint contracts', () => {
     inspectorFailed: true,
     paperContractFailed: true,
   }), {
-    'Pipeline endpoint contract': false,
-    'Paper trades response contract': false,
+    'Inspector endpoint integrity': false,
+    'Paper endpoint integrity': false,
   });
 });
 
@@ -659,7 +1103,7 @@ test('no endpoint failures pass both endpoint contracts', () => {
     inspectorFailed: false,
     paperContractFailed: false,
   }), {
-    'Pipeline endpoint contract': true,
-    'Paper trades response contract': true,
+    'Inspector endpoint integrity': true,
+    'Paper endpoint integrity': true,
   });
 });
