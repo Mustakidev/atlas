@@ -28,6 +28,7 @@ const { MTFConfirmationEngine } = require('./src/engine/mtfConfirmation');
 const { createValidationDependencies } = require('./src/engine/validationDependencies');
 const { createApp } = require('./src/app');
 const { createExecutionPipeline } = require('./src/core/executionPipeline');
+const { createSystemClock } = require('./src/core/clock');
 
 const fetch = require('node-fetch');
 
@@ -49,6 +50,7 @@ logger.system('Config', 'Startup configuration validated successfully');
 
 const eventBus = new EventBus();
 const symbol = config.get('SYMBOL');
+const clock = createSystemClock();
 const cache = new CacheEngine(config, logger, symbol);
 const history = new HistoryEngine(config, logger, symbol);
 const analyzer = new MarketAnalyzer(logger, symbol);
@@ -65,11 +67,11 @@ const bollingerEngine = new BollingerEngine({ candleEngine, logger, symbol });
 const signalHistoryEngine = new SignalHistoryEngine({ config, logger, symbol, history, analyzer, structureEngine, candleEngine, indicatorRegistry, confluenceEngine, mtfEngine, macdEngine });
 const backtestEngine = new BacktestEngine({ structureEngine, indicatorRegistry, logger, symbol });
 const analyticsEngine = new AnalyticsEngine({ logger, symbol });
-const paperTradeEngine = new PaperTradingEngine({ logger, symbol });
+const paperTradeEngine = new PaperTradingEngine({ logger, symbol, clock });
 const riskEngine = new RiskEngine({ logger, symbol });
 const regimeEngine = new RegimeEngine({ indicatorRegistry, atrEngine, candleEngine, analyzer, logger, config, symbol });
 const regimeDecisionEngine = new RegimeDecisionEngine({ logger, symbol });
-const advanceRiskEngine = new AdvanceRiskEngine({ logger, symbol, paperTradeEngine, config });
+const advanceRiskEngine = new AdvanceRiskEngine({ logger, symbol, paperTradeEngine, config, clock });
 const mtfConfirmationEngine = new MTFConfirmationEngine({ logger, symbol, config });
 const strategyReplayEngine = new StrategyReplayEngine({ logger, symbol, config, riskPolicySource: advanceRiskEngine });
 const validationDependencyFactory = () => createValidationDependencies({ config, symbol });
@@ -95,6 +97,7 @@ const executionPipeline = createExecutionPipeline({
   advanceRiskEngine,
   mtfEngine,
   paperTradeEngine,
+  clock,
 });
 
 const app = createApp({

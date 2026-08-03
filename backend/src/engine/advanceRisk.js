@@ -1,4 +1,13 @@
 const { REGIMES } = require('../market-regime/RegimeTypes');
+const {
+  elapsedMs,
+  formatTimestamp,
+  readNowMs,
+  readMonotonicMs,
+  resolveClock,
+  resolveCycleNowMs,
+  utcDateKey,
+} = require('../core/clock');
 
 const ENGINE_VERSION = '2.0.0';
 
@@ -23,11 +32,12 @@ const DEFAULTS = {
 };
 
 class AdvanceRiskEngine {
-  constructor({ logger, symbol, paperTradeEngine, config }) {
+  constructor({ logger, symbol, paperTradeEngine, config, clock }) {
     this.logger = logger;
     this.symbol = symbol || 'BTCUSDT';
     this.paperTradeEngine = paperTradeEngine;
     this.config = config;
+    this.clock = resolveClock(clock);
     this.version = ENGINE_VERSION;
     this.lastUpdated = null;
     this.calculationTime = 0;
@@ -54,61 +64,62 @@ class AdvanceRiskEngine {
     this._lossPauseUntil = 0;
     this._dailyLossLimitReached = false;
     this._tradingEnabled = true;
-    this._lastResetDay = new Date().toDateString();
+    this._lastResetDay = this._dayKey(readNowMs(this.clock));
   }
 
   evaluate(params) {
-    const start = Date.now();
+    const nowMs = resolveCycleNowMs(this.clock, params?.nowMs);
+    const start = readMonotonicMs(this.clock);
     const { symbol, timeframe, entryPrice, atr, direction, trend, structure, confluence, regime } = params || {};
 
-    const inputError = this._validateInputs(params);
+    const inputError = this._validateInputs(params, nowMs);
     if (inputError) {
-      this.calculationTime = Date.now() - start;
-      this.lastUpdated = new Date().toISOString();
+      this.calculationTime = elapsedMs(this.clock, start);
+      this.lastUpdated = formatTimestamp(nowMs);
       return inputError;
     }
 
-    this._resetDailyIfNeeded();
+    this._resetDailyIfNeeded(nowMs);
 
     if (!this._tradingEnabled) {
       return this._rejected(symbol, timeframe, entryPrice, direction,
-        'Trading disabled — manual override');
+        'Trading disabled — manual override', nowMs);
     }
 
-    if (this._lossPauseUntil > Date.now()) {
-      const remaining = Math.ceil((this._lossPauseUntil - Date.now()) / 60000);
+    if (this._lossPauseUntil > nowMs) {
+      const remaining = Math.ceil((this._lossPauseUntil - nowMs) / 60000);
       return this._rejected(symbol, timeframe, entryPrice, direction,
-        `Consecutive loss pause active — ${remaining} min remaining (${this._consecutiveLosses} consecutive losses)`);
+        `Consecutive loss pause active — ${remaining} min remaining (${this._consecutiveLosses} consecutive losses)`, nowMs);
     }
 
     if (this._dailyLossLimitReached) {
       return this._rejected(symbol, timeframe, entryPrice, direction,
-        `Daily loss limit reached — max ${this._maxDailyLossPct}% loss (${this._dailyPnL.toFixed(2)})`);
+        `Daily loss limit reached — max ${this._maxDailyLossPct}% loss (${this._dailyPnL.toFixed(2)})`, nowMs);
     }
 
     const dailyDrawdownPct = this._calculateDailyDrawdownPct();
     if (dailyDrawdownPct >= this._maxDailyDrawdownPct) {
       this._dailyLossLimitReached = true;
       return this._rejected(symbol, timeframe, entryPrice, direction,
-        `Daily drawdown limit reached — ${dailyDrawdownPct.toFixed(2)}% >= ${this._maxDailyDrawdownPct}% max`);
+        `Daily drawdown limit reached — ${dailyDrawdownPct.toFixed(2)}% >= ${this._maxDailyDrawdownPct}% max`, nowMs);
     }
 
     const confConfidence = confluence?.confidence;
     if (!isFiniteNumber(confConfidence) || confConfidence > 100) {
-      return this._calculationRejected(start, symbol, timeframe, entryPrice, direction, 'Invalid confluence confidence');
+      return this._calculationRejected(start, symbol, timeframe, entryPrice, direction, 'Invalid confluence confidence', nowMs);
     }
     if (confConfidence < DEFAULTS.MIN_CONFIDENCE) {
       return this._rejected(symbol, timeframe, entryPrice, direction,
-        `Confluence confidence ${confConfidence} below minimum ${DEFAULTS.MIN_CONFIDENCE}`);
+        `Confluence confidence ${confConfidence} below minimum ${DEFAULTS.MIN_CONFIDENCE}`, nowMs);
     }
 
     const atrPct = atr?.atrPercentage;
     if (!isFiniteNumber(atrPct) || atrPct < 0) {
-      return this._calculationRejected(start, symbol, timeframe, entryPrice, direction, 'Invalid ATR percentage');
+      return this._calculationRejected(start, symbol, timeframe, entryPrice, direction, 'Invalid ATR percentage', nowMs);
     }
     if (atrPct > DEFAULTS.MAX_VOLATILITY_PCT) {
       return this._rejected(symbol, timeframe, entryPrice, direction,
-        `Volatility ${atrPct}% exceeds maximum ${DEFAULTS.MAX_VOLATILITY_PCT}%`);
+        `Volatility ${atrPct}% exceeds maximum ${DEFAULTS.MAX_VOLATILITY_PCT}%`, nowMs);
     }
 
     const isRanging = regime === REGIMES.RANGING;
@@ -117,7 +128,7 @@ class AdvanceRiskEngine {
     const atrMult = breakoutRegime ? this._atrMultRanging : (isRanging ? this._atrMultRanging : this._atrMultTrending);
     const rr = isRanging ? this._rrRanging : this._rrTrending;
 
-    const session = this._detectSession();
+    const session = this._detectSession(nowMs);
     const sessionMult = this._sessionMultipliers[session] || 1;
 
     const effectiveRiskPct = this._riskPerTradePct * sessionMult;
@@ -163,16 +174,16 @@ class AdvanceRiskEngine {
       effectiveRiskPct, atrValue, atrMult, sessionMult, this._dailyPnL, dailyDrawdown]
       .every(Number.isFinite)) {
       return this._calculationRejected(start, symbol, timeframe, entryPrice, direction,
-        'Risk calculation produced non-finite value');
+        'Risk calculation produced non-finite value', nowMs);
     }
 
     if (!(riskPerUnit > 0) || !(roundedRiskPerUnit > 0)) {
       return this._calculationRejected(start, symbol, timeframe, entryPrice, direction,
-        'Risk distance must be finite and greater than zero');
+        'Risk distance must be finite and greater than zero', nowMs);
     }
 
-    this.calculationTime = Date.now() - start;
-    this.lastUpdated = new Date().toISOString();
+    this.calculationTime = elapsedMs(this.clock, start);
+    this.lastUpdated = formatTimestamp(nowMs);
 
     return {
       symbol: symbol || this.symbol,
@@ -199,17 +210,18 @@ class AdvanceRiskEngine {
       dailyDrawdownPct: dailyDrawdown,
       consecutiveLosses: this._consecutiveLosses,
       tradingEnabled: this._tradingEnabled,
-      timestamp: new Date().toISOString(),
+      timestamp: this.lastUpdated,
       engineVersion: this.version,
       lastUpdated: this.lastUpdated,
       calculationTime: this.calculationTime,
     };
   }
 
-  onTradeClosed(pnl) {
+  onTradeClosed(pnl, context = {}) {
     if (!isFiniteNumber(pnl)) return;
 
-    this._resetDailyIfNeeded();
+    const nowMs = resolveCycleNowMs(this.clock, context?.nowMs);
+    this._resetDailyIfNeeded(nowMs);
     const nextDailyPnL = this._dailyPnL + pnl;
     const nextEquity = this._accountBalance + nextDailyPnL;
     if (!isFiniteNumber(nextDailyPnL) || !isFiniteNumber(nextEquity)) return;
@@ -221,7 +233,7 @@ class AdvanceRiskEngine {
 
     if (isLoss) {
       if (nextConsecutiveLosses >= this._maxConsecutiveLosses) {
-        nextLossPauseUntil = Date.now() + this._cooldownMs;
+        nextLossPauseUntil = nowMs + this._cooldownMs;
         if (!isFiniteNumber(nextLossPauseUntil)) return;
       }
       lossPct = Math.abs(nextDailyPnL) / this._accountBalance * 100;
@@ -240,7 +252,7 @@ class AdvanceRiskEngine {
       this._dailyLossLimitReached = true;
       this.logger?.warn('AdvanceRisk', `Daily loss limit reached — ${lossPct.toFixed(2)}% loss (${this._dailyPnL.toFixed(2)})`);
     }
-    this.lastUpdated = new Date().toISOString();
+    this.lastUpdated = formatTimestamp(nowMs);
   }
 
   getDailyPnL() { return this._round(this._dailyPnL); }
@@ -248,12 +260,19 @@ class AdvanceRiskEngine {
     return this._round(this._calculateDailyDrawdownPct());
   }
   getConsecutiveLosses() { return this._consecutiveLosses; }
-  isTradingEnabled() { return this._tradingEnabled && !this._dailyLossLimitReached && this._lossPauseUntil <= Date.now(); }
-  getLossPauseRemainingMs() { return Math.max(0, this._lossPauseUntil - Date.now()); }
+  isTradingEnabled(nowMs) {
+    const currentNowMs = resolveCycleNowMs(this.clock, nowMs);
+    return this._tradingEnabled && !this._dailyLossLimitReached && this._lossPauseUntil <= currentNowMs;
+  }
+  getLossPauseRemainingMs(nowMs) {
+    const currentNowMs = resolveCycleNowMs(this.clock, nowMs);
+    return Math.max(0, this._lossPauseUntil - currentNowMs);
+  }
   getAccountBalance() { return this._accountBalance; }
 
   getState() {
-    this._resetDailyIfNeeded();
+    const nowMs = readNowMs(this.clock);
+    this._resetDailyIfNeeded(nowMs);
     return {
       accountBalance: this._accountBalance,
       riskPerTradePct: this._riskPerTradePct,
@@ -263,10 +282,10 @@ class AdvanceRiskEngine {
       maxDailyDrawdownPct: this._maxDailyDrawdownPct,
       consecutiveLosses: this._consecutiveLosses,
       maxConsecutiveLosses: this._maxConsecutiveLosses,
-      lossPauseRemainingMs: this.getLossPauseRemainingMs(),
+      lossPauseRemainingMs: this.getLossPauseRemainingMs(nowMs),
       dailyLossLimitReached: this._dailyLossLimitReached,
       tradingEnabled: this._tradingEnabled,
-      session: this._detectSession(),
+      session: this._detectSession(nowMs),
       sessionMultipliers: { ...this._sessionMultipliers },
       atrMultTrending: this._atrMultTrending,
       atrMultRanging: this._atrMultRanging,
@@ -309,11 +328,12 @@ class AdvanceRiskEngine {
   setRrRanging(val) { if (isFiniteNumber(val) && val > 0) this._rrRanging = val; }
   enableTrading() { this._tradingEnabled = true; }
   disableTrading() { this._tradingEnabled = false; }
-  resetDaily() {
+  resetDaily(nowMs) {
+    const currentNowMs = resolveCycleNowMs(this.clock, nowMs);
     this._dailyPnL = 0;
     this._dailyHighWater = this._accountBalance;
     this._dailyLossLimitReached = false;
-    this._lastResetDay = new Date().toDateString();
+    this._lastResetDay = this._dayKey(currentNowMs);
   }
   resetConsecutiveLosses() {
     this._consecutiveLosses = 0;
@@ -332,17 +352,19 @@ class AdvanceRiskEngine {
     };
   }
 
-  _detectSession() {
-    const hour = new Date().getUTCHours();
+  _detectSession(nowMs) {
+    const currentNowMs = resolveCycleNowMs(this.clock, nowMs);
+    const hour = new Date(currentNowMs).getUTCHours();
     if (hour >= 0 && hour < 8) return 'ASIAN';
     if (hour >= 8 && hour < 16) return 'LONDON';
     return 'NEW_YORK';
   }
 
-  _resetDailyIfNeeded() {
-    const today = new Date().toDateString();
+  _resetDailyIfNeeded(nowMs) {
+    const currentNowMs = resolveCycleNowMs(this.clock, nowMs);
+    const today = this._dayKey(currentNowMs);
     if (today !== this._lastResetDay) {
-      this.resetDaily();
+      this.resetDaily(currentNowMs);
       this.resetConsecutiveLosses();
     }
   }
@@ -353,21 +375,22 @@ class AdvanceRiskEngine {
     return ((this._dailyHighWater - equity) / this._accountBalance) * 100;
   }
 
-  _validateInputs(params) {
-    if (!params) return this._rejected(this.symbol, null, null, null, 'No parameters provided');
+  _validateInputs(params, nowMs) {
+    if (!params) return this._rejected(this.symbol, null, null, null, 'No parameters provided', nowMs);
     if (!isFiniteNumber(params.entryPrice) || params.entryPrice <= 0) {
-      return this._rejected(params.symbol || this.symbol, params.timeframe, null, params.direction, 'Invalid entry price');
+      return this._rejected(params.symbol || this.symbol, params.timeframe, null, params.direction, 'Invalid entry price', nowMs);
     }
     if (!params.direction || !['BUY', 'SELL'].includes(params.direction)) {
-      return this._rejected(params.symbol || this.symbol, params.timeframe, params.entryPrice, null, 'Direction must be BUY or SELL');
+      return this._rejected(params.symbol || this.symbol, params.timeframe, params.entryPrice, null, 'Direction must be BUY or SELL', nowMs);
     }
     if (!params.atr || !params.atr.ready || !isFiniteNumber(params.atr.atr) || params.atr.atr <= 0) {
-      return this._rejected(params.symbol || this.symbol, params.timeframe, params.entryPrice, params.direction, 'ATR not ready or invalid');
+      return this._rejected(params.symbol || this.symbol, params.timeframe, params.entryPrice, params.direction, 'ATR not ready or invalid', nowMs);
     }
     return null;
   }
 
-  _rejected(symbol, timeframe, entryPrice, direction, reason) {
+  _rejected(symbol, timeframe, entryPrice, direction, reason, nowMs) {
+    const currentNowMs = resolveCycleNowMs(this.clock, nowMs);
     return {
       symbol: symbol || this.symbol,
       timeframe: timeframe || null,
@@ -385,7 +408,7 @@ class AdvanceRiskEngine {
       atrUsed: null,
       atrMultiplier: null,
       regime: null,
-      session: this._detectSession(),
+      session: this._detectSession(currentNowMs),
       sessionMultiplier: null,
       tradeAllowed: false,
       rejectionReason: reason,
@@ -393,18 +416,20 @@ class AdvanceRiskEngine {
       dailyDrawdownPct: this.getDailyDrawdownPct(),
       consecutiveLosses: this._consecutiveLosses,
       tradingEnabled: this._tradingEnabled,
-      timestamp: new Date().toISOString(),
+      timestamp: formatTimestamp(currentNowMs),
       engineVersion: this.version,
-      lastUpdated: new Date().toISOString(),
+      lastUpdated: formatTimestamp(currentNowMs),
       calculationTime: this.calculationTime,
     };
   }
 
-  _calculationRejected(start, symbol, timeframe, entryPrice, direction, reason) {
-    this.calculationTime = Date.now() - start;
-    this.lastUpdated = new Date().toISOString();
-    return this._rejected(symbol || this.symbol, timeframe, entryPrice, direction, reason);
+  _calculationRejected(start, symbol, timeframe, entryPrice, direction, reason, nowMs) {
+    this.calculationTime = elapsedMs(this.clock, start);
+    this.lastUpdated = formatTimestamp(nowMs);
+    return this._rejected(symbol || this.symbol, timeframe, entryPrice, direction, reason, nowMs);
   }
+
+  _dayKey(nowMs) { return utcDateKey(nowMs); }
 
   _round(value) {
     return Math.round(value * 100) / 100;

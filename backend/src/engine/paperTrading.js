@@ -14,6 +14,13 @@
  * Version: 2.0.0
  * Data Source: Production engine outputs (consumed only)
  */
+const {
+  elapsedMs,
+  formatTimestamp,
+  readMonotonicMs,
+  resolveClock,
+  resolveCycleNowMs,
+} = require('../core/clock');
 const ENGINE_VERSION = '2.0.0';
 const DEFAULT_SYMBOL = 'BTCUSDT';
 const DEFAULT_MAX_TRADES = 500;
@@ -37,9 +44,10 @@ const EXIT_REASONS = {
 };
 
 class PaperTradingEngine {
-  constructor({ logger, symbol }) {
+  constructor({ logger, symbol, clock }) {
     this.logger = logger;
     this.symbol = symbol || DEFAULT_SYMBOL;
+    this.clock = resolveClock(clock);
     this.version = ENGINE_VERSION;
     this.lastUpdated = null;
     this.calculationTime = 0;
@@ -60,11 +68,12 @@ class PaperTradingEngine {
   // Public API — Signal Processing
   // ---------------------------------------------------------------------------
 
-  signal(engines, currentPrice, timeframe, pipelineDirection, executionPlan) {
-    const start = Date.now();
+  signal(engines, currentPrice, timeframe, pipelineDirection, executionPlan, context = {}) {
+    const nowMs = resolveCycleNowMs(this.clock, context?.nowMs);
+    const start = readMonotonicMs(this.clock);
 
     if (currentPrice == null || currentPrice <= 0) {
-      this.calculationTime = Date.now() - start;
+      this.calculationTime = elapsedMs(this.clock, start);
       return null;
     }
 
@@ -82,12 +91,12 @@ class PaperTradingEngine {
     }
 
     if (executionDirection === 'neutral') {
-      this.calculationTime = Date.now() - start;
+      this.calculationTime = elapsedMs(this.clock, start);
       return null;
     }
 
     if (!pipelineDirection && analysis.confidence < 30) {
-      this.calculationTime = Date.now() - start;
+      this.calculationTime = elapsedMs(this.clock, start);
       return null;
     }
 
@@ -98,7 +107,7 @@ class PaperTradingEngine {
 
     if (executionPlan !== undefined) {
       if (!this._isValidExecutionPlan(executionPlan, currentPrice, executionDirection)) {
-        this.calculationTime = Date.now() - start;
+        this.calculationTime = elapsedMs(this.clock, start);
         return null;
       }
       ({ stopLoss, takeProfit, riskReward, positionSize } = executionPlan);
@@ -119,7 +128,7 @@ class PaperTradingEngine {
       timeframe: tf,
       direction: executionDirection,
       entryPrice: this._round(currentPrice),
-      entryTime: new Date().toISOString(),
+      entryTime: formatTimestamp(nowMs),
       stopLoss: executionPlan === undefined ? this._round(stopLoss) : stopLoss,
       takeProfit: executionPlan === undefined ? this._round(takeProfit) : takeProfit,
       riskReward,
@@ -130,8 +139,8 @@ class PaperTradingEngine {
       status: TRADE_STATES.OPEN,
     });
 
-    this.lastUpdated = new Date().toISOString();
-    this.calculationTime = Date.now() - start;
+    this.lastUpdated = formatTimestamp(nowMs);
+    this.calculationTime = elapsedMs(this.clock, start);
     return this._copyTrade(trade);
   }
 
@@ -149,7 +158,7 @@ class PaperTradingEngine {
   // Public API — Automatic Trade Management (Phase 2)
   // ---------------------------------------------------------------------------
 
-  onCandle(candle) {
+  onCandle(candle, context = {}) {
     if (!candle) return { opened: [], closed: [] };
 
     const openTrades = this._trades.filter(t => t.status === TRADE_STATES.OPEN || t.status === TRADE_STATES.ACTIVE);
@@ -187,10 +196,10 @@ class PaperTradingEngine {
       }
 
       if (hitSL) {
-        const closedTrade = this._closeTrade(trade, trade.stopLoss, EXIT_REASONS.STOP_LOSS);
+        const closedTrade = this._closeTrade(trade, trade.stopLoss, EXIT_REASONS.STOP_LOSS, context);
         if (closedTrade) closed.push(closedTrade);
       } else if (hitTP) {
-        const closedTrade = this._closeTrade(trade, trade.takeProfit, EXIT_REASONS.TAKE_PROFIT);
+        const closedTrade = this._closeTrade(trade, trade.takeProfit, EXIT_REASONS.TAKE_PROFIT, context);
         if (closedTrade) closed.push(closedTrade);
       }
     }
@@ -198,24 +207,24 @@ class PaperTradingEngine {
     return { opened: [], closed: this._copyTrades(closed) };
   }
 
-  close(tradeId, reason) {
+  close(tradeId, reason, context = {}) {
     const trade = this._trades.find(t => t.tradeId === tradeId);
     if (!trade) return null;
     if (trade.status === TRADE_STATES.CLOSED) return null;
 
     const price = this._lastPrice || trade.currentPrice || trade.entryPrice;
-    return this._copyTrade(this._closeTrade(trade, price, reason || EXIT_REASONS.MANUAL));
+    return this._copyTrade(this._closeTrade(trade, price, reason || EXIT_REASONS.MANUAL, context));
   }
 
-  invalidate(tradeId) {
+  invalidate(tradeId, context = {}) {
     const trade = this._trades.find(t => t.tradeId === tradeId);
     if (!trade) return null;
     if (trade.status === TRADE_STATES.CLOSED) return null;
 
-    return this._copyTrade(this._closeTrade(trade, trade.entryPrice, EXIT_REASONS.INVALIDATED));
+    return this._copyTrade(this._closeTrade(trade, trade.entryPrice, EXIT_REASONS.INVALIDATED, context));
   }
 
-  evaluateTrades(currentPrice) {
+  evaluateTrades(currentPrice, context = {}) {
     if (currentPrice == null || currentPrice <= 0) return [];
     this._lastPrice = currentPrice;
     const closed = [];
@@ -234,10 +243,10 @@ class PaperTradingEngine {
         : currentPrice <= trade.takeProfit;
 
       if (hitStopLoss) {
-        const closedTrade = this._closeTrade(trade, currentPrice, EXIT_REASONS.STOP_LOSS);
+        const closedTrade = this._closeTrade(trade, currentPrice, EXIT_REASONS.STOP_LOSS, context);
         if (closedTrade) closed.push(closedTrade);
       } else if (hitTakeProfit) {
-        const closedTrade = this._closeTrade(trade, currentPrice, EXIT_REASONS.TAKE_PROFIT);
+        const closedTrade = this._closeTrade(trade, currentPrice, EXIT_REASONS.TAKE_PROFIT, context);
         if (closedTrade) closed.push(closedTrade);
       }
     }
@@ -596,6 +605,7 @@ class PaperTradingEngine {
   _openTrade(params) {
     this._tradeCounter++;
     const tradeId = `PT-${this._tradeCounter}`;
+    const entryTime = params.entryTime || formatTimestamp(this.clock.nowMs());
 
     const trade = {
       tradeId,
@@ -603,7 +613,7 @@ class PaperTradingEngine {
       timeframe: params.timeframe,
       direction: params.direction,
       entryPrice: params.entryPrice,
-      entryTime: params.entryTime || new Date().toISOString(),
+      entryTime,
       stopLoss: params.stopLoss,
       takeProfit: params.takeProfit,
       riskReward: params.riskReward || 0,
@@ -618,7 +628,7 @@ class PaperTradingEngine {
       pnlPercent: null,
       confidence: params.confidence,
       reason: params.reason,
-      timestamp: params.entryTime || new Date().toISOString(),
+      timestamp: entryTime,
     };
 
     this._trades.push(trade);
@@ -640,7 +650,7 @@ class PaperTradingEngine {
     trade.status = newState;
   }
 
-  _closeTrade(trade, exitPrice, reason) {
+  _closeTrade(trade, exitPrice, reason, context = {}) {
     if (this._closedIds.has(trade.tradeId)) return null;
 
     const idx = this._trades.indexOf(trade);
@@ -648,7 +658,7 @@ class PaperTradingEngine {
 
     trade.status = TRADE_STATES.CLOSED;
     trade.exitPrice = this._round(exitPrice);
-    trade.exitTime = new Date().toISOString();
+    trade.exitTime = formatTimestamp(resolveCycleNowMs(this.clock, context?.nowMs));
     trade.exitReason = reason;
 
     const entryPrice = trade.entryPrice;
