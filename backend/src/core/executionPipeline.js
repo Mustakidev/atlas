@@ -1,4 +1,5 @@
 const { getFinalizedCandles } = require('../engine/candleUtils');
+const { captureCycleTime, resolveClock } = require('./clock');
 
 function isValidCandle(candle) {
   return Boolean(candle)
@@ -30,11 +31,7 @@ function createExecutionPipeline({
   paperTradeEngine,
   clock,
 }) {
-  const time = clock || {
-    now: () => Date.now(),
-    isoNow: () => new Date().toISOString(),
-    localeTime: () => new Date().toLocaleTimeString(),
-  };
+  const time = resolveClock(clock);
   let lastSignalTime = 0;
   let pipelineCycleCount = 0;
   let lastDecision = null;
@@ -42,32 +39,33 @@ function createExecutionPipeline({
   let lastPipelineError = null;
   let lastSuccessfulCycle = null;
 
-  function safeExecute(engineName, fn, fallback) {
+  function safeExecute(engineName, fn, fallback, cycle) {
     try {
       return fn();
     } catch (err) {
       pipelineErrors++;
-      lastPipelineError = { engine: engineName, timestamp: time.isoNow(), error: err.message };
+      lastPipelineError = { engine: engineName, timestamp: cycle.isoNow, error: err.message };
       logger.error('Pipeline', `Engine failure: ${engineName}`, { error: err.message });
       return fallback;
     }
   }
 
-  function processTradeLifecycle(price, activeCandle) {
-    const closed = safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price), []);
+  function processTradeLifecycle(price, activeCandle, cycle) {
+    const context = Object.freeze({ nowMs: cycle.nowMs });
+    const closed = safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price, context), [], cycle);
     if (closed.length > 0) {
       for (const t of closed) {
-        safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl), undefined);
+        safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl, context), undefined, cycle);
         console.log(`  Trade Closed: ${t.tradeId} | ${t.exitReason} | Entry=$${t.entryPrice} → Exit=$${t.exitPrice} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
       }
     }
 
     if (!isValidCandle(activeCandle)) return;
 
-    const candleResult = safeExecute('PaperTrading', () => paperTradeEngine.onCandle(activeCandle), null);
+    const candleResult = safeExecute('PaperTrading', () => paperTradeEngine.onCandle(activeCandle, context), null, cycle);
     if (candleResult && candleResult.closed && candleResult.closed.length > 0) {
       for (const t of candleResult.closed) {
-        safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl), undefined);
+        safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl, context), undefined, cycle);
         console.log(`  Trade Closed (candle): ${t.tradeId} | ${t.exitReason} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
       }
     }
@@ -75,18 +73,19 @@ function createExecutionPipeline({
 
   function run(snapshot) {
     pipelineCycleCount++;
+    const cycle = captureCycleTime(time);
     const tf = '1h';
     const price = snapshot?.price;
 
     const divider = '─'.repeat(50);
     console.log(`\n${divider}`);
-    console.log(`[Pipeline] Cycle #${pipelineCycleCount} | ${time.localeTime()} | Price: $${price || 'N/A'}`);
+    console.log(`[Pipeline] Cycle #${pipelineCycleCount} | ${cycle.localeTime} | Price: $${price || 'N/A'}`);
 
     const riskThreshold = config.get('CONFLUENCE_BULLISH_THRESHOLD') || 65;
     const bearThreshold = config.get('CONFLUENCE_BEARISH_THRESHOLD') || 35;
 
     const decision = {
-      timestamp: time.isoNow(),
+      timestamp: cycle.isoNow,
       cycle: pipelineCycleCount,
       price: price || null,
       timeframe: tf,
@@ -112,7 +111,7 @@ function createExecutionPipeline({
     }
 
     const activeCandle = candleEngine.getActive(tf);
-    processTradeLifecycle(price, activeCandle);
+    processTradeLifecycle(price, activeCandle, cycle);
 
     const finalized = getFinalizedCandles(candleEngine, tf, 500);
 
@@ -128,12 +127,12 @@ function createExecutionPipeline({
       return;
     }
 
-    lastSuccessfulCycle = time.isoNow();
+    lastSuccessfulCycle = cycle.isoNow;
 
     const marketRegime = safeExecute('RegimeEngine', () => regimeEngine.calculate(finalized, tf), {
       regime: 'UNKNOWN', confidence: 0, trendScore: 50, rangeScore: 50,
       volatility: 'UNKNOWN', decisionReason: 'Regime engine failed',
-    });
+    }, cycle);
     decision.marketRegime = {
       regime: marketRegime.regime,
       confidence: marketRegime.confidence,
@@ -145,16 +144,16 @@ function createExecutionPipeline({
 
     const confluence = safeExecute('ConfluenceEngine', () => confluenceEngine.calculate(finalized, tf), {
       score: 50, bias: 'Neutral', confidence: 0, components: {},
-    });
+    }, cycle);
     decision.confluence = { score: confluence.score, bias: confluence.bias, confidence: confluence.confidence, components: confluence.components };
 
-    const atr = safeExecute('ATREngine', () => atrEngine.calculate(tf), null);
-    const trend = safeExecute('MarketAnalyzer', () => analyzer.getAnalysis(), null);
-    const structureResult = safeExecute('StructureEngine', () => structureEngine.calculate(finalized), null);
-    const rsiResult = safeExecute('RSI', () => indicatorRegistry.get('RSI')?.calculate(finalized, tf), null);
-    const emaResult = safeExecute('EMA', () => indicatorRegistry.get('EMA')?.calculate(finalized, tf, 20), null);
-    const macdResult = safeExecute('MACDEngine', () => macdEngine.calculate(tf), null);
-    const bollingerResult = safeExecute('BollingerEngine', () => bollingerEngine.calculate(tf), null);
+    const atr = safeExecute('ATREngine', () => atrEngine.calculate(tf), null, cycle);
+    const trend = safeExecute('MarketAnalyzer', () => analyzer.getAnalysis(), null, cycle);
+    const structureResult = safeExecute('StructureEngine', () => structureEngine.calculate(finalized), null, cycle);
+    const rsiResult = safeExecute('RSI', () => indicatorRegistry.get('RSI')?.calculate(finalized, tf), null, cycle);
+    const emaResult = safeExecute('EMA', () => indicatorRegistry.get('EMA')?.calculate(finalized, tf, 20), null, cycle);
+    const macdResult = safeExecute('MACDEngine', () => macdEngine.calculate(tf), null, cycle);
+    const bollingerResult = safeExecute('BollingerEngine', () => bollingerEngine.calculate(tf), null, cycle);
 
     decision.engines.trend = trend;
     decision.engines.structure = { ...structureResult };
@@ -211,7 +210,7 @@ function createExecutionPipeline({
         confidence: marketRegime.confidence,
         direction: null,
         confluenceScore: confluence.score,
-      }), { allowTrade: false, penalty: 0, preferredDirection: null, reason: 'Regime decision engine failed' });
+      }), { allowTrade: false, penalty: 0, preferredDirection: null, reason: 'Regime decision engine failed' }, cycle);
       decision.regimeDecision = neutralRegimeDecision;
       decision.gates.regimeDecision = {
         pass: true,
@@ -238,7 +237,7 @@ function createExecutionPipeline({
       confidence: marketRegime.confidence,
       direction,
       confluenceScore: confluence.score,
-    }), { allowTrade: false, penalty: 0, preferredDirection: direction, reason: 'Regime decision engine failed' });
+    }), { allowTrade: false, penalty: 0, preferredDirection: direction, reason: 'Regime decision engine failed' }, cycle);
     decision.regimeDecision = regimeDecision;
     decision.gates.regimeDecision = {
       pass: regimeDecision.allowTrade,
@@ -266,8 +265,8 @@ function createExecutionPipeline({
     for (const mtfTF of mtfTFs) {
       const mtfFinalized = getFinalizedCandles(candleEngine, mtfTF, 100);
       if (mtfFinalized.length >= 15) {
-        const mtfConfluence = safeExecute('MTF-Confluence', () => confluenceEngine.calculate(mtfFinalized, mtfTF), { score: 50, bias: 'Neutral', confidence: 0 });
-        const mtfAtr = safeExecute('MTF-ATR', () => atrEngine.calculate(mtfTF), null);
+        const mtfConfluence = safeExecute('MTF-Confluence', () => confluenceEngine.calculate(mtfFinalized, mtfTF), { score: 50, bias: 'Neutral', confidence: 0 }, cycle);
+        const mtfAtr = safeExecute('MTF-ATR', () => atrEngine.calculate(mtfTF), null, cycle);
         mtfTimeframes[mtfTF] = {
           confluence: { score: mtfConfluence.score, bias: mtfConfluence.bias, confidence: mtfConfluence.confidence },
           volatilityLevel: mtfAtr?.volatilityLevel || null,
@@ -275,7 +274,7 @@ function createExecutionPipeline({
       }
     }
 
-    const mtfResult = safeExecute('MTFConfirmation', () => mtfConfirmationEngine.evaluate({ direction, timeframe: tf, timeframes: mtfTimeframes }), { mtfAllowed: false, rejectionReason: 'MTF confirmation engine failed', confidence: 0, alignmentScore: 0 });
+    const mtfResult = safeExecute('MTFConfirmation', () => mtfConfirmationEngine.evaluate({ direction, timeframe: tf, timeframes: mtfTimeframes }), { mtfAllowed: false, rejectionReason: 'MTF confirmation engine failed', confidence: 0, alignmentScore: 0 }, cycle);
     decision.mtfConfirmation = mtfResult;
     decision.gates.mtfConfirmation = {
       pass: mtfResult.mtfAllowed,
@@ -295,7 +294,8 @@ function createExecutionPipeline({
 
     const riskResult = safeExecute('AdvanceRisk', () => advanceRiskEngine.evaluate({
       symbol, timeframe: tf, entryPrice: price, atr: atr || { ready: false, atr: null, atrPercentage: 0 }, direction, trend, structure: structureResult, confluence, regime: marketRegime.regime,
-    }), { tradeAllowed: false, rejectionReason: 'Advance risk engine failed', positionSize: 0, stopLoss: 0, takeProfit: 0, riskReward: 0, session: null });
+      nowMs: cycle.nowMs,
+    }), { tradeAllowed: false, rejectionReason: 'Advance risk engine failed', positionSize: 0, stopLoss: 0, takeProfit: 0, riskReward: 0, session: null }, cycle);
     decision.risk = riskResult;
     decision.gates.advanceRisk = { pass: riskResult.tradeAllowed, value: riskResult.tradeAllowed ? 'ALLOWED' : 'BLOCKED', detail: riskResult.tradeAllowed ? `AdvanceRisk | pos=${riskResult.positionSize} | SL=$${riskResult.stopLoss} | TP=$${riskResult.takeProfit} | R:R 1:${riskResult.riskReward}` : riskResult.rejectionReason };
 
@@ -319,7 +319,7 @@ function createExecutionPipeline({
       return;
     }
 
-    const now = time.now();
+    const now = cycle.nowMs;
     if (now - lastSignalTime < 60000) {
       const waitSec = Math.ceil((60000 - (now - lastSignalTime)) / 1000);
       decision.verdict.rejectionReason = `Cooldown active — ${waitSec}s remaining (min 60s between trades)`;
@@ -331,7 +331,7 @@ function createExecutionPipeline({
     }
 
     const engines = { trend, structure: structureResult, rsi: rsiResult, ema: emaResult, macd: macdResult, atr, bollinger: bollingerResult, confluence, mtf: (() => { try { return mtfEngine.calculate(500); } catch (e) { return null; } })() };
-    const trade = safeExecute('PaperTrading', () => paperTradeEngine.signal(engines, price, tf, direction, riskResult), null);
+    const trade = safeExecute('PaperTrading', () => paperTradeEngine.signal(engines, price, tf, direction, riskResult, { nowMs: cycle.nowMs }), null, cycle);
     if (trade) {
       lastSignalTime = now;
       decision.verdict.tradeOpened = true;
