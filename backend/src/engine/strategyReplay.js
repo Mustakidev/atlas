@@ -7,7 +7,7 @@
  *
  * Uses the EXACT same logic as the live pipeline:
  *   1. Confluence bias check (Bullish/Bearish → signal)
- *   2. Risk Engine evaluation (confidence, volatility, ATR levels)
+ *   2. AdvanceRiskEngine evaluation (confidence, volatility, ATR levels)
  *   3. PaperTrading weighted-vote analysis (direction + confidence gate)
  *   4. Trade lifecycle (SL/TP via candle high/low)
  *

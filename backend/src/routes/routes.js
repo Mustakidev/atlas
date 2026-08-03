@@ -692,7 +692,7 @@ function createRouter(deps) {
   });
 
   // ---------------------------------------------------------------------------
-  // Risk Management — ATR-based stop loss/take profit evaluation
+  // Standalone Risk Calculator API — simple ATR-based stop loss/take profit evaluation
   // ---------------------------------------------------------------------------
 
   router.get('/risk', (req, res) => {
@@ -759,7 +759,7 @@ function createRouter(deps) {
   });
 
   // ---------------------------------------------------------------------------
-  // Advance Risk — dynamic position sizing, ATR SL/TP, daily limits, session risk
+  // Canonical Live Risk API — execution-plan sizing, ATR SL/TP, daily limits, session risk
   // ---------------------------------------------------------------------------
 
   router.get('/advance-risk', (req, res) => {
@@ -809,7 +809,7 @@ function createRouter(deps) {
   });
 
   // ---------------------------------------------------------------------------
-  // Advance Risk State — current risk engine state (daily limits, losses, session)
+  // Canonical Live Risk State — daily limits, losses, and session state
   // ---------------------------------------------------------------------------
 
   router.get('/advance-risk/state', (req, res) => {
