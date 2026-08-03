@@ -2,7 +2,45 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { createRouter } = require('../../src/routes/routes');
+const { RiskEngine } = require('../../src/engine/risk');
+const { AdvanceRiskEngine } = require('../../src/engine/advanceRisk');
 const { cloneFixture, validMarketSnapshot } = require('../fixtures/market');
+
+const riskLogger = { info() {}, warn() {}, error() {}, system() {} };
+
+function riskApiDependencies() {
+  const candles = [{ open: 100, high: 102, low: 98, close: 100, openTime: 1 }];
+  return {
+    logger: riskLogger,
+    candleEngine: {
+      getAllTimeframes: () => ['1h'],
+      getCandles: () => candles,
+      getActive: () => null,
+    },
+    atrEngine: {
+      calculate: () => ({ ready: true, atr: 2, atrPercentage: 1 }),
+    },
+    analyzer: {
+      getAnalysis: () => ({ trend: { '1H': 'Bullish' } }),
+    },
+    structureEngine: {
+      calculate: () => ({ ready: true, direction: 'bullish', score: 80 }),
+    },
+    confluenceEngine: {
+      calculate: () => ({ bias: 'Bullish', score: 80, confidence: 80 }),
+    },
+    regimeEngine: {
+      calculate: () => ({ regime: 'TRENDING_BULL' }),
+    },
+    riskEngine: new RiskEngine({ logger: riskLogger, symbol: 'BTCUSDT' }),
+    advanceRiskEngine: new AdvanceRiskEngine({
+      logger: riskLogger,
+      symbol: 'BTCUSDT',
+      paperTradeEngine: null,
+      config: {},
+    }),
+  };
+}
 
 function responseHarness(resolve, reject) {
   return {
@@ -166,6 +204,74 @@ test('invalid entryPrice is rejected by query sanitization', async () => {
 
   assert.equal(result.statusCode, 400);
   assert.equal(result.body.error, 'entryPrice must be a positive number');
+});
+
+test('GET /api/risk returns the standalone calculator contract', async () => {
+  const result = await dispatch('/risk', { entryPrice: '100', direction: 'BUY' }, riskApiDependencies());
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.engineVersion, '1.0.0');
+  assert.equal(result.body.tradeAllowed, true);
+  assert.equal(result.body.stopLoss, 96);
+  assert.equal(result.body.takeProfit, 108);
+  assert.equal(result.body.riskReward, 2);
+  assert.equal(result.body.risk, 4);
+  assert.equal(result.body.reward, 8);
+  assert.equal(result.body.rejectionReason, null);
+
+  for (const field of [
+    'positionSize', 'accountBalance', 'riskPerTradePct', 'dailyPnL',
+    'dailyDrawdownPct', 'consecutiveLosses', 'regime', 'session',
+  ]) {
+    assert.equal(Object.hasOwn(result.body, field), false, `/risk should not expose ${field}`);
+  }
+});
+
+test('GET /api/advance-risk returns the canonical execution-plan contract', async () => {
+  const result = await dispatch('/advance-risk', { entryPrice: '100', direction: 'BUY' }, riskApiDependencies());
+  const standalone = await dispatch('/risk', { entryPrice: '100', direction: 'BUY' }, riskApiDependencies());
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.engineVersion, '2.0.0');
+  assert.equal(result.body.tradeAllowed, true);
+  assert.equal(result.body.stopLoss, 96);
+  assert.equal(result.body.takeProfit, 112);
+  assert.equal(result.body.riskReward, 3);
+  assert.equal(result.body.positionSize, 25);
+  assert.equal(result.body.accountBalance, 10000);
+  assert.equal(result.body.riskPerTradePct, 1);
+  assert.equal(result.body.regime, 'TRENDING_BULL');
+  assert.ok(['ASIAN', 'LONDON', 'NEW_YORK'].includes(result.body.session));
+  assert.equal(result.body.dailyPnL, 0);
+  assert.equal(result.body.dailyDrawdownPct, 0);
+  assert.equal(result.body.consecutiveLosses, 0);
+  assert.equal(result.body.rejectionReason, null);
+
+  assert.notEqual(result.body.takeProfit, standalone.body.takeProfit);
+  assert.notEqual(result.body.riskReward, standalone.body.riskReward);
+  assert.equal(Object.hasOwn(standalone.body, 'positionSize'), false);
+  assert.equal(Object.hasOwn(result.body, 'positionSize'), true);
+});
+
+test('GET /api/advance-risk/state returns live AdvanceRisk state', async () => {
+  const dependencies = riskApiDependencies();
+  const before = dependencies.advanceRiskEngine.getState();
+  const result = await dispatch('/advance-risk/state', {}, dependencies);
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.available, true);
+  for (const field of [
+    'accountBalance', 'riskPerTradePct', 'dailyPnL', 'dailyDrawdownPct',
+    'maxDailyLossPct', 'maxDailyDrawdownPct', 'consecutiveLosses',
+    'maxConsecutiveLosses', 'dailyLossLimitReached', 'tradingEnabled',
+    'session', 'sessionMultipliers', 'atrMultTrending', 'atrMultRanging',
+    'rrTrending', 'rrRanging', 'lastUpdated',
+  ]) {
+    assert.equal(Object.hasOwn(result.body, field), true, `state missing ${field}`);
+    assert.deepEqual(result.body[field], before[field], `state changed unexpectedly for ${field}`);
+  }
+  assert.equal(Object.hasOwn(result.body, 'riskReward'), false);
+  assert.equal(Object.hasOwn(result.body, 'stopLoss'), false);
 });
 
 test('indicator route preserves per-indicator engine failure fallback', async () => {
