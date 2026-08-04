@@ -7,6 +7,7 @@ const { MTFConfirmationEngine } = require('../../src/engine/mtfConfirmation');
 const { PaperTradingEngine } = require('../../src/engine/paperTrading');
 
 const logger = { info() {}, warn() {}, error() {} };
+const BASE_TIME = Date.parse('2024-01-01T00:00:00.000Z');
 const config = {
   get(key) {
     if (key === 'CONFLUENCE_BULLISH_THRESHOLD') return 65;
@@ -24,7 +25,7 @@ function candles(direction = 'up', length = 52) {
       low: close - 1,
       close,
       volume: 1,
-      timestamp: new Date(index * 60000).toISOString(),
+      timestamp: new Date(BASE_TIME + index * 60000).toISOString(),
     };
   });
 }
@@ -36,7 +37,7 @@ function flatCandles() {
     low: 99,
     close: 100,
     volume: 1,
-    timestamp: new Date(index * 60000).toISOString(),
+    timestamp: new Date(BASE_TIME + index * 60000).toISOString(),
   }));
 }
 
@@ -446,7 +447,7 @@ test('stop-loss closure advances replay risk exactly once', () => {
   const { replay } = makeReplay({ riskPolicySource: source });
   const { closedPnLs } = instrumentReplayRisk(replay);
   const input = candles('up');
-  Object.assign(input[51], { high: 150, low: 147, close: 149 });
+  Object.assign(input[51], { open: 149, high: 150, low: 147, close: 149 });
 
   const result = replay.run(input, '1h');
 
@@ -490,7 +491,7 @@ test('consecutive loss pause rejects following signals without reporting rejecte
   const { replay } = makeReplay({ riskPolicySource: source });
   const { risk, closedPnLs } = instrumentReplayRisk(replay);
   const input = candles('up', 54);
-  Object.assign(input[51], { high: 150, low: 147, close: 149 });
+  Object.assign(input[51], { open: 149, high: 150, low: 147, close: 149 });
 
   const result = replay.run(input, '1h');
 
@@ -506,7 +507,7 @@ test('winning replay trade resets consecutive-loss state', () => {
   const { replay } = makeReplay({ riskPolicySource: source });
   const { risk, closedPnLs } = instrumentReplayRisk(replay);
   const input = candles('up', 54);
-  Object.assign(input[51], { high: 150, low: 147, close: 149 });
+  Object.assign(input[51], { open: 149, high: 150, low: 147, close: 149 });
   Object.assign(input[52], { high: 153, low: 151, close: 152 });
   Object.assign(input[53], { high: 158, low: 152, close: 157 });
 
@@ -524,7 +525,7 @@ test('replay closures update daily PnL and drawdown state', () => {
   const { replay } = makeReplay({ riskPolicySource: source });
   const { risk, closedPnLs } = instrumentReplayRisk(replay);
   const input = candles('up');
-  Object.assign(input[51], { high: 150, low: 149, close: 149 });
+  Object.assign(input[51], { open: 149, high: 150, low: 149, close: 149 });
 
   const result = replay.run(input, '1h');
   const state = risk.getState();
@@ -541,7 +542,7 @@ test('replay closure reporting does not mutate the source risk engine', () => {
   const { replay } = makeReplay({ riskPolicySource: source });
   instrumentReplayRisk(replay);
   const input = candles('up');
-  Object.assign(input[51], { high: 150, low: 147, close: 149 });
+  Object.assign(input[51], { open: 149, high: 150, low: 147, close: 149 });
 
   replay.run(input, '1h');
 

@@ -31,6 +31,7 @@ const { AdvanceRiskEngine } = require('./advanceRisk');
 const { RegimeEngine } = require('../market-regime/RegimeEngine');
 const { RegimeDecisionEngine } = require('../market-regime/RegimeDecisionEngine');
 const { MTFConfirmationEngine } = require('./mtfConfirmation');
+const { normalizeReplayInput } = require('./replayInput');
 
 class StrategyReplayEngine {
   constructor({ logger, symbol, config, advanceRiskEngine, riskPolicySource, mtfConfirmationEngine }) {
@@ -56,15 +57,19 @@ class StrategyReplayEngine {
 
   run(candles, timeframe) {
     const start = Date.now();
-    const tf = timeframe || '1h';
+    const fallbackTimeframe = timeframe || '1h';
 
     if (!candles || !Array.isArray(candles) || candles.length === 0) {
-      return this._emptyResult(tf, 'No candle data provided');
+      return this._emptyResult(fallbackTimeframe, 'No candle data provided');
     }
 
     if (candles.length < DEFAULT_WARMUP + 1) {
-      return this._emptyResult(tf, `Insufficient candles (${candles.length}/${DEFAULT_WARMUP + 1} minimum)`);
+      return this._emptyResult(fallbackTimeframe, `Insufficient candles (${candles.length}/${DEFAULT_WARMUP + 1} minimum)`);
     }
+
+    const normalizedInput = normalizeReplayInput(candles, timeframe);
+    candles = normalizedInput.candles;
+    const tf = normalizedInput.timeframe;
 
     const trades = [];
     const rejections = [];

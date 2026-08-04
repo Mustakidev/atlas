@@ -9,6 +9,7 @@ const { StrategyReplayEngine } = require('../../src/engine/strategyReplay');
 const { createValidationDependencies } = require('../../src/engine/validationDependencies');
 
 const logger = { info() {}, warn() {}, error() {}, system() {} };
+const BASE_TIME = Date.parse('2024-01-01T00:00:00.000Z');
 const config = {
   get(key) {
     if (key === 'MAX_HISTORY') return 500;
@@ -38,7 +39,7 @@ function constantRangeCandles(count, width = 5) {
     low: 100 - width,
     close: 100,
     volume: 1,
-    timestamp: new Date(index * 60000).toISOString(),
+    timestamp: new Date(BASE_TIME + index * 60000).toISOString(),
   }));
 }
 
@@ -52,7 +53,7 @@ function variedCandles() {
       low: close - width,
       close,
       volume: 10,
-      timestamp: new Date(index * 3600000).toISOString(),
+      timestamp: new Date(BASE_TIME + index * 3600000).toISOString(),
     };
   });
 }
@@ -64,7 +65,7 @@ function customPeriodCandles() {
     low: 100 - width,
     close: 100,
     volume: 1,
-    timestamp: new Date(index * 60000).toISOString(),
+    timestamp: new Date(BASE_TIME + index * 60000).toISOString(),
   }));
 }
 
