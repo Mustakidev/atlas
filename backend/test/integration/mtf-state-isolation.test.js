@@ -6,6 +6,7 @@ const { MTFConfirmationEngine } = require('../../src/engine/mtfConfirmation');
 const { StrategyReplayEngine } = require('../../src/engine/strategyReplay');
 
 const FIXED_ISO = '2024-01-01T00:00:00.000Z';
+const BASE_TIME = Date.parse('2024-01-01T00:00:00.000Z');
 const logger = { info() {}, warn() {}, error() {} };
 const config = {
   get(key) {
@@ -31,8 +32,8 @@ function makeCandles(count) {
     low: 99 + index,
     close: 100 + index,
     volume: 1,
-    openTime: index,
-    timestamp: new Date(index * 60000).toISOString(),
+    openTime: BASE_TIME + index * 60000,
+    timestamp: new Date(BASE_TIME + index * 60000).toISOString(),
   }));
 }
 
