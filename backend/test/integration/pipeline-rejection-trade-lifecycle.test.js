@@ -70,9 +70,23 @@ function makeHarness(mode, activeCandle, now = 60000) {
   const riskClosures = [];
   const candleCalls = [];
   const evaluateCalls = [];
+  const finalizedInputs = [];
+  const dependencyCalls = [];
+  const clockCalls = { now: 0, monotonic: 0 };
   const confluence = mode === 'neutral'
     ? { score: 50, bias: 'Neutral', confidence: 50, components: {}, missing: [] }
     : { score: 80, bias: 'Bullish', confidence: 80, components: {} };
+
+  const clock = {
+    now: () => {
+      clockCalls.now++;
+      return now;
+    },
+    monotonic: () => {
+      clockCalls.monotonic++;
+      return clockCalls.monotonic;
+    },
+  };
 
   const pipeline = createExecutionPipeline({
     config,
@@ -83,38 +97,97 @@ function makeHarness(mode, activeCandle, now = 60000) {
       getActive: () => activeCandle,
     },
     regimeEngine: {
-      calculate: () => ({ regime: 'TRENDING_BULL', confidence: 80, trendScore: 80, rangeScore: 20, volatility: 'Low' }),
+      calculate: candles => {
+        dependencyCalls.push('regime');
+        finalizedInputs.push(candles);
+        return { regime: 'TRENDING_BULL', confidence: 80, trendScore: 80, rangeScore: 20, volatility: 'Low' };
+      },
     },
-    confluenceEngine: { calculate: () => confluence },
-    atrEngine: { calculate: () => ({ ready: true, atr: 2, atrPercentage: 1, volatilityLevel: 'Low', volatilityTrend: 'Stable' }) },
-    analyzer: { getAnalysis: () => ({ trend: { '1H': 'Bullish' } }) },
-    structureEngine: { calculate: () => ({ ready: true, direction: 'bullish', score: 80, structure: 'Bullish' }) },
+    confluenceEngine: {
+      calculate: candles => {
+        dependencyCalls.push('confluence');
+        finalizedInputs.push(candles);
+        return confluence;
+      },
+    },
+    atrEngine: {
+      calculate: () => {
+        dependencyCalls.push('atr');
+        return { ready: true, atr: 2, atrPercentage: 1, volatilityLevel: 'Low', volatilityTrend: 'Stable' };
+      },
+    },
+    analyzer: {
+      getAnalysis: () => {
+        dependencyCalls.push('analyzer');
+        return { trend: { '1H': 'Bullish' } };
+      },
+    },
+    structureEngine: {
+      calculate: candles => {
+        dependencyCalls.push('structure');
+        finalizedInputs.push(candles);
+        return { ready: true, direction: 'bullish', score: 80, structure: 'Bullish' };
+      },
+    },
     indicatorRegistry: {
-      get: name => ({ calculate: () => name === 'RSI'
-        ? { ready: true, value: 70, state: 'Overbought' }
-        : { ready: true, value: 110, trend: 'Above' } }),
+      get: name => ({
+        calculate: candles => {
+          dependencyCalls.push(`indicator:${name}`);
+          finalizedInputs.push(candles);
+          return name === 'RSI'
+            ? { ready: true, value: 70, state: 'Overbought' }
+            : { ready: true, value: 110, trend: 'Above' };
+        },
+      }),
     },
-    macdEngine: { calculate: () => ({ ready: true, macd: 1, signal: 0, histogram: 1, trend: 'Bullish' }) },
-    bollingerEngine: { calculate: () => ({ ready: true, middleBand: 100, upperBand: 110, lowerBand: 90, pricePosition: 'Inside Bands', squeeze: false }) },
+    macdEngine: {
+      calculate: () => {
+        dependencyCalls.push('macd');
+        return { ready: true, macd: 1, signal: 0, histogram: 1, trend: 'Bullish' };
+      },
+    },
+    bollingerEngine: {
+      calculate: () => {
+        dependencyCalls.push('bollinger');
+        return { ready: true, middleBand: 100, upperBand: 110, lowerBand: 90, pricePosition: 'Inside Bands', squeeze: false };
+      },
+    },
     regimeDecisionEngine: {
-      evaluate: () => mode === 'regime'
-        ? { allowTrade: false, reason: 'Wrong regime' }
-        : { allowTrade: true, preferredDirection: 'BUY', penalty: 0, reason: 'Allowed' },
+      evaluate: () => {
+        dependencyCalls.push('regimeDecision');
+        return mode === 'regime'
+          ? { allowTrade: false, reason: 'Wrong regime' }
+          : { allowTrade: true, preferredDirection: 'BUY', penalty: 0, reason: 'Allowed' };
+      },
     },
     mtfConfirmationEngine: {
-      evaluate: () => mode === 'mtf'
-        ? { mtfAllowed: false, rejectionReason: '1h disagrees', confidence: 20, alignmentScore: 25 }
-        : { mtfAllowed: true, rejectionReason: null, confidence: 80, alignmentScore: 100 },
+      evaluate: () => {
+        dependencyCalls.push('mtfConfirmation');
+        return mode === 'mtf'
+          ? { mtfAllowed: false, rejectionReason: '1h disagrees', confidence: 20, alignmentScore: 25 }
+          : { mtfAllowed: true, rejectionReason: null, confidence: 80, alignmentScore: 100 };
+      },
     },
     advanceRiskEngine: {
-      evaluate: () => mode === 'risk'
-        ? { tradeAllowed: false, rejectionReason: 'Daily limit reached' }
-        : { tradeAllowed: true, positionSize: 25, stopLoss: 96, takeProfit: 106, riskReward: 2.5, session: 'ASIAN' },
-      onTradeClosed: pnl => riskClosures.push(pnl),
+      evaluate: () => {
+        dependencyCalls.push('advanceRisk');
+        return mode === 'risk'
+          ? { tradeAllowed: false, rejectionReason: 'Daily limit reached' }
+          : { tradeAllowed: true, positionSize: 25, stopLoss: 96, takeProfit: 106, riskReward: 2.5, session: 'ASIAN' };
+      },
+      onTradeClosed: pnl => {
+        dependencyCalls.push('advanceRiskClosure');
+        riskClosures.push(pnl);
+      },
     },
-    mtfEngine: { calculate: () => ({ overallBias: 'Bullish' }) },
+    mtfEngine: {
+      calculate: () => {
+        dependencyCalls.push('mtf');
+        return { overallBias: 'Bullish' };
+      },
+    },
     paperTradeEngine,
-    clock: { now: () => now, isoNow: () => FIXED_ISO, localeTime: () => '00:00:00' },
+    clock,
   });
 
   const onCandle = paperTradeEngine.onCandle.bind(paperTradeEngine);
@@ -128,15 +201,26 @@ function makeHarness(mode, activeCandle, now = 60000) {
     return evaluateTrades(price);
   };
 
-  return { paperTradeEngine, pipeline, riskClosures, candleCalls, evaluateCalls };
+  return {
+    paperTradeEngine,
+    pipeline,
+    riskClosures,
+    candleCalls,
+    evaluateCalls,
+    finalizedInputs,
+    dependencyCalls,
+    clockCalls,
+  };
 }
 
-function run(pipeline, price) {
+function run(pipeline, price, options) {
   if (arguments.length < 2) price = 100;
   const originalLog = console.log;
   console.log = () => {};
   try {
-    pipeline.run({ symbol: 'BTCUSDT', price, timestamp: FIXED_ISO });
+    const snapshot = { symbol: 'BTCUSDT', price, timestamp: FIXED_ISO };
+    if (options === undefined) pipeline.run(snapshot);
+    else pipeline.run(snapshot, options);
   } finally {
     console.log = originalLog;
   }
@@ -217,6 +301,165 @@ test('current-price closure is not duplicated by candle processing', () => {
   assert.equal(harness.paperTradeEngine.open().length, 0);
   assert.equal(harness.paperTradeEngine.closed().length, 1);
   assert.deepEqual(harness.riskClosures, [150]);
+});
+
+test('missing options preserves the active-candle lifecycle fallback', () => {
+  const activeCandle = makeActiveCandle({ high: 106, low: 99 });
+  const harness = makeHarness('neutral', activeCandle);
+  openTrade(harness.paperTradeEngine);
+
+  run(harness.pipeline);
+
+  assert.equal(harness.candleCalls.length, 1);
+  assert.strictEqual(harness.candleCalls[0], activeCandle);
+});
+
+test('an options object without lifecycleCandle preserves the active-candle fallback', () => {
+  const activeCandle = makeActiveCandle({ high: 106, low: 99 });
+  const harness = makeHarness('neutral', activeCandle);
+  openTrade(harness.paperTradeEngine);
+
+  run(harness.pipeline, 100, {});
+
+  assert.deepEqual(harness.candleCalls, [activeCandle]);
+});
+
+test('explicit completed lifecycle candle replaces the active-candle fallback exactly once', () => {
+  const activeCandle = makeActiveCandle({ high: 101, low: 99 });
+  const completedCandle = makeActiveCandle({ openTime: 21 * 3600000, high: 105, low: 95 });
+  const harness = makeHarness('neutral', activeCandle);
+
+  run(harness.pipeline, 100, { lifecycleCandle: completedCandle });
+
+  assert.deepEqual(harness.candleCalls, [completedCandle]);
+  assert.notStrictEqual(harness.candleCalls[0], activeCandle);
+});
+
+test('completed lifecycle extremes close an existing trade once without current-price or active-candle hits', () => {
+  const activeCandle = makeActiveCandle({ high: 101, low: 99 });
+  const completedCandle = makeActiveCandle({ openTime: 21 * 3600000, high: 106, low: 99, close: 100 });
+  const harness = makeHarness('neutral', activeCandle);
+  openTrade(harness.paperTradeEngine);
+
+  const decision = run(harness.pipeline, 100, { lifecycleCandle: completedCandle });
+
+  assert.equal(decision.verdict.rejectionReason, 'Confluence bias: Score 50 is between thresholds (35-65)');
+  assert.deepEqual(harness.evaluateCalls, [100]);
+  assert.deepEqual(harness.candleCalls, [completedCandle]);
+  assert.equal(harness.paperTradeEngine.open().length, 0);
+  assert.equal(harness.paperTradeEngine.closed().length, 1);
+  assert.equal(harness.paperTradeEngine.closed()[0].exitReason, 'Take Profit');
+  assert.deepEqual(harness.riskClosures, [150]);
+});
+
+test('explicit lifecycle processing precedes signal and cannot close a newly opened trade', () => {
+  const activeCandle = makeActiveCandle({ high: 101, low: 99 });
+  const completedCandle = makeActiveCandle({ openTime: 21 * 3600000, high: 112, low: 95 });
+  const harness = makeHarness('allowed', activeCandle);
+  const order = [];
+  const onCandle = harness.paperTradeEngine.onCandle.bind(harness.paperTradeEngine);
+  const signal = harness.paperTradeEngine.signal.bind(harness.paperTradeEngine);
+  harness.paperTradeEngine.onCandle = candle => {
+    order.push('onCandle');
+    return onCandle(candle);
+  };
+  harness.paperTradeEngine.signal = (...args) => {
+    order.push('signal');
+    return signal(...args);
+  };
+
+  const decision = run(harness.pipeline, 100, { lifecycleCandle: completedCandle });
+
+  assert.equal(decision.verdict.tradeOpened, true);
+  assert.ok(order.indexOf('onCandle') < order.indexOf('signal'));
+  assert.equal(harness.paperTradeEngine.closed().length, 0);
+  assert.equal(harness.paperTradeEngine.open().length, 1);
+  assert.equal(harness.paperTradeEngine.open()[0].status, 'OPEN');
+});
+
+test('explicit lifecycle context does not alter finalized indicator inputs', () => {
+  const activeCandle = makeActiveCandle({ high: 101, low: 99 });
+  const completedCandle = makeActiveCandle({ openTime: 21 * 3600000, high: 200, low: 99, close: 200 });
+  const harness = makeHarness('neutral', activeCandle);
+
+  run(harness.pipeline, 100, { lifecycleCandle: completedCandle });
+
+  assert.ok(harness.finalizedInputs.length > 0);
+  for (const candles of harness.finalizedInputs) {
+    assert.equal(candles.some(candle => candle === completedCandle), false);
+    assert.equal(candles.some(candle => candle.openTime === completedCandle.openTime), false);
+  }
+});
+
+test('price-based closure remains unchanged with explicit lifecycle context', () => {
+  const activeCandle = makeActiveCandle({ high: 101, low: 99 });
+  const completedCandle = makeActiveCandle({ openTime: 21 * 3600000, high: 101, low: 99 });
+  const harness = makeHarness('neutral', activeCandle);
+  openTrade(harness.paperTradeEngine);
+
+  run(harness.pipeline, 106, { lifecycleCandle: completedCandle });
+
+  assert.deepEqual(harness.evaluateCalls, [106]);
+  assert.deepEqual(harness.candleCalls, [completedCandle]);
+  assert.equal(harness.paperTradeEngine.closed().length, 1);
+  assert.deepEqual(harness.riskClosures, [150]);
+});
+
+test('invalid lifecycle options are side-effect free and reject deterministically', () => {
+  const invalidCases = [
+    [{ unknown: true }, 'unknown option'],
+    [{ lifecycleCandle: [] }, 'valid candle object'],
+    [{ lifecycleCandle: { high: 106, low: 99 } }, 'valid candle object'],
+    [{ lifecycleCandle: null }, 'valid candle object'],
+    [{ lifecycleCandle: undefined }, 'valid candle object'],
+  ];
+
+  for (const [options, message] of invalidCases) {
+    const harness = makeHarness('neutral', makeActiveCandle());
+    const beforeDecision = harness.pipeline.getLastDecision();
+    const beforeHealth = harness.pipeline.getPipelineHealth();
+
+    assert.throws(() => run(harness.pipeline, 100, options), new RegExp(message));
+    assert.strictEqual(harness.pipeline.getLastDecision(), beforeDecision);
+    assert.deepEqual(harness.pipeline.getPipelineHealth(), beforeHealth);
+    assert.deepEqual(harness.clockCalls, { now: 0, monotonic: 0 });
+    assert.deepEqual(harness.evaluateCalls, []);
+    assert.deepEqual(harness.candleCalls, []);
+    assert.deepEqual(harness.dependencyCalls, []);
+  }
+
+  const harness = makeHarness('neutral', makeActiveCandle());
+  const beforeHealth = harness.pipeline.getPipelineHealth();
+  assert.throws(() => run(harness.pipeline, 100, []), /non-array object/);
+  assert.deepEqual(harness.pipeline.getPipelineHealth(), beforeHealth);
+  assert.deepEqual(harness.clockCalls, { now: 0, monotonic: 0 });
+  assert.deepEqual(harness.evaluateCalls, []);
+  assert.deepEqual(harness.candleCalls, []);
+  assert.deepEqual(harness.dependencyCalls, []);
+});
+
+test('a valid call after malformed options behaves as the first accepted cycle', () => {
+  const harness = makeHarness('neutral', makeActiveCandle());
+  const freshHarness = makeHarness('neutral', makeActiveCandle());
+
+  assert.throws(() => run(harness.pipeline, 100, { invalid: true }), /unknown option/);
+  const decision = run(harness.pipeline);
+  const freshDecision = run(freshHarness.pipeline);
+
+  assert.equal(decision.cycle, 1);
+  assert.equal(decision.timestamp, freshDecision.timestamp);
+  assert.equal(decision.verdict.rejectionReason, freshDecision.verdict.rejectionReason);
+  assert.equal(harness.clockCalls.now, 1);
+  assert.equal(harness.clockCalls.monotonic, 0);
+});
+
+test('explicit lifecycle context preserves pipeline decision timestamp behavior', () => {
+  const completedCandle = makeActiveCandle({ openTime: 21 * 3600000 });
+  const harness = makeHarness('neutral', makeActiveCandle());
+
+  const decision = run(harness.pipeline, 100, { lifecycleCandle: completedCandle });
+
+  assert.equal(decision.timestamp, new Date(60000).toISOString());
 });
 
 test('candle touching neither level leaves the existing trade active', () => {
