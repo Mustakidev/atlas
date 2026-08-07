@@ -11,6 +11,33 @@ function isValidCandle(candle) {
     && candle.close <= candle.high;
 }
 
+function isValidExplicitLifecycleCandle(candle) {
+  return Boolean(candle)
+    && typeof candle === 'object'
+    && !Array.isArray(candle)
+    && isValidCandle(candle);
+}
+
+function validateRunOptions(options) {
+  if (options === undefined) return undefined;
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    throw new TypeError('executionPipeline.run() options must be a non-array object');
+  }
+
+  for (const key of Reflect.ownKeys(options)) {
+    if (key !== 'lifecycleCandle') {
+      throw new TypeError(`executionPipeline.run() received unknown option: ${String(key)}`);
+    }
+  }
+
+  if (Object.hasOwn(options, 'lifecycleCandle')
+    && !isValidExplicitLifecycleCandle(options.lifecycleCandle)) {
+    throw new TypeError('executionPipeline.run() lifecycleCandle must be a valid candle object');
+  }
+
+  return options;
+}
+
 function createExecutionPipeline({
   config,
   logger,
@@ -71,7 +98,8 @@ function createExecutionPipeline({
     }
   }
 
-  function run(snapshot) {
+  function run(snapshot, options) {
+    const validatedOptions = validateRunOptions(options);
     pipelineCycleCount++;
     const cycle = captureCycleTime(time);
     const tf = '1h';
@@ -111,7 +139,10 @@ function createExecutionPipeline({
     }
 
     const activeCandle = candleEngine.getActive(tf);
-    processTradeLifecycle(price, activeCandle, cycle);
+    const lifecycleCandle = validatedOptions && Object.hasOwn(validatedOptions, 'lifecycleCandle')
+      ? validatedOptions.lifecycleCandle
+      : activeCandle;
+    processTradeLifecycle(price, lifecycleCandle, cycle);
 
     const finalized = getFinalizedCandles(candleEngine, tf, 500);
 
