@@ -164,21 +164,86 @@ test('EventBus delivers events, supports duplicate listeners, and removes listen
   assert.equal(received.length, 2);
 });
 
+test('EventBus invokes zero-payload listeners without synthesizing an argument', () => {
+  const bus = new EventBus();
+  let received;
+
+  bus.on('event', (...args) => { received = args; });
+  bus.emit('event');
+
+  assert.deepEqual(received, []);
+});
+
+test('EventBus preserves one-payload compatibility and identity', () => {
+  const bus = new EventBus();
+  const payload = {};
+  let received;
+
+  bus.on('event', (...args) => { received = args; });
+  bus.emit('event', payload);
+
+  assert.equal(received.length, 1);
+  assert.strictEqual(received[0], payload);
+});
+
+test('EventBus forwards multiple payloads in order without transforming them', () => {
+  const bus = new EventBus();
+  const first = {};
+  const second = {};
+  const third = 123;
+  let received;
+
+  bus.on('event', (...args) => { received = args; });
+  bus.emit('event', first, second, third);
+
+  assert.equal(received.length, 3);
+  assert.strictEqual(received[0], first);
+  assert.strictEqual(received[1], second);
+  assert.strictEqual(received[2], third);
+});
+
+test('EventBus preserves listener order and gives every listener the same arguments', () => {
+  const bus = new EventBus();
+  const first = {};
+  const second = {};
+  const calls = [];
+
+  bus.on('event', (...args) => { calls.push(['A', args]); });
+  bus.on('event', (...args) => { calls.push(['B', args]); });
+  bus.on('event', (...args) => { calls.push(['C', args]); });
+  bus.emit('event', first, second);
+
+  assert.deepEqual(calls.map(([name]) => name), ['A', 'B', 'C']);
+  for (const [, args] of calls) {
+    assert.equal(args.length, 2);
+    assert.strictEqual(args[0], first);
+    assert.strictEqual(args[1], second);
+  }
+});
+
 test('EventBus isolates listener failures and continues delivery', () => {
   const bus = new EventBus();
-  const received = [];
+  const calls = [];
+  const errors = [];
   const originalError = console.error;
-  console.error = () => {};
+  console.error = (...args) => { errors.push(args); };
 
   try {
-    bus.on('market', () => { throw new Error('listener failure'); });
-    bus.on('market', data => received.push(data.price));
-    bus.emit('market', { price: 123 });
+    bus.on('market', () => { calls.push('first'); });
+    bus.on('market', () => {
+      throw new Error('listener failure');
+    });
+    bus.on('market', () => { calls.push('third'); });
+
+    assert.doesNotThrow(() => bus.emit('market', { price: 123 }));
   } finally {
     console.error = originalError;
   }
 
-  assert.deepEqual(received, [123]);
+  assert.deepEqual(calls, ['first', 'third']);
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0][0], 'EventBus: listener error on "market":');
+  assert.equal(errors[0][1], 'listener failure');
 });
 
 test('CandleEngine aggregates active candles and exposes timeframe boundaries', () => {
