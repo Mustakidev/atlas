@@ -31,6 +31,9 @@ class CandleEngine {
     const ts = new Date(snapshot.timestamp).getTime();
     const price = snapshot.price;
     const volume = snapshot.volume || 0;
+    const finalized = Object.fromEntries(
+      Object.keys(TIMEFRAMES).map(tf => [tf, null]),
+    );
 
     for (const [tf, durationSec] of Object.entries(TIMEFRAMES)) {
       const durationMs = durationSec * 1000;
@@ -41,11 +44,15 @@ class CandleEngine {
         this._updateCandle(bucket.active, price, volume);
       } else {
         if (bucket.active) {
+          const finalizedCandle = bucket.active;
           this._finalizeCandle(bucket);
+          finalized[tf] = finalizedCandle;
         }
         bucket.active = this._newCandle(bucketStart, price, volume);
       }
     }
+
+    return Object.freeze({ finalized: Object.freeze(finalized) });
   }
 
   ingestHistoricalCandle(timeframe, candle) {
