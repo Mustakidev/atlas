@@ -1,6 +1,8 @@
 const { assertTimestamp } = require('../core/clock');
 const { createExecutionPipeline } = require('../core/executionPipeline');
 
+const PRIMARY_CANDLE_DURATION_MS = 3_600_000;
+
 const REQUIRED_DEPENDENCY_METHODS = Object.freeze({
   candleEngine: ['hasNext', 'nextActive', 'getActive', 'getCandles', 'finalizeActive'],
   clockController: ['advanceTo'],
@@ -156,7 +158,13 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
     let activeCandle = null;
 
     try {
-      dependencies.clockController.advanceTo(expectedCandle.openTime);
+      const closeTime = assertTimestamp(
+        expectedCandle.openTime + PRIMARY_CANDLE_DURATION_MS,
+        `normalizedInput.candles[${index}].closeTime`,
+      );
+      const closeTimestamp = new Date(closeTime).toISOString();
+
+      dependencies.clockController.advanceTo(closeTime);
       activeCandle = dependencies.candleEngine.nextActive();
 
       if (activeCandle !== expectedCandle || activeCandle.openTime !== expectedCandle.openTime) {
@@ -165,7 +173,7 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
 
       executionPipeline.run({
         price: expectedCandle.close,
-        timestamp: expectedCandle.timestamp,
+        timestamp: closeTimestamp,
       });
 
       const decision = executionPipeline.getLastDecision();
@@ -175,7 +183,7 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
       const result = cloneAndFreeze({
         index,
         openTime: expectedCandle.openTime,
-        timestamp: expectedCandle.timestamp,
+        timestamp: closeTimestamp,
         price: expectedCandle.close,
         decision: frozenDecision,
       });
