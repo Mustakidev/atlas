@@ -1,13 +1,28 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { createReplayPipelineRunner } = require('../../src/engine/replayPipelineRunner');
 const { createReplayDependencies } = require('../../src/engine/replayDependencies');
 const { CandleEngine } = require('../../src/engine/candles');
 const { normalizeReplayInput } = require('../../src/engine/replayInput');
+const executionPipelineModule = require('../../src/core/executionPipeline');
+
+const pipelineSnapshots = [];
+const originalCreateExecutionPipeline = executionPipelineModule.createExecutionPipeline;
+executionPipelineModule.createExecutionPipeline = dependencies => {
+  const pipeline = originalCreateExecutionPipeline(dependencies);
+  const originalRun = pipeline.run.bind(pipeline);
+  pipeline.run = snapshot => {
+    pipelineSnapshots.push(snapshot);
+    return originalRun(snapshot);
+  };
+  return pipeline;
+};
+const { createReplayPipelineRunner } = require('../../src/engine/replayPipelineRunner');
+executionPipelineModule.createExecutionPipeline = originalCreateExecutionPipeline;
 
 const BASE_TIME = Date.parse('2024-01-01T00:00:00.000Z');
 const HOUR = 60 * 60 * 1000;
+const MAX_DATE_MS = 8640000000000000;
 const logger = { info() {}, warn() {}, error() {}, system() {} };
 const config = {
   get(key) {
@@ -17,7 +32,7 @@ const config = {
   },
 };
 
-function rawCandles(count = 51, mutate) {
+function rawCandles(count = 51, mutate, startTime = BASE_TIME) {
   return Array.from({ length: count }, (_, index) => {
     const close = 100 + index;
     const candle = {
@@ -26,18 +41,18 @@ function rawCandles(count = 51, mutate) {
       low: close - 1,
       close,
       volume: 1,
-      openTime: BASE_TIME + index * HOUR,
-      timestamp: new Date(BASE_TIME + index * HOUR).toISOString(),
+      openTime: startTime + index * HOUR,
+      timestamp: new Date(startTime + index * HOUR).toISOString(),
     };
     mutate?.(candle, index);
     return candle;
   });
 }
 
-function normalizedInput(count = 51, timeframe = '1h', mutate) {
-  if (count >= 51) return normalizeReplayInput(rawCandles(count, mutate), timeframe);
+function normalizedInput(count = 51, timeframe = '1h', mutate, startTime = BASE_TIME) {
+  if (count >= 51) return normalizeReplayInput(rawCandles(count, mutate, startTime), timeframe);
 
-  const candles = rawCandles(count, mutate).map(candle => Object.freeze(candle));
+  const candles = rawCandles(count, mutate, startTime).map(candle => Object.freeze(candle));
   return Object.freeze({
     schemaVersion: 1,
     timeframe,
@@ -77,7 +92,7 @@ function runQuietly(runner) {
   }
 }
 
-function prepareEligibleBundle(bundle, { allowMtf = false } = {}) {
+function prepareEligibleBundle(bundle, { allowMtf = false, useActualRisk = false } = {}) {
   bundle.analyzer.getAnalysis = () => ({ trend: { '1H': 'Bullish' } });
   bundle.regimeEngine.calculate = () => ({
     regime: 'TRENDING_BULL',
@@ -141,14 +156,16 @@ function prepareEligibleBundle(bundle, { allowMtf = false } = {}) {
       confidence: 80,
       alignmentScore: 100,
     });
-    bundle.advanceRiskEngine.evaluate = ({ entryPrice }) => ({
-      tradeAllowed: true,
-      positionSize: 1,
-      stopLoss: entryPrice - 5,
-      takeProfit: entryPrice + 5,
-      riskReward: 1,
-      session: 'ASIAN',
-    });
+    if (!useActualRisk) {
+      bundle.advanceRiskEngine.evaluate = ({ entryPrice }) => ({
+        tradeAllowed: true,
+        positionSize: 1,
+        stopLoss: entryPrice - 5,
+        takeProfit: entryPrice + 5,
+        riskReward: 1,
+        session: 'ASIAN',
+      });
+    }
   }
 
 }
@@ -203,13 +220,57 @@ test('initial state is READY, frozen, and defensively snapshotted', () => {
   assert.equal(runner.hasNext(), true);
 });
 
-test('first cycle advances the historical clock to candle.openTime', () => {
+test('first cycle advances the historical clock to the candle close boundary', () => {
   const input = normalizedInput();
   const { bundle, runner } = makeRunner(input);
 
-  runQuietly(runner);
+  const result = runQuietly(runner);
+  const closeTime = input.candles[0].openTime + HOUR;
+  const closeTimestamp = new Date(closeTime).toISOString();
 
-  assert.equal(bundle.clock.nowMs(), input.candles[0].openTime);
+  assert.equal(bundle.clock.nowMs(), closeTime);
+  assert.equal(result.timestamp, closeTimestamp);
+  assert.equal(result.decision.timestamp, closeTimestamp);
+  assert.equal(pipelineSnapshots[pipelineSnapshots.length - 1].timestamp, closeTimestamp);
+});
+
+test('consecutive replay cycles advance exactly one hour at close boundaries', () => {
+  const input = normalizedInput(2);
+  const { bundle, runner } = makeRunner(input);
+
+  runQuietly(runner);
+  const firstCloseTime = bundle.clock.nowMs();
+  runQuietly(runner);
+  const secondCloseTime = bundle.clock.nowMs();
+
+  assert.equal(firstCloseTime, input.candles[0].openTime + HOUR);
+  assert.equal(secondCloseTime, input.candles[1].openTime + HOUR);
+  assert.equal(secondCloseTime - firstCloseTime, HOUR);
+});
+
+test('23:00 UTC candle executes at the new UTC day close boundary', () => {
+  const startTime = Date.parse('2024-01-01T08:00:00.000Z');
+  const input = normalizedInput(51, '1h', undefined, startTime);
+  const bundle = makeBundle(input);
+  prepareEligibleBundle(bundle, { allowMtf: true, useActualRisk: true });
+  const { runner } = makeRunner(input, bundle);
+
+  warmupToEligibleCycle(runner);
+  const result = runQuietly(runner);
+  const closeTimestamp = '2024-01-02T00:00:00.000Z';
+
+  assert.equal(result.timestamp, closeTimestamp);
+  assert.equal(result.decision.timestamp, closeTimestamp);
+  assert.equal(result.decision.risk.timestamp, closeTimestamp);
+  assert.equal(result.decision.risk.session, 'ASIAN');
+});
+
+test('schemaVersion 1 candles retain open-time identity without closeTime', () => {
+  const input = normalizedInput();
+
+  assert.equal(input.schemaVersion, 1);
+  assert.equal(Object.hasOwn(input.candles[0], 'closeTime'), false);
+  assert.equal(input.candles[0].timestamp, new Date(input.candles[0].openTime).toISOString());
 });
 
 test('active candle is visible and finalized history excludes it during execution', () => {
@@ -236,6 +297,7 @@ test('active candle is visible and finalized history excludes it during executio
     && observation.active === input.candles[0]));
   assert.ok(observations.some(observation => observation.type === 'finalized'
     && observation.candles.length === 0));
+  assert.equal(bundle.candleEngine.getActive('1h'), null);
 });
 
 test('successful cycle finalizes exactly one candle and leaves no active candle', () => {
@@ -334,6 +396,9 @@ test('a candle closure advances AdvanceRisk exactly once', () => {
   runQuietly(runner);
 
   assert.equal(closures.length, 1);
+  assert.equal(closures[0].context.nowMs, input.candles[0].openTime + HOUR);
+  assert.equal(bundle.paperTradeEngine.closed()[0].exitTime,
+    new Date(input.candles[0].openTime + HOUR).toISOString());
   assert.equal(bundle.paperTradeEngine.closed().length, 1);
 });
 
@@ -423,6 +488,39 @@ test('non-1h normalized input rejects', () => {
   );
 });
 
+test('close-boundary overflow fails before activation and preserves READY state', () => {
+  const input = Object.freeze({
+    schemaVersion: 1,
+    timeframe: '1h',
+    candles: Object.freeze([Object.freeze({
+      openTime: MAX_DATE_MS,
+      timestamp: new Date(MAX_DATE_MS).toISOString(),
+      open: 100,
+      high: 101,
+      low: 99,
+      close: 100,
+      volume: 1,
+    })]),
+  });
+  const bundle = makeBundle(input);
+  const { runner } = makeRunner(input, bundle);
+
+  assert.throws(
+    () => runQuietly(runner),
+    error => error instanceof TypeError && /closeTime/.test(error.message),
+  );
+  assert.equal(runner.hasNext(), true);
+  assert.deepEqual(runner.getState(), {
+    status: 'READY',
+    cycleCount: 0,
+    nextIndex: 0,
+    lastResult: null,
+    failure: null,
+  });
+  assert.equal(bundle.clock.nowMs(), MAX_DATE_MS);
+  assert.equal(bundle.candleEngine.getActive('1h'), null);
+});
+
 test('empty normalized input rejects', () => {
   const bundle = makeBundle();
   const input = Object.freeze({ schemaVersion: 1, timeframe: '1h', candles: Object.freeze([]) });
@@ -453,7 +551,7 @@ test('candle engine and normalized input timeframe mismatch rejects', () => {
 test('backward clock movement before activation propagates without FAILED state', () => {
   const input = normalizedInput();
   const bundle = makeBundle(input);
-  bundle.clockController.advanceTo(input.candles[1].openTime);
+  bundle.clockController.advanceTo(input.candles[0].openTime + HOUR + 1);
   const { runner } = makeRunner(input, bundle);
 
   assert.throws(() => runQuietly(runner), /historical clock cannot move backwards/);
@@ -483,6 +581,7 @@ test('escaped pipeline error after activation leaves candle active and runner FA
   assert.equal(state.nextIndex, 0);
   assert.equal(state.failure.code, 'CYCLE_FAILED');
   assert.equal(state.failure.index, 0);
+  assert.equal(state.failure.openTime, input.candles[0].openTime);
   assert.equal(bundle.candleEngine.getActive('1h'), input.candles[0]);
   assert.equal(runner.hasNext(), false);
 });
@@ -567,6 +666,7 @@ test('finalization failure preserves counters and reports actual candle state', 
   assert.equal(state.lastResult, null);
   assert.equal(state.failure.code, 'CYCLE_FAILED');
   assert.equal(state.failure.message, finalizationError.message);
+  assert.equal(state.failure.openTime, input.candles[0].openTime);
   assert.equal(bundle.candleEngine.getActive('1h'), null);
   assert.equal(bundle.candleEngine.getCandles('1h').length, 1);
 });
@@ -621,6 +721,8 @@ test('final successful cycle sets EXHAUSTED and retains its result', () => {
   assert.equal(state.nextIndex, 1);
   assert.equal(runner.hasNext(), false);
   assert.deepEqual(state.lastResult, result);
+  assert.equal(result.openTime, input.candles[0].openTime);
+  assert.equal(result.timestamp, new Date(input.candles[0].openTime + HOUR).toISOString());
   assert.equal(bundle.candleEngine.getCandles('1h').length, 1);
 });
 
