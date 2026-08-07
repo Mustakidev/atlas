@@ -29,6 +29,7 @@ const { createValidationDependencies } = require('./src/engine/validationDepende
 const { createApp } = require('./src/app');
 const { createExecutionPipeline } = require('./src/core/executionPipeline');
 const { createSystemClock } = require('./src/core/clock');
+const { registerLiveSnapshotHandler } = require('./src/core/liveSnapshot');
 
 const fetch = require('node-fetch');
 
@@ -136,10 +137,12 @@ const app = createApp({
   getPipelineHealth: executionPipeline.getPipelineHealth,
 });
 
-eventBus.on('market:snapshot', (snapshot) => {
-  analyzer.analyze(history);
-  signalHistoryEngine.record();
-  executionPipeline.run(snapshot);
+registerLiveSnapshotHandler({
+  eventBus,
+  history,
+  analyzer,
+  signalHistoryEngine,
+  executionPipeline,
 });
 
 let fetchInProgress = false;
@@ -220,16 +223,16 @@ async function fetchCycle() {
   try {
     const snapshot = await apiManager.fetchMarketData();
     history.add(snapshot);
-    candleEngine.ingest(snapshot);
-    eventBus.emit('market:snapshot', snapshot);
+    const transition = candleEngine.ingest(snapshot);
+    eventBus.emit('market:snapshot', snapshot, transition);
   } catch (err) {
     apiManager.fail();
     const fallback = cache.get();
     if (fallback) {
       const freshFallback = { ...fallback, timestamp: new Date().toISOString() };
       history.add(freshFallback);
-      candleEngine.ingest(freshFallback);
-      eventBus.emit('market:snapshot', freshFallback);
+      const transition = candleEngine.ingest(freshFallback);
+      eventBus.emit('market:snapshot', freshFallback, transition);
       logger.warn('Server', 'Using cached data after failure', {
         error: err.message,
       });
