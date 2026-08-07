@@ -9,6 +9,7 @@ const { HistoryEngine } = require('../../src/engine/history');
 const { RetryHandler } = require('../../src/network/retry');
 
 const BASE_TIME = Date.UTC(2024, 0, 1, 0, 0, 0);
+const HOUR = 3600000;
 
 function config(values = {}) {
   return { get(key) { return values[key]; } };
@@ -214,6 +215,129 @@ test('CandleEngine finalizes candles, freezes them, and enforces retention limit
   assert.deepEqual(candles.getCandles('1m').map(candle => candle.close), [110, 120]);
   assert.equal(candles.getCandles('unknown').length, 0);
   assert.equal(candles.getActive('unknown'), null);
+});
+
+test('CandleEngine ingest returns frozen null transition metadata on first ingest', () => {
+  const candles = new CandleEngine(config({ MAX_HISTORY: 2 }), logger(), 'BTCUSDT');
+
+  const transition = candles.ingest(snapshot());
+
+  assert.ok(Object.isFrozen(transition));
+  assert.ok(Object.isFrozen(transition.finalized));
+  assert.deepEqual(Object.keys(transition.finalized), candles.getAllTimeframes());
+  for (const tf of candles.getAllTimeframes()) {
+    assert.equal(transition.finalized[tf], null);
+  }
+  assert.deepEqual(getFinalizedCandles(candles, '1h'), []);
+  assert.ok(!Object.values(transition.finalized).some(Array.isArray));
+  assert.throws(() => Object.defineProperty(transition, 'extra', { value: true }), TypeError);
+  assert.throws(() => Object.defineProperty(transition.finalized, 'extra', { value: true }), TypeError);
+});
+
+test('CandleEngine same-bucket ingest preserves state and reports no finalization', () => {
+  const candles = new CandleEngine(config({ MAX_HISTORY: 2 }), logger(), 'BTCUSDT');
+
+  candles.ingest(snapshot({ price: 100, volume: 10 }));
+  const transition = candles.ingest(snapshot({
+    price: 105,
+    volume: 4,
+    timestamp: new Date(BASE_TIME + 30 * 1000).toISOString(),
+  }));
+
+  for (const tf of candles.getAllTimeframes()) {
+    assert.equal(transition.finalized[tf], null);
+  }
+  assert.deepEqual(candles.getActive('1m'), {
+    open: 100,
+    high: 105,
+    low: 100,
+    close: 105,
+    volume: 14,
+    openTime: BASE_TIME,
+    timestamp: new Date(BASE_TIME).toISOString(),
+  });
+  assert.deepEqual(getFinalizedCandles(candles, '1h'), []);
+});
+
+test('CandleEngine exact boundary returns the stored frozen finalized candle', () => {
+  const candles = new CandleEngine(config({ MAX_HISTORY: 2 }), logger(), 'BTCUSDT');
+
+  candles.ingest(snapshot({ price: 100, volume: 10 }));
+  const previousActive = candles.getActive('1h');
+  const transition = candles.ingest(snapshot({
+    price: 110,
+    volume: 4,
+    timestamp: new Date(BASE_TIME + HOUR).toISOString(),
+  }));
+  const finalizedHistory = candles.getCandles('1h');
+  const active = candles.getActive('1h');
+
+  assert.strictEqual(transition.finalized['1h'], previousActive);
+  assert.strictEqual(transition.finalized['1h'], finalizedHistory[0]);
+  assert.ok(Object.isFrozen(transition.finalized['1h']));
+  assert.notStrictEqual(active, transition.finalized['1h']);
+  assert.equal(active.openTime, BASE_TIME + HOUR);
+  assert.deepEqual(getFinalizedCandles(candles, '1h'), [previousActive]);
+  assert.throws(() => Object.defineProperty(transition.finalized['1h'], 'close', { value: 999 }), TypeError);
+  assert.equal(transition.finalized['1h'].close, 100);
+});
+
+test('CandleEngine skipped buckets finalize only the actual prior active candle', () => {
+  const candles = new CandleEngine(config({ MAX_HISTORY: 5 }), logger(), 'BTCUSDT');
+
+  candles.ingest(snapshot({ price: 100, timestamp: new Date(BASE_TIME + 10 * HOUR).toISOString() }));
+  const previousActive = candles.getActive('1h');
+  const transition = candles.ingest(snapshot({
+    price: 130,
+    timestamp: new Date(BASE_TIME + 13 * HOUR + 5 * 60 * 1000).toISOString(),
+  }));
+  const finalized = getFinalizedCandles(candles, '1h');
+
+  assert.strictEqual(transition.finalized['1h'], previousActive);
+  assert.deepEqual(finalized, [previousActive]);
+  assert.equal(candles.getActive('1h').openTime, BASE_TIME + 13 * HOUR);
+  assert.deepEqual(finalized.map(candle => candle.openTime), [BASE_TIME + 10 * HOUR]);
+});
+
+test('CandleEngine reports independent transitions for all finalized timeframes', () => {
+  const candles = new CandleEngine(config({ MAX_HISTORY: 2 }), logger(), 'BTCUSDT');
+  const finalizedTimeframes = ['1m', '5m', '15m', '30m', '1h'];
+  const nonFinalizedTimeframes = ['4h', '12h', '24h'];
+
+  candles.ingest(snapshot());
+  const transition = candles.ingest(snapshot({
+    price: 110,
+    timestamp: new Date(BASE_TIME + HOUR).toISOString(),
+  }));
+
+  for (const tf of finalizedTimeframes) {
+    assert.ok(transition.finalized[tf]);
+    assert.ok(Object.isFrozen(transition.finalized[tf]));
+  }
+  for (const tf of nonFinalizedTimeframes) {
+    assert.equal(transition.finalized[tf], null);
+  }
+  assert.deepEqual(Object.keys(transition.finalized), candles.getAllTimeframes());
+});
+
+test('CandleEngine state is unchanged when callers ignore ingest transition metadata', () => {
+  const withReturn = new CandleEngine(config({ MAX_HISTORY: 2 }), logger(), 'BTCUSDT');
+  const withoutReturn = new CandleEngine(config({ MAX_HISTORY: 2 }), logger(), 'BTCUSDT');
+  const snapshots = [
+    snapshot(),
+    snapshot({ price: 105, volume: 4, timestamp: new Date(BASE_TIME + 30 * 1000).toISOString() }),
+    snapshot({ price: 110, volume: 2, timestamp: new Date(BASE_TIME + HOUR).toISOString() }),
+  ];
+
+  for (const current of snapshots) {
+    withReturn.ingest(current);
+    withoutReturn.ingest(current);
+  }
+
+  assert.deepEqual(withReturn.getCandles('1h'), withoutReturn.getCandles('1h'));
+  assert.deepEqual(withReturn.getActive('1h'), withoutReturn.getActive('1h'));
+  assert.deepEqual(withReturn.getCandles('1m'), withoutReturn.getCandles('1m'));
+  assert.deepEqual(withReturn.getActive('1m'), withoutReturn.getActive('1m'));
 });
 
 test('getFinalizedCandles excludes the active candle and handles empty or unrelated data', () => {
