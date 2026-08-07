@@ -120,6 +120,10 @@ test('production server wires config into route dependencies', async () => {
   const executionPipelineEntry = path.join(BACKEND, 'src/core/executionPipeline.js');
   const paperTradingEntry = path.join(BACKEND, 'src/engine/paperTrading.js');
   const advanceRiskEntry = path.join(BACKEND, 'src/engine/advanceRisk.js');
+  const eventBusEntry = path.join(BACKEND, 'src/core/eventBus.js');
+  const apiManagerEntry = path.join(BACKEND, 'src/network/apiManager.js');
+  const analyzerEntry = path.join(BACKEND, 'src/engine/analyzer.js');
+  const signalHistoryEntry = path.join(BACKEND, 'src/engine/signalHistory.js');
   const preload = `
 const fs = require('node:fs');
 const fetchPath = require.resolve(${JSON.stringify(NODE_FETCH_ENTRY)});
@@ -133,14 +137,53 @@ const counters = {
   advanceRiskEvaluate: 0,
   advanceRiskOnTradeClosed: 0,
   simplePriceFetch: 0,
+  marketSnapshotEmitCount: 0,
 };
+const pipelineCalls = [];
+const marketSnapshotEmits = [];
+const order = [];
+let lastMarketSnapshotEvent = null;
 function saveProbe() {
-  fs.writeFileSync(probePath, JSON.stringify(counters));
+  fs.writeFileSync(probePath, JSON.stringify({ ...counters, pipelineCalls, marketSnapshotEmits, order }));
 }
 function count(name) {
   counters[name]++;
   saveProbe();
 }
+
+const eventBusPath = require.resolve(${JSON.stringify(eventBusEntry)});
+const { EventBus } = require(eventBusPath);
+const originalEmit = EventBus.prototype.emit;
+EventBus.prototype.emit = function (event, ...args) {
+  if (event === 'market:snapshot') {
+    counters.marketSnapshotEmitCount++;
+    lastMarketSnapshotEvent = { snapshot: args[0], transition: args[1] };
+    marketSnapshotEmits.push({
+      argumentCount: args.length,
+      price: args[0]?.price,
+      timestamp: args[0]?.timestamp,
+      oneHourOpenTime: args[1]?.finalized?.['1h']?.openTime ?? null,
+    });
+    saveProbe();
+  }
+  return originalEmit.apply(this, [event, ...args]);
+};
+
+const { MarketAnalyzer } = require(${JSON.stringify(analyzerEntry)});
+const originalAnalyze = MarketAnalyzer.prototype.analyze;
+MarketAnalyzer.prototype.analyze = function (...args) {
+  order.push('analyzer');
+  saveProbe();
+  return originalAnalyze.apply(this, args);
+};
+
+const { SignalHistoryEngine } = require(${JSON.stringify(signalHistoryEntry)});
+const originalRecord = SignalHistoryEngine.prototype.record;
+SignalHistoryEngine.prototype.record = function (...args) {
+  order.push('signalHistory');
+  saveProbe();
+  return originalRecord.apply(this, args);
+};
 
 const executionPipelinePath = require.resolve(${JSON.stringify(executionPipelineEntry)});
 const executionPipeline = require(executionPipelinePath);
@@ -149,9 +192,27 @@ executionPipeline.createExecutionPipeline = dependencies => {
   count('createExecutionPipeline');
   const pipeline = createExecutionPipeline(dependencies);
   const run = pipeline.run;
-  pipeline.run = snapshot => {
+  pipeline.run = (...args) => {
     count('pipelineRun');
-    return run(snapshot);
+    order.push('pipeline');
+    const [snapshot, options] = args;
+    const transition = lastMarketSnapshotEvent?.transition;
+    const active = dependencies.candleEngine.getActive('1h');
+    const candles = dependencies.candleEngine.getCandles('1h');
+    const finalized = active && candles[candles.length - 1]?.openTime === active.openTime
+      ? candles.slice(0, -1)
+      : candles;
+    pipelineCalls.push({
+      argumentCount: args.length,
+      price: snapshot?.price,
+      sameSnapshot: snapshot === lastMarketSnapshotEvent?.snapshot,
+      lifecycleOpenTime: options?.lifecycleCandle?.openTime ?? null,
+      activeOpenTime: active?.openTime ?? null,
+      finalizedOpenTimes: finalized.map(candle => candle.openTime),
+      sameLifecycle: options?.lifecycleCandle === transition?.finalized?.['1h'],
+    });
+    saveProbe();
+    return run(...args);
   };
   return pipeline;
 };
@@ -178,6 +239,25 @@ for (const [method, counter] of Object.entries({ evaluate: 'advanceRiskEvaluate'
     return original.apply(this, args);
   };
 }
+
+const { ApiManager } = require(${JSON.stringify(apiManagerEntry)});
+const liveSnapshots = [
+  { symbol: 'BTCUSDT', price: 110, volume: 1, timestamp: '2024-01-01T10:00:00.000Z' },
+  { symbol: 'BTCUSDT', price: 115, volume: 1, timestamp: '2024-01-01T10:30:00.000Z' },
+  { symbol: 'BTCUSDT', price: 120, volume: 1, timestamp: '2024-01-01T11:00:00.000Z' },
+];
+let liveSnapshotIndex = 0;
+ApiManager.prototype.fetchMarketData = async function () {
+  if (liveSnapshotIndex === liveSnapshots.length) {
+    liveSnapshotIndex++;
+    throw new Error('forced live fetch failure');
+  }
+  const snapshot = { ...liveSnapshots[Math.min(liveSnapshotIndex++, liveSnapshots.length - 1)] };
+  counters.simplePriceFetch++;
+  this.cache.store(snapshot);
+  saveProbe();
+  return snapshot;
+};
 
 saveProbe();
 const mockedFetch = async url => {
@@ -251,6 +331,24 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     assert.equal(first.statusResponse.statusCode, 200);
     assert.equal(first.probe.createExecutionPipeline, 1);
     assert.equal(first.probe.pipelineRun, 1);
+    assert.equal(first.probe.marketSnapshotEmitCount, 1);
+    assert.equal(first.probe.marketSnapshotEmits.length, 1);
+    assert.deepEqual(first.probe.marketSnapshotEmits[0], {
+      argumentCount: 2,
+      price: 110,
+      timestamp: '2024-01-01T10:00:00.000Z',
+      oneHourOpenTime: null,
+    });
+    assert.deepEqual(first.probe.pipelineCalls, [{
+      argumentCount: 1,
+      price: 110,
+      sameSnapshot: true,
+      lifecycleOpenTime: null,
+      activeOpenTime: Date.parse('2024-01-01T10:00:00.000Z'),
+      finalizedOpenTimes: [],
+      sameLifecycle: false,
+    }]);
+    assert.deepEqual(first.probe.order.slice(-3), ['analyzer', 'signalHistory', 'pipeline']);
     assert.equal(first.probe.simplePriceFetch, 1);
     assert.equal(first.probe.paperEvaluateTrades, 1);
     assert.equal(first.probe.paperOnCandle, 1);
@@ -276,6 +374,9 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     assert.equal(second.statusResponse.statusCode, 200);
     assert.equal(second.probe.createExecutionPipeline, 1);
     assert.equal(second.probe.pipelineRun, 2);
+    assert.equal(second.probe.marketSnapshotEmitCount, 2);
+    assert.deepEqual(second.probe.marketSnapshotEmits.map(event => event.argumentCount), [2, 2]);
+    assert.deepEqual(second.probe.pipelineCalls.map(call => call.argumentCount), [1, 1]);
     assert.equal(second.probe.simplePriceFetch, 2);
     assert.equal(second.probe.paperEvaluateTrades, 2);
     assert.equal(second.probe.paperOnCandle, 2);
@@ -283,7 +384,7 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     assert.equal(second.probe.advanceRiskEvaluate, 0);
     assert.equal(second.probe.advanceRiskOnTradeClosed, 0);
     assert.equal(second.statusResponse.body.pipeline.pipelineCycleCount, 2);
-    for (const value of Object.values(second.probe)) {
+    for (const value of Object.values(second.probe).filter(value => typeof value === 'number')) {
       assert.ok(value <= second.probe.pipelineRun, `counter exceeded authoritative runs: ${value}`);
     }
 
@@ -292,6 +393,45 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     assert.equal(secondInspector.body.available, true);
     assert.equal(secondInspector.body.cycle, 2);
     assert.equal(secondInspector.body.cycle, second.statusResponse.body.pipeline.pipelineCycleCount);
+
+    const third = await waitForCycle(port, probePath, 3);
+    assert.equal(third.probe.pipelineRun, 3);
+    assert.deepEqual(third.probe.marketSnapshotEmits[2], {
+      argumentCount: 2,
+      price: 120,
+      timestamp: '2024-01-01T11:00:00.000Z',
+      oneHourOpenTime: Date.parse('2024-01-01T10:00:00.000Z'),
+    });
+    assert.deepEqual(third.probe.pipelineCalls[2], {
+      argumentCount: 2,
+      price: 120,
+      sameSnapshot: true,
+      lifecycleOpenTime: Date.parse('2024-01-01T10:00:00.000Z'),
+      activeOpenTime: Date.parse('2024-01-01T11:00:00.000Z'),
+      finalizedOpenTimes: [Date.parse('2024-01-01T10:00:00.000Z')],
+      sameLifecycle: true,
+    });
+    assert.deepEqual(third.probe.order.slice(-3), ['analyzer', 'signalHistory', 'pipeline']);
+
+    const fourth = await waitForCycle(port, probePath, 4);
+    assert.equal(fourth.probe.pipelineRun, 4);
+    assert.equal(fourth.probe.marketSnapshotEmits[3].argumentCount, 2);
+    assert.equal(fourth.probe.pipelineCalls[3].argumentCount, 2);
+    assert.equal(fourth.probe.pipelineCalls[3].price, 120);
+    assert.equal(fourth.probe.pipelineCalls[3].sameSnapshot, true);
+    assert.equal(fourth.probe.pipelineCalls[3].lifecycleOpenTime, Date.parse('2024-01-01T11:00:00.000Z'));
+    assert.deepEqual(fourth.probe.pipelineCalls[3].finalizedOpenTimes, [
+      Date.parse('2024-01-01T10:00:00.000Z'),
+      Date.parse('2024-01-01T11:00:00.000Z'),
+    ]);
+    assert.notEqual(fourth.probe.pipelineCalls[3].activeOpenTime, fourth.probe.pipelineCalls[3].lifecycleOpenTime);
+    assert.equal(fourth.probe.pipelineCalls[3].sameLifecycle, true);
+    assert.equal(fourth.probe.paperEvaluateTrades, 4);
+    assert.equal(fourth.probe.paperOnCandle, 4);
+    assert.equal(fourth.probe.paperSignal, 0);
+    assert.equal(fourth.probe.advanceRiskEvaluate, 0);
+    assert.equal(fourth.probe.advanceRiskOnTradeClosed, 0);
+    assert.deepEqual(fourth.probe.order.slice(-3), ['analyzer', 'signalHistory', 'pipeline']);
     assert.equal(child.exitCode, null);
   } finally {
     await stopServer(child);
