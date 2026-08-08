@@ -115,13 +115,33 @@ function validateNormalizedInput(normalizedInput, candleEngine) {
   });
 }
 
-function failureDetails(error, index, openTime) {
+function failureDetails(error, {
+  phase,
+  index,
+  openTime,
+  boundaryTime,
+  commitConfirmed,
+  clockAdvanced,
+}) {
   return {
-    code: typeof error?.code === 'string' ? error.code : 'CYCLE_FAILED',
+    code: 'CYCLE_FAILED',
     message: error instanceof Error ? error.message : String(error),
-    index,
+    phase,
+    sourceIndex: index,
     openTime,
+    boundaryTime,
+    commitConfirmed,
+    clockAdvanced,
+    causeCode: typeof error?.code === 'string' ? error.code : null,
+    causeName: typeof error?.name === 'string' ? error.name : null,
   };
+}
+
+function isRetryableClockFailure(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const isHistoricalInvariant = message === 'historical clock cannot move backwards'
+    || message.startsWith('historical clock timestamp must be');
+  return error?.retryable === true && !isHistoricalInvariant;
 }
 
 function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
@@ -134,42 +154,77 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
   let lastResult = null;
   let failure = null;
 
+  function queryHasNext() {
+    return dependencies.candleEngine.hasNext();
+  }
+
   function hasNext() {
-    return status === 'READY' && dependencies.candleEngine.hasNext();
+    return status === 'READY' && queryHasNext();
   }
 
   function runNextCycle() {
     if (status === 'FAILED') {
       throw new ReplayPipelineRunnerError(
         'RUNNER_FAILED',
-        `Replay pipeline runner failed at cycle index ${failure.index}`,
+        `Replay pipeline runner failed at cycle index ${failure.sourceIndex}`,
       );
     }
-    if (status === 'EXHAUSTED' || !hasNext()) {
+    if (status === 'EXHAUSTED') {
       status = 'EXHAUSTED';
       throw new ReplayPipelineRunnerError('NO_REMAINING_CANDLES', 'No remaining replay candles');
     }
 
     const index = cycleCount;
     const expectedCandle = normalizedInput.candles[index];
-    let boundaryCommitted = false;
+    let boundaryTime = null;
+    let phase = 'PREFLIGHT';
+    let commitConfirmed = false;
+    let clockAdvanced = false;
+
+    let available;
+    try {
+      available = queryHasNext();
+    } catch (error) {
+      failure = Object.freeze(failureDetails(error, {
+        phase,
+        index,
+        openTime: expectedCandle?.openTime ?? null,
+        boundaryTime,
+        commitConfirmed,
+        clockAdvanced,
+      }));
+      status = 'FAILED';
+      throw new ReplayPipelineRunnerError('CYCLE_FAILED', failure.message);
+    }
+
+    if (!available) {
+      status = 'EXHAUSTED';
+      throw new ReplayPipelineRunnerError('NO_REMAINING_CANDLES', 'No remaining replay candles');
+    }
 
     try {
-      const closeTime = assertTimestamp(
+      phase = 'PREFLIGHT';
+      boundaryTime = assertTimestamp(
         expectedCandle.openTime + PRIMARY_CANDLE_DURATION_MS,
         `normalizedInput.candles[${index}].closeTime`,
       );
-      const closeTimestamp = new Date(closeTime).toISOString();
+      const closeTimestamp = new Date(boundaryTime).toISOString();
 
-      const plan = dependencies.candleEngine.prepareBoundary({ boundaryTime: closeTime });
-      dependencies.clockController.advanceTo(closeTime);
+      phase = 'PREPARE';
+      const plan = dependencies.candleEngine.prepareBoundary({ boundaryTime });
+      phase = 'CLOCK';
+      dependencies.clockController.advanceTo(boundaryTime);
+      clockAdvanced = true;
+      phase = 'COMMIT';
       const transition = dependencies.candleEngine.commitBoundary(plan);
-      boundaryCommitted = true;
+      commitConfirmed = true;
 
+      phase = 'TRANSITION_VALIDATION';
       if (transition.sourceIndex !== index || transition.lifecycleCandle !== expectedCandle) {
         fail('CANDLE_MISMATCH', `Committed candle does not match normalizedInput.candles[${index}]`);
       }
 
+      phase = 'SNAPSHOT';
       const price = transition.active === null
         ? expectedCandle.close
         : transition.active.open;
@@ -178,14 +233,19 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
         timestamp: closeTimestamp,
       };
 
+      phase = 'PIPELINE';
       executionPipeline.run(snapshot, {
         lifecycleCandle: transition.lifecycleCandle,
       });
 
+      phase = 'DECISION_CAPTURE';
       const decision = executionPipeline.getLastDecision();
       if (!decision) fail('MISSING_DECISION', 'Canonical execution pipeline produced no decision');
+
+      phase = 'DECISION_CLONE';
       const frozenDecision = cloneAndFreeze(decision);
 
+      phase = 'RESULT_CAPTURE';
       const result = cloneAndFreeze({
         index,
         openTime: expectedCandle.openTime,
@@ -194,7 +254,8 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
         decision: frozenDecision,
       });
 
-      const completedStatus = dependencies.candleEngine.hasNext()
+      phase = 'EXHAUSTION';
+      const completedStatus = queryHasNext()
         ? 'READY'
         : 'EXHAUSTED';
 
@@ -204,11 +265,20 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
 
       return result;
     } catch (error) {
-      if (boundaryCommitted) {
-        failure = Object.freeze(failureDetails(error, index, expectedCandle.openTime));
-        status = 'FAILED';
+      if (phase === 'CLOCK' && isRetryableClockFailure(error)) {
+        throw error;
       }
-      throw error;
+
+      failure = Object.freeze(failureDetails(error, {
+        phase,
+        index,
+        openTime: expectedCandle?.openTime ?? null,
+        boundaryTime,
+        commitConfirmed,
+        clockAdvanced,
+      }));
+      status = 'FAILED';
+      throw new ReplayPipelineRunnerError('CYCLE_FAILED', failure.message);
     }
   }
 

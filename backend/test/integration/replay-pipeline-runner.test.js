@@ -8,6 +8,7 @@ const executionPipelineModule = require('../../src/core/executionPipeline');
 
 const pipelineSnapshots = [];
 const pipelineCalls = [];
+let pipelineHook = null;
 const originalCreateExecutionPipeline = executionPipelineModule.createExecutionPipeline;
 executionPipelineModule.createExecutionPipeline = dependencies => {
   const pipeline = originalCreateExecutionPipeline(dependencies);
@@ -17,6 +18,7 @@ executionPipelineModule.createExecutionPipeline = dependencies => {
     pipelineSnapshots.push(args[0]);
     return originalRun(...args);
   };
+  pipelineHook?.(pipeline, dependencies);
   return pipeline;
 };
 const { createReplayPipelineRunner } = require('../../src/engine/replayPipelineRunner');
@@ -105,6 +107,30 @@ function makeBundle(input = normalizedInput()) {
 
 function makeRunner(input = normalizedInput(), bundle = makeBundle(input)) {
   return { bundle, runner: createReplayPipelineRunner({ dependencies: bundle, normalizedInput: input }) };
+}
+
+function makeRunnerWithPipelineHook(input, bundle, hook) {
+  pipelineHook = hook;
+  try {
+    return makeRunner(input, bundle);
+  } finally {
+    pipelineHook = null;
+  }
+}
+
+function withStructuredCloneFailure(callNumber, operation) {
+  const originalStructuredClone = globalThis.structuredClone;
+  let calls = 0;
+  globalThis.structuredClone = value => {
+    calls += 1;
+    if (calls === callNumber) throw new Error(`controlled clone failure ${callNumber}`);
+    return originalStructuredClone(value);
+  };
+  try {
+    return operation();
+  } finally {
+    globalThis.structuredClone = originalStructuredClone;
+  }
 }
 
 function runQuietly(runner) {
@@ -668,7 +694,7 @@ test('non-1h normalized input rejects', () => {
   );
 });
 
-test('close-boundary overflow fails before commit and preserves READY state', () => {
+test('close-boundary overflow fails before commit and enters terminal PREFLIGHT failure', () => {
   const input = Object.freeze({
     schemaVersion: 1,
     timeframe: '1h',
@@ -689,12 +715,23 @@ test('close-boundary overflow fails before commit and preserves READY state', ()
     () => runQuietly(runner),
     error => error instanceof TypeError && /closeTime/.test(error.message),
   );
-  assert.equal(runner.hasNext(), true);
+  assert.equal(runner.hasNext(), false);
   assert.deepEqual(runner.getState(), {
-    status: 'READY',
+    status: 'FAILED',
     cycleCount: 0,
     lastResult: null,
-    failure: null,
+    failure: {
+      code: 'CYCLE_FAILED',
+      message: 'normalizedInput.candles[0].closeTime must be a finite integer valid for JavaScript Date',
+      phase: 'PREFLIGHT',
+      sourceIndex: 0,
+      openTime: MAX_DATE_MS,
+      boundaryTime: null,
+      commitConfirmed: false,
+      clockAdvanced: false,
+      causeCode: null,
+      causeName: 'TypeError',
+    },
   });
   assert.equal(bundle.clock.nowMs(), MAX_DATE_MS);
   assert.equal(bundle.candleEngine.getActive('1h'), null);
@@ -727,10 +764,11 @@ test('candle engine and normalized input timeframe mismatch rejects', () => {
   );
 });
 
-test('clock failure after preparation skips commit and preserves retryable state', () => {
+test('transient clock failure after preparation preserves retryable state and retries', () => {
   const input = normalizedInput(2);
   const bundle = makeBundle(input);
   const order = [];
+  let clockFailures = 0;
   const originalPrepare = bundle.candleEngine.prepareBoundary.bind(bundle.candleEngine);
   const originalCommit = bundle.candleEngine.commitBoundary.bind(bundle.candleEngine);
   bundle.candleEngine.prepareBoundary = (...args) => {
@@ -744,9 +782,14 @@ test('clock failure after preparation skips commit and preserves retryable state
   const { runner } = makeRunner(input, {
     ...bundle,
     clockController: {
-      advanceTo() {
+      advanceTo(...args) {
         order.push('clock');
-        throw new Error('controlled clock failure');
+        if (clockFailures++ === 0) {
+          const error = new Error('controlled clock failure');
+          error.retryable = true;
+          throw error;
+        }
+        return bundle.clockController.advanceTo(...args);
       },
     },
   });
@@ -762,6 +805,8 @@ test('clock failure after preparation skips commit and preserves retryable state
     failure: null,
   });
   assert.equal(runner.hasNext(), true);
+  assert.equal(runQuietly(runner).index, 0);
+  assert.deepEqual(order, ['prepare', 'clock', 'prepare', 'clock', 'commit']);
 });
 
 test('escaped pipeline failure after commit preserves committed state and fails runner', () => {
@@ -788,23 +833,48 @@ test('post-commit exhaustion failure does not publish successful bookkeeping', (
   const input = normalizedInput(2);
   const bundle = makeBundle(input);
   const originalHasNext = bundle.candleEngine.hasNext.bind(bundle.candleEngine);
+  const exhaustionError = new Error('controlled exhaustion check failure');
+  exhaustionError.code = 'EXHAUSTION_CHECK_FAILED';
   let hasNextCalls = 0;
   bundle.candleEngine.hasNext = () => {
     hasNextCalls += 1;
-    if (hasNextCalls === 2) throw new Error('controlled exhaustion check failure');
+    if (hasNextCalls === 2) throw exhaustionError;
     return originalHasNext();
   };
+  const pipelineCallsBefore = pipelineCalls.length;
   const { runner } = makeRunner(input, bundle);
 
-  assert.throws(() => runQuietly(runner), /controlled exhaustion check failure/);
+  assert.throws(
+    () => runQuietly(runner),
+    error => error.code === 'CYCLE_FAILED'
+      && error.message === 'controlled exhaustion check failure',
+  );
   const state = runner.getState();
   assert.equal(state.status, 'FAILED');
   assert.equal(state.cycleCount, 0);
   assert.equal(state.lastResult, null);
+  assert.deepEqual(state.failure, {
+    code: 'CYCLE_FAILED',
+    message: 'controlled exhaustion check failure',
+    phase: 'EXHAUSTION',
+    sourceIndex: 0,
+    openTime: input.candles[0].openTime,
+    boundaryTime: input.candles[0].openTime + HOUR,
+    commitConfirmed: true,
+    clockAdvanced: true,
+    causeCode: 'EXHAUSTION_CHECK_FAILED',
+    causeName: 'Error',
+  });
+  assert.deepEqual(Object.keys(state.failure), [
+    'code', 'message', 'phase', 'sourceIndex', 'openTime', 'boundaryTime',
+    'commitConfirmed', 'clockAdvanced', 'causeCode', 'causeName',
+  ]);
   assert.equal(bundle.candleEngine.getCandles('1h').length, 1);
   assert.equal(bundle.candleEngine.getActive('1h').open, input.candles[1].open);
   assert.equal(runner.hasNext(), false);
   assert.throws(() => runner.runNextCycle(), error => error.code === 'RUNNER_FAILED');
+  assert.equal(hasNextCalls, 2);
+  assert.equal(pipelineCalls.length, pipelineCallsBefore + 1);
 });
 
 test('final successful cycle sets EXHAUSTED and retains its result', () => {
@@ -830,6 +900,326 @@ test('EXHAUSTED runner refuses extra cycles without changing state', () => {
 
   assert.throws(() => runner.runNextCycle(), error => error.code === 'NO_REMAINING_CANDLES');
   assert.deepEqual(runner.getState(), before);
+});
+
+test('direct public hasNext dependency failure propagates without changing runner state', () => {
+  const bundle = makeBundle();
+  const { runner } = makeRunner(normalizedInput(), bundle);
+  const before = runner.getState();
+  const error = new Error('direct hasNext failure');
+  bundle.candleEngine.hasNext = () => { throw error; };
+
+  assert.throws(() => runner.hasNext(), actual => actual === error);
+  assert.deepEqual(runner.getState(), before);
+});
+
+test('runNextCycle normalizes preflight hasNext failure as terminal PREFLIGHT', () => {
+  const bundle = makeBundle();
+  const { runner } = makeRunner(normalizedInput(), bundle);
+  bundle.candleEngine.hasNext = () => { throw new Error('preflight hasNext failure'); };
+
+  assert.throws(() => runQuietly(runner), error => (
+    error.code === 'CYCLE_FAILED' && error.message === 'preflight hasNext failure'
+  ));
+  assert.deepEqual(runner.getState(), {
+    status: 'FAILED',
+    cycleCount: 0,
+    lastResult: null,
+    failure: {
+      code: 'CYCLE_FAILED',
+      message: 'preflight hasNext failure',
+      phase: 'PREFLIGHT',
+      sourceIndex: 0,
+      openTime: BASE_TIME,
+      boundaryTime: null,
+      commitConfirmed: false,
+      clockAdvanced: false,
+      causeCode: null,
+      causeName: 'Error',
+    },
+  });
+});
+
+test('deterministic prepare failure becomes terminal PREPARE failure', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  const error = new Error('invalid boundary plan');
+  error.code = 'INVALID_BOUNDARY';
+  bundle.candleEngine.prepareBoundary = () => { throw error; };
+  const { runner } = makeRunner(input, bundle);
+
+  assert.throws(() => runQuietly(runner), thrown => thrown.code === 'CYCLE_FAILED');
+  assert.deepEqual(runner.getState().failure, {
+    code: 'CYCLE_FAILED',
+    message: 'invalid boundary plan',
+    phase: 'PREPARE',
+    sourceIndex: 0,
+    openTime: BASE_TIME,
+    boundaryTime: BASE_TIME + HOUR,
+    commitConfirmed: false,
+    clockAdvanced: false,
+    causeCode: 'INVALID_BOUNDARY',
+    causeName: 'Error',
+  });
+  assert.equal(runner.getState().status, 'FAILED');
+});
+
+test('backward historical clock failure is terminal CLOCK failure', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  bundle.clockController.advanceTo(BASE_TIME + 2 * HOUR);
+  const { runner } = makeRunner(input, bundle);
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  assert.deepEqual(runner.getState().failure, {
+    code: 'CYCLE_FAILED',
+    message: 'historical clock cannot move backwards',
+    phase: 'CLOCK',
+    sourceIndex: 0,
+    openTime: BASE_TIME,
+    boundaryTime: BASE_TIME + HOUR,
+    commitConfirmed: false,
+    clockAdvanced: false,
+    causeCode: null,
+    causeName: 'TypeError',
+  });
+  assert.equal(runner.hasNext(), false);
+});
+
+test('unclassified clock failure defaults to terminal CLOCK failure', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  const { runner } = makeRunner(input, {
+    ...bundle,
+    clockController: { advanceTo() { throw new Error('unclassified clock failure'); } },
+  });
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  assert.equal(runner.getState().failure.phase, 'CLOCK');
+  assert.equal(runner.getState().failure.commitConfirmed, false);
+  assert.equal(runner.getState().failure.clockAdvanced, false);
+});
+
+test('invalid historical clock timestamp failure is terminal CLOCK failure', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  const { runner } = makeRunner(input, {
+    ...bundle,
+    clockController: {
+      advanceTo() {
+        throw new TypeError('historical clock timestamp must be a finite integer valid for JavaScript Date');
+      },
+    },
+  });
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  assert.equal(runner.getState().failure.phase, 'CLOCK');
+  assert.equal(runner.getState().failure.commitConfirmed, false);
+  assert.equal(runner.getState().failure.clockAdvanced, false);
+});
+
+test('commit failure is terminal without claiming candle state was untouched', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  let commitCalls = 0;
+  bundle.candleEngine.commitBoundary = () => {
+    commitCalls += 1;
+    throw new Error('controlled commit failure');
+  };
+  const { runner } = makeRunner(input, bundle);
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  const state = runner.getState();
+  assert.deepEqual(state.failure, {
+    code: 'CYCLE_FAILED',
+    message: 'controlled commit failure',
+    phase: 'COMMIT',
+    sourceIndex: 0,
+    openTime: BASE_TIME,
+    boundaryTime: BASE_TIME + HOUR,
+    commitConfirmed: false,
+    clockAdvanced: true,
+    causeCode: null,
+    causeName: 'Error',
+  });
+  assert.equal(state.cycleCount, 0);
+  assert.equal(state.lastResult, null);
+  assert.throws(() => runner.runNextCycle(), error => error.code === 'RUNNER_FAILED');
+  assert.equal(commitCalls, 1);
+});
+
+test('transition source mismatch is terminal after confirmed commit', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  const originalCommit = bundle.candleEngine.commitBoundary.bind(bundle.candleEngine);
+  bundle.candleEngine.commitBoundary = plan => ({
+    ...originalCommit(plan),
+    sourceIndex: 99,
+  });
+  const pipelineCallsBefore = pipelineCalls.length;
+  const { runner } = makeRunner(input, bundle);
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  const state = runner.getState();
+  assert.equal(state.failure.phase, 'TRANSITION_VALIDATION');
+  assert.equal(state.failure.commitConfirmed, true);
+  assert.equal(state.failure.clockAdvanced, true);
+  assert.equal(state.cycleCount, 0);
+  assert.equal(pipelineCalls.length, pipelineCallsBefore);
+});
+
+test('lifecycle identity mismatch is terminal after confirmed commit', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  const originalCommit = bundle.candleEngine.commitBoundary.bind(bundle.candleEngine);
+  bundle.candleEngine.commitBoundary = plan => {
+    const transition = originalCommit(plan);
+    return { ...transition, lifecycleCandle: { ...transition.lifecycleCandle } };
+  };
+  const { runner } = makeRunner(input, bundle);
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  assert.equal(runner.getState().failure.phase, 'TRANSITION_VALIDATION');
+  assert.equal(runner.getState().failure.commitConfirmed, true);
+  assert.equal(runner.getState().cycleCount, 0);
+});
+
+test('causal snapshot construction failure is terminal SNAPSHOT failure', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  const originalCommit = bundle.candleEngine.commitBoundary.bind(bundle.candleEngine);
+  bundle.candleEngine.commitBoundary = plan => {
+    const transition = originalCommit(plan);
+    return new Proxy(transition, {
+      get(target, property, receiver) {
+        if (property === 'active') throw new Error('snapshot construction failure');
+        return Reflect.get(target, property, receiver);
+      },
+    });
+  };
+  const { runner } = makeRunner(input, bundle);
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  assert.equal(runner.getState().failure.phase, 'SNAPSHOT');
+  assert.equal(runner.getState().failure.commitConfirmed, true);
+  assert.equal(runner.getState().failure.clockAdvanced, true);
+  assert.equal(runner.getState().cycleCount, 0);
+});
+
+test('safeExecute component failure still publishes a successful cycle', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  bundle.paperTradeEngine.onCandle = () => { throw new Error('absorbed component failure'); };
+  const { runner } = makeRunner(input, bundle);
+
+  const result = runQuietly(runner);
+
+  assert.ok(result);
+  assert.equal(runner.getState().status, 'READY');
+  assert.equal(runner.getState().cycleCount, 1);
+  assert.equal(runner.getState().failure, null);
+  assert.equal(runner.getState().lastResult.index, 0);
+});
+
+test('getLastDecision failure is terminal DECISION_CAPTURE failure', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  const error = new Error('decision capture failure');
+  const { runner } = makeRunnerWithPipelineHook(input, bundle, pipeline => {
+    pipeline.getLastDecision = () => { throw error; };
+  });
+
+  assert.throws(() => runQuietly(runner), thrown => thrown.code === 'CYCLE_FAILED');
+  assert.equal(runner.getState().failure.phase, 'DECISION_CAPTURE');
+  assert.equal(runner.getState().failure.commitConfirmed, true);
+  assert.equal(runner.getState().cycleCount, 0);
+  assert.equal(runner.getState().lastResult, null);
+});
+
+test('decision clone failure is terminal DECISION_CLONE failure', () => {
+  const input = normalizedInput(2);
+  const { bundle, runner } = makeRunner(input);
+
+  withStructuredCloneFailure(1, () => {
+    assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  });
+
+  assert.equal(runner.getState().failure.phase, 'DECISION_CLONE');
+  assert.equal(runner.getState().failure.commitConfirmed, true);
+  assert.equal(runner.getState().cycleCount, 0);
+});
+
+test('result clone failure is terminal RESULT_CAPTURE failure', () => {
+  const input = normalizedInput(2);
+  const { bundle, runner } = makeRunner(input);
+
+  withStructuredCloneFailure(2, () => {
+    assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  });
+
+  assert.equal(runner.getState().failure.phase, 'RESULT_CAPTURE');
+  assert.equal(runner.getState().failure.commitConfirmed, true);
+  assert.equal(runner.getState().cycleCount, 0);
+});
+
+test('failure metadata has the exact frozen schema and stable snapshots', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  bundle.candleEngine.getCandles = () => { throw new Error('schema failure'); };
+  const { runner } = makeRunner(input, bundle);
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  const first = runner.getState();
+  const second = runner.getState();
+  const expectedKeys = [
+    'code', 'message', 'phase', 'sourceIndex', 'openTime', 'boundaryTime',
+    'commitConfirmed', 'clockAdvanced', 'causeCode', 'causeName',
+  ];
+
+  assert.deepEqual(Object.keys(first.failure), expectedKeys);
+  assert.equal(Object.isFrozen(first), true);
+  assert.equal(Object.isFrozen(first.failure), true);
+  assert.notStrictEqual(first, second);
+  assert.deepEqual(first, second);
+  first.failure.phase = 'MUTATED';
+  first.failure.code = 'MUTATED';
+  assert.equal(runner.getState().failure.phase, 'PIPELINE');
+  assert.equal(runner.getState().failure.code, 'CYCLE_FAILED');
+});
+
+test('failed runner remains immutable and never replays the committed source', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  const originalGetCandles = bundle.candleEngine.getCandles.bind(bundle.candleEngine);
+  bundle.candleEngine.getCandles = () => { throw new Error('one-shot pipeline failure'); };
+  const pipelineCallsBefore = pipelineCalls.length;
+  const { runner } = makeRunner(input, bundle);
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  const failed = runner.getState();
+  assert.equal(pipelineCalls.length, pipelineCallsBefore + 1);
+  assert.equal(originalGetCandles('1h').length, 1);
+  assert.equal(runner.hasNext(), false);
+  assert.throws(() => runner.runNextCycle(), error => error.code === 'RUNNER_FAILED');
+  assert.deepEqual(runner.getState(), failed);
+  assert.equal(pipelineCalls.length, pipelineCallsBefore + 1);
+});
+
+test('post-commit failure preserves the previous published result', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  const { runner } = makeRunner(input, bundle);
+  runQuietly(runner);
+  const previous = runner.getState();
+  bundle.candleEngine.getCandles = () => { throw new Error('second cycle failure'); };
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  const state = runner.getState();
+  assert.equal(state.status, 'FAILED');
+  assert.equal(state.cycleCount, 1);
+  assert.deepEqual(state.lastResult, previous.lastResult);
+  assert.equal(state.failure.sourceIndex, 1);
+  assert.equal(state.failure.commitConfirmed, true);
 });
 
 test('runner has no StrategyReplay or report/statistics integration', () => {
