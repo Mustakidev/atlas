@@ -7,13 +7,15 @@ const { normalizeReplayInput } = require('../../src/engine/replayInput');
 const executionPipelineModule = require('../../src/core/executionPipeline');
 
 const pipelineSnapshots = [];
+const pipelineCalls = [];
 const originalCreateExecutionPipeline = executionPipelineModule.createExecutionPipeline;
 executionPipelineModule.createExecutionPipeline = dependencies => {
   const pipeline = originalCreateExecutionPipeline(dependencies);
   const originalRun = pipeline.run.bind(pipeline);
-  pipeline.run = snapshot => {
-    pipelineSnapshots.push(snapshot);
-    return originalRun(snapshot);
+  pipeline.run = (...args) => {
+    pipelineCalls.push(args);
+    pipelineSnapshots.push(args[0]);
+    return originalRun(...args);
   };
   return pipeline;
 };
@@ -58,6 +60,29 @@ function normalizedInput(count = 51, timeframe = '1h', mutate, startTime = BASE_
     timeframe,
     candles: Object.freeze(candles),
   });
+}
+
+function customInput(candles) {
+  const frozenCandles = candles.map(candle => Object.freeze({
+    timestamp: new Date(candle.openTime).toISOString(),
+    ...candle,
+  }));
+  return Object.freeze({
+    schemaVersion: 1,
+    timeframe: '1h',
+    candles: Object.freeze(frozenCandles),
+  });
+}
+
+function customCandle(openTime, open, close = open) {
+  return {
+    openTime,
+    open,
+    high: Math.max(open, close) + 1,
+    low: Math.min(open, close) - 1,
+    close,
+    volume: 1,
+  };
 }
 
 function makeClock() {
@@ -210,7 +235,6 @@ test('initial state is READY, frozen, and defensively snapshotted', () => {
   assert.deepEqual(first, {
     status: 'READY',
     cycleCount: 0,
-    nextIndex: 0,
     lastResult: null,
     failure: null,
   });
@@ -232,6 +256,160 @@ test('first cycle advances the historical clock to the candle close boundary', (
   assert.equal(result.timestamp, closeTimestamp);
   assert.equal(result.decision.timestamp, closeTimestamp);
   assert.equal(pipelineSnapshots[pipelineSnapshots.length - 1].timestamp, closeTimestamp);
+});
+
+test('transactional cycle order is prepare, clock, commit, then pipeline', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  const order = [];
+  const originalPrepare = bundle.candleEngine.prepareBoundary.bind(bundle.candleEngine);
+  const originalAdvance = bundle.clockController.advanceTo.bind(bundle.clockController);
+  const originalCommit = bundle.candleEngine.commitBoundary.bind(bundle.candleEngine);
+  const originalRun = bundle.candleEngine.getCandles.bind(bundle.candleEngine);
+
+  bundle.candleEngine.prepareBoundary = (...args) => {
+    order.push('prepare');
+    return originalPrepare(...args);
+  };
+  bundle.candleEngine.commitBoundary = (...args) => {
+    order.push('commit');
+    return originalCommit(...args);
+  };
+  bundle.candleEngine.getCandles = (...args) => {
+    order.push('pipeline-read');
+    return originalRun(...args);
+  };
+  const orderedClockController = {
+    advanceTo(...args) {
+      order.push('clock');
+      return originalAdvance(...args);
+    },
+  };
+  const { runner } = makeRunner(input, { ...bundle, clockController: orderedClockController });
+
+  runQuietly(runner);
+
+  assert.deepEqual(order.slice(0, 4), ['prepare', 'clock', 'commit', 'pipeline-read']);
+});
+
+test('continuous discontinuity uses the next source open as the boundary price', () => {
+  const input = customInput([
+    customCandle(BASE_TIME, 100, 100),
+    customCandle(BASE_TIME + HOUR, 105, 106),
+  ]);
+  const { bundle, runner } = makeRunner(input);
+  const before = pipelineCalls.length;
+
+  const result = runQuietly(runner);
+  const [snapshot, options] = pipelineCalls[before];
+
+  assert.equal(pipelineCalls[before].length, 2);
+  assert.equal(snapshot.price, 105);
+  assert.equal(snapshot.price, input.candles[1].open);
+  assert.equal(options.lifecycleCandle, input.candles[0]);
+  assert.notStrictEqual(options.lifecycleCandle, bundle.candleEngine.getActive('1h'));
+  assert.equal(result.price, 105);
+});
+
+test('projection replacement finalizes exact sources one boundary later', () => {
+  const input = normalizedInput(3);
+  const { bundle, runner } = makeRunner(input);
+
+  runQuietly(runner);
+  const projection1 = bundle.candleEngine.getActive('1h');
+  assert.strictEqual(bundle.candleEngine.getCandles('1h')[0], input.candles[0]);
+  assert.notStrictEqual(projection1, input.candles[1]);
+
+  runQuietly(runner);
+  const projection2 = bundle.candleEngine.getActive('1h');
+  assert.deepEqual(bundle.candleEngine.getCandles('1h'), [input.candles[0], input.candles[1]]);
+  assert.strictEqual(bundle.candleEngine.getCandles('1h')[1], input.candles[1]);
+  assert.notStrictEqual(bundle.candleEngine.getCandles('1h')[1], projection1);
+  assert.notStrictEqual(projection2, input.candles[2]);
+
+  runQuietly(runner);
+  assert.deepEqual(bundle.candleEngine.getCandles('1h'), [
+    input.candles[0],
+    input.candles[1],
+    input.candles[2],
+  ]);
+  assert.equal(bundle.candleEngine.getActive('1h'), null);
+});
+
+test('transactional runner never invokes legacy activation or finalization', () => {
+  const input = normalizedInput(3);
+  const bundle = makeBundle(input);
+  bundle.candleEngine.nextActive = () => { throw new Error('legacy nextActive invoked'); };
+  bundle.candleEngine.finalizeActive = () => { throw new Error('legacy finalizeActive invoked'); };
+  const { runner } = makeRunner(input, bundle);
+
+  runQuietly(runner);
+  runQuietly(runner);
+  runQuietly(runner);
+
+  assert.equal(runner.getState().status, 'EXHAUSTED');
+  assert.equal(runner.getState().cycleCount, 3);
+});
+
+test('transactional cycles preserve frozen source candles and input identity', () => {
+  const input = normalizedInput(3);
+  const sourceArray = input.candles;
+  const sourceRefs = [...input.candles];
+  const sourceSnapshots = input.candles.map(candle => ({ ...candle }));
+  const { runner } = makeRunner(input);
+
+  runQuietly(runner);
+  runQuietly(runner);
+  runQuietly(runner);
+
+  assert.strictEqual(input.candles, sourceArray);
+  assert.ok(Object.isFrozen(input.candles));
+  input.candles.forEach((candle, index) => {
+    assert.ok(Object.isFrozen(candle));
+    assert.strictEqual(candle, sourceRefs[index]);
+    assert.deepEqual(candle, sourceSnapshots[index]);
+  });
+});
+
+test('gap boundary uses the completed close without fabricating intervals', () => {
+  const input = customInput([
+    customCandle(BASE_TIME, 100, 101),
+    customCandle(BASE_TIME + 3 * HOUR, 105, 106),
+  ]);
+  const { bundle, runner } = makeRunner(input);
+  const firstCall = pipelineCalls.length;
+
+  const firstResult = runQuietly(runner);
+  const firstSnapshot = pipelineCalls[firstCall][0];
+
+  assert.equal(firstSnapshot.price, input.candles[0].close);
+  assert.equal(bundle.candleEngine.getActive('1h'), null);
+  assert.equal(firstResult.timestamp, new Date(BASE_TIME + HOUR).toISOString());
+
+  const secondCall = pipelineCalls.length;
+  const secondResult = runQuietly(runner);
+  const secondSnapshot = pipelineCalls[secondCall][0];
+
+  assert.equal(secondSnapshot.price, input.candles[1].close);
+  assert.equal(secondResult.timestamp, new Date(BASE_TIME + 4 * HOUR).toISOString());
+  assert.equal(runner.getState().cycleCount, 2);
+});
+
+test('terminal boundary uses the final close and executes exactly once', () => {
+  const input = normalizedInput(1);
+  const { bundle, runner } = makeRunner(input);
+  const before = pipelineCalls.length;
+
+  const result = runQuietly(runner);
+  const [snapshot, options] = pipelineCalls[before];
+
+  assert.equal(snapshot.price, input.candles[0].close);
+  assert.equal(options.lifecycleCandle, input.candles[0]);
+  assert.equal(bundle.candleEngine.getActive('1h'), null);
+  assert.equal(result.openTime, input.candles[0].openTime);
+  assert.equal(result.timestamp, new Date(input.candles[0].openTime + HOUR).toISOString());
+  assert.equal(runner.getState().status, 'EXHAUSTED');
+  assert.equal(runner.hasNext(), false);
 });
 
 test('consecutive replay cycles advance exactly one hour at close boundaries', () => {
@@ -273,7 +451,7 @@ test('schemaVersion 1 candles retain open-time identity without closeTime', () =
   assert.equal(input.candles[0].timestamp, new Date(input.candles[0].openTime).toISOString());
 });
 
-test('active candle is visible and finalized history excludes it during execution', () => {
+test('transaction commits finalized history and causal active state before execution', () => {
   const input = normalizedInput();
   const bundle = makeBundle(input);
   const observations = [];
@@ -293,32 +471,34 @@ test('active candle is visible and finalized history excludes it during executio
 
   runQuietly(runner);
 
-  assert.ok(observations.some(observation => observation.type === 'active'
-    && observation.active === input.candles[0]));
-  assert.ok(observations.some(observation => observation.type === 'finalized'
-    && observation.candles.length === 0));
-  assert.equal(bundle.candleEngine.getActive('1h'), null);
+  const activeObservation = observations.find(observation => observation.type === 'active');
+  const finalizedObservation = observations.find(observation => observation.type === 'finalized');
+  assert.ok(activeObservation);
+  assert.strictEqual(activeObservation.active.open, input.candles[1].open);
+  assert.ok(finalizedObservation);
+  assert.deepEqual(finalizedObservation.candles, [input.candles[0]]);
+  assert.strictEqual(finalizedObservation.candles[0], input.candles[0]);
+  assert.strictEqual(bundle.candleEngine.getActive('1h').open, input.candles[1].open);
 });
 
-test('successful cycle finalizes exactly one candle and leaves no active candle', () => {
-  const input = normalizedInput();
+test('successful cycle finalizes exactly one candle and leaves the causal projection active', () => {
+  const input = normalizedInput(2);
   const { bundle, runner } = makeRunner(input);
 
   runQuietly(runner);
 
-  assert.equal(bundle.candleEngine.getActive('1h'), null);
+  assert.equal(bundle.candleEngine.getActive('1h').open, input.candles[1].open);
   assert.equal(bundle.candleEngine.getCandles('1h').length, 1);
   assert.strictEqual(bundle.candleEngine.getCandles('1h')[0], input.candles[0]);
 });
 
-test('cycleCount and nextIndex advance exactly once per successful cycle', () => {
+test('cycleCount advances exactly once per successful cycle', () => {
   const { bundle, runner } = makeRunner();
 
   runQuietly(runner);
   assert.deepEqual(runner.getState(), {
     status: 'READY',
     cycleCount: 1,
-    nextIndex: 1,
     lastResult: runner.getState().lastResult,
     failure: null,
   });
@@ -330,7 +510,7 @@ test('insufficient-history rejection remains canonical', () => {
 
   const result = runQuietly(runner);
 
-  assert.equal(result.decision.verdict.rejectionReason, 'Insufficient candles (0/15 minimum)');
+  assert.equal(result.decision.verdict.rejectionReason, 'Insufficient candles (1/15 minimum)');
 });
 
 test('canonical MTF insufficiency remains visible after sufficient history', () => {
@@ -413,7 +593,7 @@ test('newly opened trade is not evaluated against its opening candle', () => {
   prepareEligibleBundle(bundle, { allowMtf: true });
   const { runner } = makeRunner(input, bundle);
 
-  warmupToEligibleCycle(runner);
+  warmupToEligibleCycle(runner, 14);
   runQuietly(runner);
 
   assert.equal(bundle.paperTradeEngine.open().length, 1);
@@ -488,7 +668,7 @@ test('non-1h normalized input rejects', () => {
   );
 });
 
-test('close-boundary overflow fails before activation and preserves READY state', () => {
+test('close-boundary overflow fails before commit and preserves READY state', () => {
   const input = Object.freeze({
     schemaVersion: 1,
     timeframe: '1h',
@@ -513,7 +693,6 @@ test('close-boundary overflow fails before activation and preserves READY state'
   assert.deepEqual(runner.getState(), {
     status: 'READY',
     cycleCount: 0,
-    nextIndex: 0,
     lastResult: null,
     failure: null,
   });
@@ -548,165 +727,84 @@ test('candle engine and normalized input timeframe mismatch rejects', () => {
   );
 });
 
-test('backward clock movement before activation propagates without FAILED state', () => {
-  const input = normalizedInput();
+test('clock failure after preparation skips commit and preserves retryable state', () => {
+  const input = normalizedInput(2);
   const bundle = makeBundle(input);
-  bundle.clockController.advanceTo(input.candles[0].openTime + HOUR + 1);
-  const { runner } = makeRunner(input, bundle);
+  const order = [];
+  const originalPrepare = bundle.candleEngine.prepareBoundary.bind(bundle.candleEngine);
+  const originalCommit = bundle.candleEngine.commitBoundary.bind(bundle.candleEngine);
+  bundle.candleEngine.prepareBoundary = (...args) => {
+    order.push('prepare');
+    return originalPrepare(...args);
+  };
+  bundle.candleEngine.commitBoundary = (...args) => {
+    order.push('commit');
+    return originalCommit(...args);
+  };
+  const { runner } = makeRunner(input, {
+    ...bundle,
+    clockController: {
+      advanceTo() {
+        order.push('clock');
+        throw new Error('controlled clock failure');
+      },
+    },
+  });
 
-  assert.throws(() => runQuietly(runner), /historical clock cannot move backwards/);
-  assert.equal(runner.hasNext(), true);
+  assert.throws(() => runQuietly(runner), /controlled clock failure/);
+  assert.deepEqual(order, ['prepare', 'clock']);
+  assert.equal(bundle.candleEngine.getCandles('1h').length, 0);
+  assert.equal(bundle.candleEngine.getActive('1h'), null);
   assert.deepEqual(runner.getState(), {
     status: 'READY',
     cycleCount: 0,
-    nextIndex: 0,
     lastResult: null,
     failure: null,
   });
-  assert.equal(bundle.candleEngine.getActive('1h'), null);
+  assert.equal(runner.hasNext(), true);
 });
 
-test('escaped pipeline error after activation leaves candle active and runner FAILED', () => {
-  const input = normalizedInput();
-  const bundle = makeBundle(input);
-  bundle.candleEngine.getCandles = () => {
-    throw new Error('controlled candle access failure');
-  };
-  const { runner } = makeRunner(input, bundle);
-
-  assert.throws(() => runQuietly(runner), /controlled candle access failure/);
-  const state = runner.getState();
-  assert.equal(state.status, 'FAILED');
-  assert.equal(state.cycleCount, 0);
-  assert.equal(state.nextIndex, 0);
-  assert.equal(state.failure.code, 'CYCLE_FAILED');
-  assert.equal(state.failure.index, 0);
-  assert.equal(state.failure.openTime, input.candles[0].openTime);
-  assert.equal(bundle.candleEngine.getActive('1h'), input.candles[0]);
-  assert.equal(runner.hasNext(), false);
-});
-
-test('successful finalization is followed by no clone or freeze operation', () => {
-  const { bundle, runner } = makeRunner();
-  let finalized = false;
-  const originalFinalize = bundle.candleEngine.finalizeActive.bind(bundle.candleEngine);
-  const originalClone = global.structuredClone;
-  const originalFreeze = Object.freeze;
-  bundle.candleEngine.finalizeActive = () => {
-    const result = originalFinalize();
-    finalized = true;
-    return result;
-  };
-  global.structuredClone = value => {
-    if (finalized) throw new Error('clone after finalization');
-    return originalClone(value);
-  };
-  Object.freeze = value => {
-    if (finalized) throw new Error('freeze after finalization');
-    return originalFreeze(value);
-  };
-
-  let result;
-  try {
-    result = runQuietly(runner);
-  } finally {
-    global.structuredClone = originalClone;
-    Object.freeze = originalFreeze;
-  }
-
-  assert.equal(finalized, true);
-  assert.equal(result.index, 0);
-  assert.equal(runner.getState().status, 'READY');
-});
-
-test('post-activation candleEngine.hasNext failure cannot fail a successful cycle', () => {
+test('escaped pipeline failure after commit preserves committed state and fails runner', () => {
   const input = normalizedInput(2);
   const bundle = makeBundle(input);
-  let activated = false;
-  const originalHasNext = bundle.candleEngine.hasNext.bind(bundle.candleEngine);
-  const originalNextActive = bundle.candleEngine.nextActive.bind(bundle.candleEngine);
-  bundle.candleEngine.hasNext = () => {
-    if (activated) throw new Error('post-activation hasNext failure');
-    return originalHasNext();
-  };
-  bundle.candleEngine.nextActive = () => {
-    const active = originalNextActive();
-    activated = true;
-    return active;
+  const originalGetCandles = bundle.candleEngine.getCandles.bind(bundle.candleEngine);
+  bundle.candleEngine.getCandles = () => {
+    throw new Error('controlled pipeline failure');
   };
   const { runner } = makeRunner(input, bundle);
 
-  const result = runQuietly(runner);
-  const state = runner.getState();
-
-  assert.equal(result.index, 0);
-  assert.equal(state.status, 'READY');
-  assert.equal(state.cycleCount, 1);
-  assert.equal(state.nextIndex, 1);
-  assert.equal(state.failure, null);
-  assert.equal(bundle.candleEngine.getCandles('1h').length, 1);
-});
-
-test('finalization failure preserves counters and reports actual candle state', () => {
-  const input = normalizedInput();
-  const bundle = makeBundle(input);
-  const finalizationError = new Error('controlled finalization failure');
-  const originalFinalize = bundle.candleEngine.finalizeActive.bind(bundle.candleEngine);
-  bundle.candleEngine.finalizeActive = () => {
-    originalFinalize();
-    throw finalizationError;
-  };
-  const { runner } = makeRunner(input, bundle);
-
-  assert.throws(() => runQuietly(runner), error => error === finalizationError);
+  assert.throws(() => runQuietly(runner), /controlled pipeline failure/);
   const state = runner.getState();
   assert.equal(state.status, 'FAILED');
   assert.equal(state.cycleCount, 0);
-  assert.equal(state.nextIndex, 0);
   assert.equal(state.lastResult, null);
-  assert.equal(state.failure.code, 'CYCLE_FAILED');
-  assert.equal(state.failure.message, finalizationError.message);
-  assert.equal(state.failure.openTime, input.candles[0].openTime);
-  assert.equal(bundle.candleEngine.getActive('1h'), null);
-  assert.equal(bundle.candleEngine.getCandles('1h').length, 1);
+  assert.equal(bundle.candleEngine.getActive('1h').open, input.candles[1].open);
+  assert.equal(originalGetCandles('1h').length, 1);
+  assert.equal(runner.hasNext(), false);
+  assert.throws(() => runner.runNextCycle(), error => error.code === 'RUNNER_FAILED');
 });
 
-test('final-candle exhaustion does not call external hasNext after finalization', () => {
-  const input = normalizedInput(1);
+test('post-commit exhaustion failure does not publish successful bookkeeping', () => {
+  const input = normalizedInput(2);
   const bundle = makeBundle(input);
-  let activated = false;
   const originalHasNext = bundle.candleEngine.hasNext.bind(bundle.candleEngine);
-  const originalNextActive = bundle.candleEngine.nextActive.bind(bundle.candleEngine);
+  let hasNextCalls = 0;
   bundle.candleEngine.hasNext = () => {
-    if (activated) throw new Error('post-finalization hasNext failure');
+    hasNextCalls += 1;
+    if (hasNextCalls === 2) throw new Error('controlled exhaustion check failure');
     return originalHasNext();
   };
-  bundle.candleEngine.nextActive = () => {
-    const active = originalNextActive();
-    activated = true;
-    return active;
-  };
   const { runner } = makeRunner(input, bundle);
 
-  const result = runQuietly(runner);
+  assert.throws(() => runQuietly(runner), /controlled exhaustion check failure/);
   const state = runner.getState();
-
-  assert.equal(result.index, 0);
-  assert.equal(state.status, 'EXHAUSTED');
-  assert.equal(state.cycleCount, 1);
-  assert.equal(state.nextIndex, 1);
-  assert.equal(state.failure, null);
-});
-
-test('FAILED runner refuses continuation deterministically', () => {
-  const input = normalizedInput();
-  const bundle = makeBundle(input);
-  bundle.candleEngine.getCandles = () => { throw new Error('controlled failure'); };
-  const { runner } = makeRunner(input, bundle);
-  assert.throws(() => runQuietly(runner), /controlled failure/);
-
-  assert.throws(() => runner.runNextCycle(), error => error.code === 'RUNNER_FAILED');
+  assert.equal(state.status, 'FAILED');
+  assert.equal(state.cycleCount, 0);
+  assert.equal(state.lastResult, null);
+  assert.equal(bundle.candleEngine.getCandles('1h').length, 1);
+  assert.equal(bundle.candleEngine.getActive('1h').open, input.candles[1].open);
   assert.equal(runner.hasNext(), false);
+  assert.throws(() => runner.runNextCycle(), error => error.code === 'RUNNER_FAILED');
 });
 
 test('final successful cycle sets EXHAUSTED and retains its result', () => {
@@ -718,7 +816,6 @@ test('final successful cycle sets EXHAUSTED and retains its result', () => {
 
   assert.equal(state.status, 'EXHAUSTED');
   assert.equal(state.cycleCount, 1);
-  assert.equal(state.nextIndex, 1);
   assert.equal(runner.hasNext(), false);
   assert.deepEqual(state.lastResult, result);
   assert.equal(result.openTime, input.candles[0].openTime);
