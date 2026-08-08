@@ -20,7 +20,7 @@ const REQUIRED_DEPENDENCY_METHODS = Object.freeze({
   mtfConfirmationEngine: ['evaluate'],
   advanceRiskEngine: ['evaluate', 'onTradeClosed'],
   mtfEngine: ['calculate'],
-  paperTradeEngine: ['evaluateTrades', 'onCandle', 'signal', 'open', 'closed', 'getBalance'],
+  paperTradeEngine: ['evaluateTrades', 'onCandle', 'signal', 'open', 'close', 'closed', 'getBalance'],
 });
 
 class ReplayPipelineRunnerError extends TypeError {
@@ -162,6 +162,23 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
     return status === 'READY' && queryHasNext();
   }
 
+  function settleEndOfData(boundaryTime) {
+    const candidates = dependencies.paperTradeEngine.open();
+    const context = Object.freeze({ nowMs: boundaryTime });
+
+    for (const candidate of candidates) {
+      const closedTrade = dependencies.paperTradeEngine.close(
+        candidate.tradeId,
+        'End of Data',
+        context,
+      );
+      if (!closedTrade || closedTrade.status !== 'CLOSED') {
+        fail('EOD_CLOSE_FAILED', `End-of-data close failed for trade ${candidate.tradeId}`);
+      }
+      dependencies.advanceRiskEngine.onTradeClosed(closedTrade.pnl, context);
+    }
+  }
+
   function runNextCycle() {
     if (status === 'FAILED') {
       throw new ReplayPipelineRunnerError(
@@ -258,6 +275,11 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
       const completedStatus = queryHasNext()
         ? 'READY'
         : 'EXHAUSTED';
+
+      if (completedStatus === 'EXHAUSTED') {
+        phase = 'EOD_SETTLEMENT';
+        settleEndOfData(boundaryTime);
+      }
 
       lastResult = result;
       cycleCount += 1;

@@ -438,6 +438,334 @@ test('terminal boundary uses the final close and executes exactly once', () => {
   assert.equal(runner.hasNext(), false);
 });
 
+test('final cycle with no open trades publishes EXHAUSTED without settlement calls', () => {
+  const input = normalizedInput(1);
+  const bundle = makeBundle(input);
+  const closeCalls = [];
+  const riskCalls = [];
+  const originalClose = bundle.paperTradeEngine.close.bind(bundle.paperTradeEngine);
+  const originalOnTradeClosed = bundle.advanceRiskEngine.onTradeClosed.bind(bundle.advanceRiskEngine);
+  bundle.paperTradeEngine.close = (...args) => {
+    closeCalls.push(args);
+    return originalClose(...args);
+  };
+  bundle.advanceRiskEngine.onTradeClosed = (...args) => {
+    riskCalls.push(args);
+    return originalOnTradeClosed(...args);
+  };
+  const { runner } = makeRunner(input, bundle);
+
+  try {
+    runQuietly(runner);
+  } finally {
+    bundle.paperTradeEngine.close = originalClose;
+    bundle.advanceRiskEngine.onTradeClosed = originalOnTradeClosed;
+  }
+
+  assert.deepEqual(closeCalls, []);
+  assert.deepEqual(riskCalls, []);
+  assert.equal(runner.getState().status, 'EXHAUSTED');
+  assert.equal(runner.getState().cycleCount, 1);
+});
+
+test('EOD settles a pre-existing open trade at the exact causal price and boundary time', () => {
+  const input = normalizedInput(1, '1h', candle => {
+    candle.close = 100;
+    candle.open = 100;
+    candle.high = 101;
+    candle.low = 99;
+  });
+  const bundle = makeBundle(input);
+  const opened = openPaperTrade(bundle, 100, 96, 106);
+  const closeCalls = [];
+  const riskCalls = [];
+  const originalClose = bundle.paperTradeEngine.close.bind(bundle.paperTradeEngine);
+  const originalOnTradeClosed = bundle.advanceRiskEngine.onTradeClosed.bind(bundle.advanceRiskEngine);
+  bundle.paperTradeEngine.close = (...args) => {
+    closeCalls.push(args);
+    return originalClose(...args);
+  };
+  bundle.advanceRiskEngine.onTradeClosed = (...args) => {
+    riskCalls.push(args);
+    return originalOnTradeClosed(...args);
+  };
+  const { runner } = makeRunner(input, bundle);
+  const boundaryTime = input.candles[0].openTime + HOUR;
+
+  try {
+    runQuietly(runner);
+  } finally {
+    bundle.paperTradeEngine.close = originalClose;
+    bundle.advanceRiskEngine.onTradeClosed = originalOnTradeClosed;
+  }
+
+  const closed = bundle.paperTradeEngine.closed();
+  assert.equal(closeCalls.length, 1);
+  assert.equal(closeCalls[0][0], opened.tradeId);
+  assert.equal(closeCalls[0][1], 'End of Data');
+  assert.deepEqual(closeCalls[0][2], { nowMs: boundaryTime });
+  assert.equal(closed.length, 1);
+  assert.equal(closed[0].exitPrice, input.candles[0].close);
+  assert.equal(closed[0].exitTime, new Date(boundaryTime).toISOString());
+  assert.equal(closed[0].exitReason, 'End of Data');
+  assert.equal(closed[0].pnl, 0);
+  assert.equal(riskCalls.length, 1);
+  assert.equal(riskCalls[0][0], closed[0].pnl);
+  assert.deepEqual(riskCalls[0][1], { nowMs: boundaryTime });
+  assert.equal(runner.getState().status, 'EXHAUSTED');
+});
+
+test('successful EOD settlement remains stable and executes only once', () => {
+  const input = normalizedInput(1);
+  const bundle = makeBundle(input);
+  const opened = openPaperTrade(bundle, 100, 96, 106);
+  let closeCalls = 0;
+  let riskCalls = 0;
+  const originalClose = bundle.paperTradeEngine.close.bind(bundle.paperTradeEngine);
+  const originalOnTradeClosed = bundle.advanceRiskEngine.onTradeClosed.bind(bundle.advanceRiskEngine);
+  bundle.paperTradeEngine.close = (...args) => {
+    closeCalls += 1;
+    return originalClose(...args);
+  };
+  bundle.advanceRiskEngine.onTradeClosed = (...args) => {
+    riskCalls += 1;
+    return originalOnTradeClosed(...args);
+  };
+  const { runner } = makeRunner(input, bundle);
+
+  try {
+    runQuietly(runner);
+    const firstState = runner.getState();
+    assert.equal(runner.hasNext(), false);
+    assert.equal(runner.hasNext(), false);
+    assert.throws(() => runner.runNextCycle(), error => error.code === 'NO_REMAINING_CANDLES');
+    assert.deepEqual(runner.getState(), firstState);
+  } finally {
+    bundle.paperTradeEngine.close = originalClose;
+    bundle.advanceRiskEngine.onTradeClosed = originalOnTradeClosed;
+  }
+
+  assert.equal(closeCalls, 1);
+  assert.equal(riskCalls, 1);
+  assert.equal(bundle.paperTradeEngine.getTrade(opened.tradeId).status, 'CLOSED');
+});
+
+test('final price-triggered closure is not duplicated by EOD settlement', () => {
+  const input = normalizedInput(1, '1h', candle => {
+    candle.close = 106;
+    candle.open = 106;
+    candle.high = 107;
+    candle.low = 105;
+  });
+  const bundle = makeBundle(input);
+  const opened = openPaperTrade(bundle, 100, 96, 106);
+  let closeCalls = 0;
+  const originalClose = bundle.paperTradeEngine.close.bind(bundle.paperTradeEngine);
+  bundle.paperTradeEngine.close = (...args) => {
+    closeCalls += 1;
+    return originalClose(...args);
+  };
+  const { runner } = makeRunner(input, bundle);
+
+  try {
+    runQuietly(runner);
+  } finally {
+    bundle.paperTradeEngine.close = originalClose;
+  }
+
+  const closed = bundle.paperTradeEngine.getTrade(opened.tradeId);
+  assert.equal(closeCalls, 0);
+  assert.equal(closed.exitReason, 'Take Profit');
+  assert.equal(bundle.paperTradeEngine.closed().length, 1);
+  assert.equal(runner.getState().status, 'EXHAUSTED');
+});
+
+test('final lifecycle-candle closure is not duplicated by EOD settlement', () => {
+  const input = normalizedInput(1, '1h', candle => {
+    candle.close = 100;
+    candle.open = 100;
+    candle.high = 107;
+    candle.low = 99;
+  });
+  const bundle = makeBundle(input);
+  const opened = openPaperTrade(bundle, 100, 96, 106);
+  let closeCalls = 0;
+  const originalClose = bundle.paperTradeEngine.close.bind(bundle.paperTradeEngine);
+  bundle.paperTradeEngine.close = (...args) => {
+    closeCalls += 1;
+    return originalClose(...args);
+  };
+  const { runner } = makeRunner(input, bundle);
+
+  try {
+    runQuietly(runner);
+  } finally {
+    bundle.paperTradeEngine.close = originalClose;
+  }
+
+  const closed = bundle.paperTradeEngine.getTrade(opened.tradeId);
+  assert.equal(closeCalls, 0);
+  assert.equal(closed.exitReason, 'Take Profit');
+  assert.equal(bundle.paperTradeEngine.closed().length, 1);
+  assert.equal(runner.getState().status, 'EXHAUSTED');
+});
+
+test('final-cycle signal is settled at the same price and boundary time', () => {
+  const input = normalizedInput(15);
+  const bundle = makeBundle(input);
+  prepareEligibleBundle(bundle, { allowMtf: true });
+  const { runner } = makeRunner(input, bundle);
+
+  warmupToEligibleCycle(runner, 14);
+  const result = runQuietly(runner);
+  const closed = bundle.paperTradeEngine.closed();
+  const boundaryTime = input.candles[14].openTime + HOUR;
+
+  assert.equal(result.decision.verdict.tradeOpened, true);
+  assert.equal(closed.length, 1);
+  assert.equal(closed[0].entryPrice, input.candles[14].close);
+  assert.equal(closed[0].exitPrice, input.candles[14].close);
+  assert.equal(closed[0].entryTime, new Date(boundaryTime).toISOString());
+  assert.equal(closed[0].exitTime, new Date(boundaryTime).toISOString());
+  assert.equal(closed[0].exitReason, 'End of Data');
+  assert.equal(closed[0].pnl, 0);
+  assert.deepEqual(Object.keys(result), ['index', 'openTime', 'timestamp', 'price', 'decision']);
+  assert.equal(runner.getState().status, 'EXHAUSTED');
+});
+
+test('multiple final open trades settle in insertion order with one risk notification each', () => {
+  const input = normalizedInput(1, '1h', candle => {
+    candle.close = 100;
+    candle.open = 100;
+    candle.high = 101;
+    candle.low = 99;
+  });
+  const bundle = makeBundle(input);
+  const first = openPaperTrade(bundle, 100, 96, 106);
+  const second = openPaperTrade(bundle, 100, 95, 105);
+  const closeOrder = [];
+  const riskOrder = [];
+  const originalClose = bundle.paperTradeEngine.close.bind(bundle.paperTradeEngine);
+  const originalOnTradeClosed = bundle.advanceRiskEngine.onTradeClosed.bind(bundle.advanceRiskEngine);
+  bundle.paperTradeEngine.close = (tradeId, ...args) => {
+    closeOrder.push(tradeId);
+    return originalClose(tradeId, ...args);
+  };
+  bundle.advanceRiskEngine.onTradeClosed = (pnl, context) => {
+    riskOrder.push({ pnl, context });
+    return originalOnTradeClosed(pnl, context);
+  };
+  const { runner } = makeRunner(input, bundle);
+  const boundaryTime = input.candles[0].openTime + HOUR;
+
+  try {
+    runQuietly(runner);
+  } finally {
+    bundle.paperTradeEngine.close = originalClose;
+    bundle.advanceRiskEngine.onTradeClosed = originalOnTradeClosed;
+  }
+
+  assert.deepEqual(closeOrder, [first.tradeId, second.tradeId]);
+  assert.deepEqual(riskOrder.map(({ context }) => context), [
+    { nowMs: boundaryTime },
+    { nowMs: boundaryTime },
+  ]);
+  assert.equal(riskOrder.length, 2);
+  assert.equal(bundle.paperTradeEngine.open().length, 0);
+  assert.equal(bundle.paperTradeEngine.closed().length, 2);
+  assert.ok(bundle.paperTradeEngine.closed().every(trade => (
+    trade.exitReason === 'End of Data'
+      && trade.exitPrice === input.candles[0].close
+      && trade.exitTime === new Date(boundaryTime).toISOString()
+  )));
+});
+
+test('PaperTrading close failure becomes terminal EOD_SETTLEMENT without publication or retry', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  openPaperTrade(bundle, input.candles[0].close, input.candles[0].close - 5, input.candles[0].close + 5);
+  const error = new Error('controlled EOD close failure');
+  let closeCalls = 0;
+  const originalClose = bundle.paperTradeEngine.close.bind(bundle.paperTradeEngine);
+  bundle.paperTradeEngine.close = (...args) => {
+    closeCalls += 1;
+    throw error;
+  };
+  const { runner } = makeRunner(input, bundle);
+
+  try {
+    runQuietly(runner);
+    const previous = runner.getState();
+
+    assert.throws(() => runQuietly(runner), thrown => thrown.code === 'CYCLE_FAILED');
+    const state = runner.getState();
+    assert.equal(state.status, 'FAILED');
+    assert.equal(state.cycleCount, 1);
+    assert.deepEqual(state.lastResult, previous.lastResult);
+    assert.equal(state.failure.phase, 'EOD_SETTLEMENT');
+    assert.equal(state.failure.commitConfirmed, true);
+    assert.equal(state.failure.clockAdvanced, true);
+    assert.deepEqual(Object.keys(state.failure), [
+      'code', 'message', 'phase', 'sourceIndex', 'openTime', 'boundaryTime',
+      'commitConfirmed', 'clockAdvanced', 'causeCode', 'causeName',
+    ]);
+    assert.equal(closeCalls, 1);
+    assert.throws(() => runner.runNextCycle(), thrown => thrown.code === 'RUNNER_FAILED');
+    assert.equal(closeCalls, 1);
+  } finally {
+    bundle.paperTradeEngine.close = originalClose;
+  }
+});
+
+test('risk notification failure leaves the closed trade, stops later settlement, and does not retry', () => {
+  const input = normalizedInput(1, '1h', candle => {
+    candle.close = 100;
+    candle.open = 100;
+    candle.high = 101;
+    candle.low = 99;
+  });
+  const bundle = makeBundle(input);
+  const first = openPaperTrade(bundle, 100, 96, 106);
+  const second = openPaperTrade(bundle, 100, 95, 105);
+  const closeOrder = [];
+  const riskCalls = [];
+  const originalClose = bundle.paperTradeEngine.close.bind(bundle.paperTradeEngine);
+  const originalOnTradeClosed = bundle.advanceRiskEngine.onTradeClosed.bind(bundle.advanceRiskEngine);
+  bundle.paperTradeEngine.close = (tradeId, ...args) => {
+    closeOrder.push(tradeId);
+    return originalClose(tradeId, ...args);
+  };
+  bundle.advanceRiskEngine.onTradeClosed = (pnl, context) => {
+    riskCalls.push({ pnl, context });
+    originalOnTradeClosed(pnl, context);
+    throw new Error('controlled EOD risk notification failure');
+  };
+  const { runner } = makeRunner(input, bundle);
+
+  try {
+    assert.throws(() => runQuietly(runner), thrown => thrown.code === 'CYCLE_FAILED');
+  } finally {
+    bundle.paperTradeEngine.close = originalClose;
+    bundle.advanceRiskEngine.onTradeClosed = originalOnTradeClosed;
+  }
+
+  const state = runner.getState();
+  assert.equal(state.status, 'FAILED');
+  assert.equal(state.cycleCount, 0);
+  assert.equal(state.lastResult, null);
+  assert.equal(state.failure.phase, 'EOD_SETTLEMENT');
+  assert.equal(state.failure.commitConfirmed, true);
+  assert.equal(state.failure.clockAdvanced, true);
+  assert.deepEqual(closeOrder, [first.tradeId]);
+  assert.equal(riskCalls.length, 1);
+  assert.equal(bundle.paperTradeEngine.getTrade(first.tradeId).status, 'CLOSED');
+  assert.equal(bundle.paperTradeEngine.getTrade(first.tradeId).exitReason, 'End of Data');
+  assert.equal(bundle.paperTradeEngine.getTrade(second.tradeId).status, 'ACTIVE');
+  assert.throws(() => runner.runNextCycle(), thrown => thrown.code === 'RUNNER_FAILED');
+  assert.deepEqual(closeOrder, [first.tradeId]);
+  assert.equal(riskCalls.length, 1);
+});
+
 test('consecutive replay cycles advance exactly one hour at close boundaries', () => {
   const input = normalizedInput(2);
   const { bundle, runner } = makeRunner(input);
