@@ -5,6 +5,16 @@ const express = require('express');
 
 const { createApp, createErrorHandler } = require('../../src/app');
 const { cloneFixture, validMarketSnapshot } = require('../fixtures/market');
+const {
+  REGIME_DECISION_KEYS,
+  REGIME_HISTORY_KEYS,
+  STATS_KEYS,
+  SUCCESS_KEYS,
+  SUPPORTED_TIMEFRAMES,
+  TRADE_KEYS,
+  createControlledSuccessResponse,
+  normalizeReplayResponse,
+} = require('../fixtures/replay-contract');
 
 const API_KEY = 'integration-test-key';
 const ALLOWED_ORIGIN = 'http://allowed.test';
@@ -48,6 +58,18 @@ function logger(state) {
 
 function createTestApp(state) {
   const snapshot = cloneFixture(validMarketSnapshot());
+  const candles = state.candles || [];
+  const supportedTimeframes = state.supportedTimeframes || ['1h'];
+  const defaultReplayEngine = {
+    run: () => ({
+      stats: { totalTrades: 0, winRate: 0, profitFactor: 0 },
+      calculationTime: 0,
+      trades: [],
+    }),
+  };
+  const strategyReplayEngine = Object.hasOwn(state, 'strategyReplayEngine')
+    ? state.strategyReplayEngine
+    : defaultReplayEngine;
   const deps = {
     apiManager: {
       isConnected: () => true,
@@ -66,9 +88,13 @@ function createTestApp(state) {
     },
     analyzer: { getAnalysis: () => null },
     candleEngine: {
-      getAllTimeframes: () => ['1h'],
-      getCandles: () => [],
-      getActive: () => null,
+      getAllTimeframes: () => supportedTimeframes,
+      getCandles: (timeframe, limit) => {
+        state.candleRequests = state.candleRequests || [];
+        state.candleRequests.push({ timeframe, limit });
+        return [...candles];
+      },
+      getActive: () => state.activeCandle || null,
     },
     logger: logger(state),
     config: config(state),
@@ -101,13 +127,7 @@ function createTestApp(state) {
       },
     },
     riskEngine: null,
-    strategyReplayEngine: {
-      run: () => ({
-        stats: { totalTrades: 0, winRate: 0, profitFactor: 0 },
-        calculationTime: 0,
-        trades: [],
-      }),
-    },
+    strategyReplayEngine,
     regimeEngine: null,
     regimeDecisionEngine: null,
     advanceRiskEngine: null,
@@ -189,6 +209,297 @@ async function startApp(state) {
 async function stopApp(server) {
   await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 }
+
+function replayCandle(index = 0) {
+  const openTime = Date.parse('2024-01-01T00:00:00.000Z') + index * 3600000;
+  return {
+    openTime,
+    timestamp: new Date(openTime).toISOString(),
+    open: 100 + index,
+    high: 101 + index,
+    low: 99 + index,
+    close: 100 + index,
+    volume: 1,
+  };
+}
+
+const replayHeaders = { 'x-api-key': API_KEY };
+
+function minimalReplayResult() {
+  return {
+    stats: { totalTrades: 0, winRate: 0, profitFactor: 0 },
+    calculationTime: 0,
+    trades: [],
+  };
+}
+
+test('replay GET returns the controlled legacy contract without an envelope and POST remains non-contract', async () => {
+  const state = {
+    candles: [replayCandle()],
+    strategyReplayEngine: { run: () => createControlledSuccessResponse() },
+  };
+  const server = await startApp(state);
+
+  try {
+    const getResult = await request(server, {
+      path: '/api/strategy/replay',
+      headers: replayHeaders,
+    });
+    assert.equal(getResult.statusCode, 200);
+
+    const body = getResult.json();
+    assert.deepEqual(Object.keys(body), SUCCESS_KEYS);
+    assert.deepEqual(normalizeReplayResponse(body), normalizeReplayResponse(createControlledSuccessResponse()));
+    assert.equal(body.engineVersion, '1.0.0');
+    assert.equal(body.dataSource, 'Historical OHLCV candles (strategy replay)');
+    assert.deepEqual(Object.keys(body.trades[0]), TRADE_KEYS);
+    assert.deepEqual(Object.keys(body.trades[0].regimeDecision), REGIME_DECISION_KEYS);
+    assert.deepEqual(Object.keys(body.regimeHistory[0]), REGIME_HISTORY_KEYS);
+    assert.deepEqual(Object.keys(body.stats), STATS_KEYS);
+
+    const postResult = await request(server, {
+      method: 'POST',
+      path: '/api/strategy/replay',
+      headers: replayHeaders,
+    });
+    assert.equal(postResult.statusCode, 404);
+    assert.match(postResult.text, /Cannot POST \/api\/strategy\/replay/);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('replay query contract applies defaults, lowercasing, validation, and live-source invariance', async () => {
+  const state = {
+    candles: [replayCandle()],
+    supportedTimeframes: SUPPORTED_TIMEFRAMES,
+    strategyReplayEngine: {
+      run(candles, timeframe) {
+        state.replayCalls = state.replayCalls || [];
+        state.replayCalls.push({ count: candles.length, timeframe });
+        return minimalReplayResult();
+      },
+    },
+  };
+  const server = await startApp(state);
+
+  try {
+    for (const [path, expectedTimeframe] of [
+      ['/api/strategy/replay', '1h'],
+      ['/api/strategy/replay?timeframe=1h', '1h'],
+      ['/api/strategy/replay?timeframe=1H', '1h'],
+      ['/api/strategy/replay?timeframe=5M', '5m'],
+    ]) {
+      const result = await request(server, { path, headers: replayHeaders });
+      assert.equal(result.statusCode, 200);
+      assert.equal(state.replayCalls.at(-1).timeframe, expectedTimeframe);
+    }
+
+    const invalid = await request(server, {
+      path: '/api/strategy/replay?timeframe=2h',
+      headers: replayHeaders,
+    });
+    assert.equal(invalid.statusCode, 400);
+    assert.deepEqual(invalid.json(), {
+      error: 'Invalid timeframe',
+      supported: SUPPORTED_TIMEFRAMES,
+    });
+
+    const callsBeforeDays = state.replayCalls.length;
+    for (const days of ['0', '-5', 'abc', '999999']) {
+      const result = await request(server, {
+        path: `/api/strategy/replay?days=${days}`,
+        headers: replayHeaders,
+      });
+      assert.equal(result.statusCode, 200);
+    }
+    assert.equal(state.replayCalls.length, callsBeforeDays + 4);
+    assert.deepEqual(state.replayCalls.slice(-4), [
+      { count: 1, timeframe: '1h' },
+      { count: 1, timeframe: '1h' },
+      { count: 1, timeframe: '1h' },
+      { count: 1, timeframe: '1h' },
+    ]);
+    assert.ok(state.candleRequests.every(({ limit }) => limit === 500));
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('replay live source excludes the active candle, requests 500, and skips fallback', async () => {
+  const candles = Array.from({ length: 501 }, (_, index) => replayCandle(index));
+  const state = {
+    candles,
+    activeCandle: candles.at(-1),
+    strategyReplayEngine: {
+      run(input) {
+        state.replayInput = input;
+        return minimalReplayResult();
+      },
+    },
+  };
+  const server = await startApp(state);
+
+  try {
+    const result = await withFetchMock(async () => {
+      throw new Error('fallback must not be called');
+    }, () => request(server, {
+      path: '/api/strategy/replay?days=999999',
+      headers: replayHeaders,
+    }));
+
+    assert.equal(result.statusCode, 200);
+    assert.deepEqual(state.candleRequests, [{ timeframe: '1h', limit: 500 }]);
+    assert.equal(state.replayInput.length, 500);
+    assert.notEqual(state.replayInput.at(-1).openTime, state.activeCandle.openTime);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('replay fallback normalizes days, maps OHLC, and sets volume to zero', async () => {
+  const state = {
+    strategyReplayEngine: {
+      run(candles, timeframe) {
+        state.replayInput = candles;
+        state.replayTimeframe = timeframe;
+        return minimalReplayResult();
+      },
+    },
+  };
+  const urls = [];
+  const server = await startApp(state);
+
+  try {
+    await withFetchMock(async url => {
+      urls.push(url);
+      return {
+        ok: true,
+        async json() {
+          return [[1704067200000, 100, 105, 95, 102]];
+        },
+      };
+    }, async () => {
+      for (const days of [undefined, '0', '-5', 'abc', '999999']) {
+        const query = days === undefined ? '' : `?days=${days}`;
+        const result = await request(server, {
+          path: `/api/strategy/replay${query}`,
+          headers: replayHeaders,
+        });
+        assert.equal(result.statusCode, 200);
+        assert.equal(state.replayInput[0].open, 100);
+        assert.equal(state.replayInput[0].high, 105);
+        assert.equal(state.replayInput[0].low, 95);
+        assert.equal(state.replayInput[0].close, 102);
+        assert.equal(state.replayInput[0].volume, 0);
+        assert.equal(state.replayTimeframe, '1h');
+      }
+    });
+  } finally {
+    await stopApp(server);
+  }
+
+  assert.deepEqual(urls.map(url => new URL(url).searchParams.get('days')), [
+    '30', '30', '30', '30', '10000',
+  ]);
+});
+
+test('replay fallback with no rows returns the exact 404 contract', async () => {
+  const server = await startApp({});
+
+  try {
+    const result = await withFetchMock(async () => ({
+      ok: true,
+      async json() { return []; },
+    }), () => request(server, {
+      path: '/api/strategy/replay',
+      headers: replayHeaders,
+    }));
+
+    assert.equal(result.statusCode, 404);
+    assert.deepEqual(result.json(), { error: 'No candle data available for replay' });
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('replay engine unavailable returns the exact 503 contract', async () => {
+  const server = await startApp({ strategyReplayEngine: null });
+
+  try {
+    const result = await request(server, {
+      path: '/api/strategy/replay',
+      headers: replayHeaders,
+    });
+
+    assert.equal(result.statusCode, 503);
+    assert.deepEqual(result.json(), { error: 'Strategy replay engine not available' });
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('replay runtime failures remain generic and are logged without leakage', async () => {
+  const state = {
+    candles: [replayCandle()],
+    strategyReplayEngine: {
+      run() {
+        throw new Error('secret replay failure /internal/path');
+      },
+    },
+  };
+  const server = await startApp(state);
+
+  try {
+    const result = await request(server, {
+      path: '/api/strategy/replay',
+      headers: replayHeaders,
+    });
+
+    assert.equal(result.statusCode, 500);
+    assert.deepEqual(result.json(), { error: 'Internal server error' });
+    assert.equal(result.text.includes('secret replay failure'), false);
+    assert.equal(result.text.includes('/internal/path'), false);
+    assert.equal(result.text.includes('Error:'), false);
+    assert.ok(state.errors.some(entry => (
+      entry.module === 'ErrorBoundary'
+        && entry.data.path === '/api/strategy/replay'
+        && entry.data.status === 500
+        && entry.data.category === 'unhandled'
+    )));
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('replay authentication preserves missing and invalid API-key contracts', async () => {
+  const missingServer = await startApp({});
+  try {
+    const result = await request(missingServer, { path: '/api/strategy/replay' });
+    assert.equal(result.statusCode, 401);
+    assert.deepEqual(result.json(), {
+      error: 'Authentication required',
+      message: 'Missing X-API-Key header',
+    });
+  } finally {
+    await stopApp(missingServer);
+  }
+
+  const invalidServer = await startApp({});
+  try {
+    const result = await request(invalidServer, {
+      path: '/api/strategy/replay',
+      headers: { 'x-api-key': 'wrong-key' },
+    });
+    assert.equal(result.statusCode, 401);
+    assert.deepEqual(result.json(), {
+      error: 'Authentication required',
+      message: 'Invalid API key',
+    });
+  } finally {
+    await stopApp(invalidServer);
+  }
+});
 
 test('real Express app serves an allowed health endpoint without authentication', async () => {
   const server = await startApp({});

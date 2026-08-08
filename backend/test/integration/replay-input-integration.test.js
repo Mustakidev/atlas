@@ -7,6 +7,13 @@ const { AdvanceRiskEngine } = require('../../src/engine/advanceRisk');
 const { MTFConfirmationEngine } = require('../../src/engine/mtfConfirmation');
 const { PaperTradingEngine } = require('../../src/engine/paperTrading');
 const { ReplayInputError } = require('../../src/engine/replayInput');
+const {
+  EMPTY_RESULT_KEYS,
+  REGIME_HISTORY_KEYS,
+  REJECTION_KEYS,
+  STATS_KEYS,
+  SUCCESS_KEYS,
+} = require('../fixtures/replay-contract');
 
 const logger = { info() {}, warn() {}, error() {} };
 const config = {
@@ -302,3 +309,90 @@ test('repeated identical valid runs remain deterministic', () => {
 
   assert.deepEqual(stable(second), stable(first));
 });
+
+test('actual legacy 50-candle result preserves the empty response contract', () => {
+  const candles = makeCandles(50);
+  assert.equal(candles.length, 50);
+
+  // The legacy _emptyResult contract reports totalCandles as 0 even when a
+  // nonempty sub-warmup candle array was supplied. CBP-4D0 intentionally
+  // freezes this existing public behavior; it is not being corrected here.
+  const result = runQuietly(createReplay(), candles, '1h');
+
+  assert.deepEqual(Object.keys(result), EMPTY_RESULT_KEYS);
+  assert.equal(result.totalCandles, 0);
+  assert.equal(result.candlesAnalyzed, 0);
+  assert.equal(result.warmup, 50);
+  assert.deepEqual(result.trades, []);
+  assert.deepEqual(result.rejections, []);
+  assert.equal(Object.hasOwn(result, 'regimeHistory'), false);
+  assert.equal(result.reason, 'Insufficient candles (50/51 minimum)');
+  assert.equal(result.engineVersion, '1.0.0');
+  assert.equal(result.dataSource, 'Historical OHLCV candles (strategy replay)');
+  assert.equal(Number.isNaN(Date.parse(result.lastUpdated)), false);
+  assert.equal(Number.isFinite(result.calculationTime), true);
+  assert.deepEqual(Object.keys(result.stats), STATS_KEYS.filter(key => key !== 'regime'));
+  assert.equal(Object.hasOwn(result.stats, 'regime'), false);
+});
+
+// Future canonical replay compatibility must preserve totalCandles: 0 here,
+// or obtain explicit architecture/API approval for an intentional behavioral
+// change before altering this legacy contract.
+
+test('actual legacy 51-candle result preserves warmup, MTF rejection, regime history, and zero-trade stats', () => {
+  const result = runQuietly(createReplay(), makeCandles(51), '1h');
+
+  assert.deepEqual(Object.keys(result), SUCCESS_KEYS);
+  assert.equal(result.totalCandles, 51);
+  assert.equal(result.warmup, 50);
+  assert.equal(result.candlesAnalyzed, 1);
+  assert.deepEqual(result.trades, []);
+  assert.equal(result.rejections.length, 1);
+  assert.deepEqual(Object.keys(result.rejections[0]), REJECTION_KEYS);
+  assert.deepEqual(result.rejections[0], {
+    timestamp: '2024-01-01T00:50:00.000Z',
+    reason: 'MTF Confirmation: MTF Confirmation: blocked by 15m=Ranging',
+    score: 81,
+    bias: 'Bullish',
+    direction: 'BUY',
+  });
+
+  assert.equal(result.regimeHistory.length, 1);
+  assert.deepEqual(Object.keys(result.regimeHistory[0]), REGIME_HISTORY_KEYS);
+  assert.deepEqual(result.regimeHistory[0], {
+    timestamp: '2024-01-01T00:50:00.000Z',
+    regime: 'UNKNOWN',
+    confidence: 0,
+    trendScore: null,
+    rangeScore: 44,
+    volatility: 'NORMAL',
+  });
+
+  assert.deepEqual(Object.keys(result.stats), STATS_KEYS);
+  assert.deepEqual(result.stats, {
+    totalTrades: 0,
+    wins: 0,
+    losses: 0,
+    winRate: 0,
+    profitFactor: 0,
+    expectancy: 0,
+    averageR: 0,
+    maxDrawdown: 0,
+    maxDrawdownPct: 0,
+    grossProfit: 0,
+    grossLoss: 0,
+    netPnl: 0,
+    longs: { total: 0, wins: 0, losses: 0, winRate: 0, avgR: 0 },
+    shorts: { total: 0, wins: 0, losses: 0, winRate: 0, avgR: 0 },
+    maxConsecutiveWins: 0,
+    maxConsecutiveLosses: 0,
+    averageDuration: 0,
+    totalRejections: 1,
+    rejectionBreakdown: { 'MTF Confirmation': 1 },
+    regime: { byRegime: {}, winRateByRegime: {} },
+  });
+});
+
+// CBP-4D0 does not freeze an actual legacy trade semantic golden because no
+// deterministic natural trade fixture was reproducible without modifying
+// trading internals. The controlled route fixture covers public shape only.
