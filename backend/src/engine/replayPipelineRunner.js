@@ -4,7 +4,7 @@ const { createExecutionPipeline } = require('../core/executionPipeline');
 const PRIMARY_CANDLE_DURATION_MS = 3_600_000;
 
 const REQUIRED_DEPENDENCY_METHODS = Object.freeze({
-  candleEngine: ['hasNext', 'nextActive', 'getActive', 'getCandles', 'finalizeActive'],
+  candleEngine: ['hasNext', 'prepareBoundary', 'commitBoundary', 'getActive', 'getCandles'],
   clockController: ['advanceTo'],
   config: ['get'],
   logger: ['info', 'warn', 'error'],
@@ -131,14 +131,11 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
   const executionPipeline = createExecutionPipeline(dependencies);
   let status = 'READY';
   let cycleCount = 0;
-  let nextIndex = 0;
   let lastResult = null;
   let failure = null;
 
   function hasNext() {
-    return status === 'READY'
-      && nextIndex < normalizedInput.candles.length
-      && dependencies.candleEngine.hasNext();
+    return status === 'READY' && dependencies.candleEngine.hasNext();
   }
 
   function runNextCycle() {
@@ -153,9 +150,9 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
       throw new ReplayPipelineRunnerError('NO_REMAINING_CANDLES', 'No remaining replay candles');
     }
 
-    const index = nextIndex;
+    const index = cycleCount;
     const expectedCandle = normalizedInput.candles[index];
-    let activeCandle = null;
+    let boundaryCommitted = false;
 
     try {
       const closeTime = assertTimestamp(
@@ -164,16 +161,25 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
       );
       const closeTimestamp = new Date(closeTime).toISOString();
 
+      const plan = dependencies.candleEngine.prepareBoundary({ boundaryTime: closeTime });
       dependencies.clockController.advanceTo(closeTime);
-      activeCandle = dependencies.candleEngine.nextActive();
+      const transition = dependencies.candleEngine.commitBoundary(plan);
+      boundaryCommitted = true;
 
-      if (activeCandle !== expectedCandle || activeCandle.openTime !== expectedCandle.openTime) {
-        fail('CANDLE_MISMATCH', `Activated candle does not match normalizedInput.candles[${index}]`);
+      if (transition.sourceIndex !== index || transition.lifecycleCandle !== expectedCandle) {
+        fail('CANDLE_MISMATCH', `Committed candle does not match normalizedInput.candles[${index}]`);
       }
 
-      executionPipeline.run({
-        price: expectedCandle.close,
+      const price = transition.active === null
+        ? expectedCandle.close
+        : transition.active.open;
+      const snapshot = {
+        price,
         timestamp: closeTimestamp,
+      };
+
+      executionPipeline.run(snapshot, {
+        lifecycleCandle: transition.lifecycleCandle,
       });
 
       const decision = executionPipeline.getLastDecision();
@@ -184,24 +190,21 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
         index,
         openTime: expectedCandle.openTime,
         timestamp: closeTimestamp,
-        price: expectedCandle.close,
+        price,
         decision: frozenDecision,
       });
-      const completedNextIndex = index + 1;
-      const completedStatus = completedNextIndex >= normalizedInput.candles.length
-        ? 'EXHAUSTED'
-        : 'READY';
 
-      dependencies.candleEngine.finalizeActive();
+      const completedStatus = dependencies.candleEngine.hasNext()
+        ? 'READY'
+        : 'EXHAUSTED';
 
       lastResult = result;
-      nextIndex = completedNextIndex;
       cycleCount += 1;
       status = completedStatus;
 
       return result;
     } catch (error) {
-      if (activeCandle !== null) {
+      if (boundaryCommitted) {
         failure = Object.freeze(failureDetails(error, index, expectedCandle.openTime));
         status = 'FAILED';
       }
@@ -213,7 +216,6 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
     return cloneAndFreeze({
       status,
       cycleCount,
-      nextIndex,
       lastResult: lastResult === null ? null : cloneAndFreeze(lastResult),
       failure: failure === null ? null : cloneAndFreeze(failure),
     });
