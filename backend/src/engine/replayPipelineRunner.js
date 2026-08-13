@@ -12,6 +12,7 @@ const REQUIRED_DEPENDENCY_METHODS = Object.freeze({
   confluenceEngine: ['calculate'],
   atrEngine: ['calculate'],
   analyzer: ['getAnalysis'],
+  replayAnalyzerOrchestrator: ['runForBoundary'],
   structureEngine: ['calculate'],
   indicatorRegistry: ['get'],
   macdEngine: ['calculate'],
@@ -251,6 +252,7 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
       };
 
       phase = 'PIPELINE';
+      dependencies.replayAnalyzerOrchestrator.runForBoundary(boundaryTime);
       executionPipeline.run(snapshot, {
         lifecycleCandle: transition.lifecycleCandle,
       });

@@ -13,12 +13,15 @@ const { MTFConfirmationEngine } = require('./mtfConfirmation');
 const { MTFEngine } = require('./mtf');
 const { PaperTradingEngine } = require('./paperTrading');
 const { AdvanceRiskEngine } = require('./advanceRisk');
+const { createReplayAnalyzerHistory } = require('./replayAnalyzerHistory');
+const { createReplayAnalyzerOrchestrator } = require('./replayAnalyzerOrchestrator');
 
 // Confluence is the only graph engine that reads config at runtime. SYMBOL reads in
 // Confluence and MTF are unreachable because this factory requires an explicit symbol.
 const SNAPSHOTTED_CONFIG_KEYS = Object.freeze([
   'CONFLUENCE_BULLISH_THRESHOLD',
   'CONFLUENCE_BEARISH_THRESHOLD',
+  'MAX_HISTORY',
 ]);
 
 const SESSION_NAMES = Object.freeze(['ASIAN', 'LONDON', 'NEW_YORK']);
@@ -232,6 +235,7 @@ function createReplayDependencies({
   symbol,
   config,
   normalizedInput,
+  analyzerInput,
   riskPolicySource,
   clock,
 } = {}) {
@@ -241,11 +245,15 @@ function createReplayDependencies({
   assertLogger(logger);
   assertConfig(config);
   assertNormalizedInput(normalizedInput);
+  if (analyzerInput === undefined) {
+    throw new TypeError('analyzerInput is required');
+  }
   assertRiskPolicySource(riskPolicySource);
 
   const riskPolicy = readRiskPolicy(riskPolicySource);
   const replayLogger = createReplayLogger();
   const replayConfig = createConfigSnapshot(config);
+  const maxHistory = replayConfig.get('MAX_HISTORY');
   const { clockView: replayClock, controller: clockController } = createRunLocalHistoricalClock(
     clock,
     normalizedInput.candles[0].openTime,
@@ -256,6 +264,13 @@ function createReplayDependencies({
   });
   const indicatorRegistry = createIndicatorRegistry(symbol);
   const analyzer = new MarketAnalyzer(replayLogger, symbol);
+  const analyzerHistory = createReplayAnalyzerHistory(analyzerInput, { symbol, maxHistory });
+  const replayAnalyzerOrchestrator = createReplayAnalyzerOrchestrator({
+    source: analyzerInput,
+    history: analyzerHistory,
+    analyzer,
+    symbol,
+  });
   const structureEngine = new StructureEngine(replayLogger, symbol);
   const atrEngine = new ATREngine({ candleEngine, logger: replayLogger, symbol });
   const macdEngine = new MACDEngine({ candleEngine, logger: replayLogger, symbol });
@@ -313,6 +328,8 @@ function createReplayDependencies({
     candleEngine,
     indicatorRegistry,
     analyzer,
+    analyzerHistory,
+    replayAnalyzerOrchestrator,
     structureEngine,
     atrEngine,
     macdEngine,
