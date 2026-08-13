@@ -7,6 +7,7 @@ const { AdvanceRiskEngine } = require('../../src/engine/advanceRisk');
 const { MTFEngine } = require('../../src/engine/mtf');
 const { MTFConfirmationEngine } = require('../../src/engine/mtfConfirmation');
 const { PaperTradingEngine } = require('../../src/engine/paperTrading');
+const { normalizeReplayAnalyzerInput } = require('../../src/engine/replayAnalyzerInput');
 
 const BASE_TIME = Date.parse('2024-01-01T00:00:00.000Z');
 const logger = { info() {}, warn() {}, error() {}, system() {} };
@@ -16,6 +17,7 @@ function makeConfig() {
     SYMBOL: 'LIVE-SYMBOL',
     CONFLUENCE_BULLISH_THRESHOLD: 65,
     CONFLUENCE_BEARISH_THRESHOLD: undefined,
+    MAX_HISTORY: 500,
     UNDEFINED_VALUE: undefined,
   };
   return {
@@ -23,6 +25,20 @@ function makeConfig() {
     get(key) { return this.values[key]; },
     set(key, value) { this.values[key] = value; },
   };
+}
+
+function makeAnalyzerInput(symbol = 'BTCUSDT') {
+  const snapshots = Array.from({ length: 3 }, (_, index) => ({
+    timestamp: new Date(BASE_TIME + index * 60000).toISOString(),
+    price: 100 + index,
+    volume: 1000 + index,
+    change24h: index,
+  }));
+  return normalizeReplayAnalyzerInput({
+    schemaVersion: 1,
+    symbol,
+    snapshots,
+  });
 }
 
 function makeInput(count = 52, startTime = BASE_TIME) {
@@ -69,6 +85,7 @@ function makeBundle(overrides = {}) {
     symbol: 'BTCUSDT',
     config: makeConfig(),
     normalizedInput: makeInput(),
+    analyzerInput: makeAnalyzerInput(),
     clock: makeClock(),
     ...overrides,
   });
@@ -90,7 +107,8 @@ function openTrade(engine) {
 test('returns the complete replay-local dependency bundle and freezes only the bundle', () => {
   const bundle = makeBundle();
   const keys = [
-    'candleEngine', 'indicatorRegistry', 'analyzer', 'structureEngine', 'atrEngine',
+    'candleEngine', 'indicatorRegistry', 'analyzer', 'analyzerHistory',
+    'replayAnalyzerOrchestrator', 'structureEngine', 'atrEngine',
     'macdEngine', 'bollingerEngine', 'confluenceEngine', 'regimeEngine',
     'regimeDecisionEngine', 'mtfConfirmationEngine', 'mtfEngine', 'paperTradeEngine',
     'advanceRiskEngine', 'logger', 'config', 'symbol', 'clock', 'clockController',
@@ -112,6 +130,7 @@ test('every mutable dependency is fresh across factory calls', () => {
   const second = makeBundle();
   const mutableKeys = [
     'candleEngine', 'indicatorRegistry', 'analyzer', 'structureEngine', 'atrEngine',
+    'analyzerHistory', 'replayAnalyzerOrchestrator',
     'macdEngine', 'bollingerEngine', 'confluenceEngine', 'regimeEngine',
     'regimeDecisionEngine', 'mtfConfirmationEngine', 'mtfEngine', 'paperTradeEngine',
     'advanceRiskEngine', 'logger', 'config', 'clock', 'clockController',
@@ -123,6 +142,8 @@ test('every mutable dependency is fresh across factory calls', () => {
   assert.strictEqual(first.regimeEngine.atrEngine, first.atrEngine);
   assert.strictEqual(first.mtfEngine.confluenceEngine, first.confluenceEngine);
   assert.strictEqual(first.advanceRiskEngine.paperTradeEngine, first.paperTradeEngine);
+  assert.notStrictEqual(first.analyzerHistory, second.analyzerHistory);
+  assert.notStrictEqual(first.replayAnalyzerOrchestrator, second.replayAnalyzerOrchestrator);
 });
 
 test('same normalized input supports independent candle, paper, risk, MTF, and registry state', () => {
@@ -206,6 +227,39 @@ test('config is snapshotted, read-only, and preserves undefined values', () => {
   assert.equal(bundle.config.get('SYMBOL'), undefined);
   assert.equal(typeof bundle.config.set, 'undefined');
   assert.equal(Object.isFrozen(bundle.config), true);
+});
+
+test('constructs the A2/A3-1 graph around one analyzer and captures MAX_HISTORY', () => {
+  const config = makeConfig();
+  config.set('MAX_HISTORY', 2);
+  const reads = [];
+  const originalGet = config.get.bind(config);
+  config.get = key => {
+    reads.push(key);
+    return originalGet(key);
+  };
+  const analyzerInput = makeAnalyzerInput();
+  const bundle = makeBundle({ config, analyzerInput });
+
+  assert.equal(reads.filter(key => key === 'MAX_HISTORY').length, 1);
+  assert.strictEqual(bundle.confluenceEngine.analyzer, bundle.analyzer);
+  assert.strictEqual(bundle.regimeEngine.analyzer, bundle.analyzer);
+  assert.strictEqual(bundle.mtfEngine.analyzer, bundle.analyzer);
+  bundle.replayAnalyzerOrchestrator.runForBoundary(BASE_TIME + 60000);
+  assert.equal(bundle.analyzer.getAnalysis().price, 101);
+  assert.deepEqual(bundle.analyzerHistory.all(), analyzerInput.snapshots.slice(0, 2));
+  config.set('MAX_HISTORY', 1);
+  bundle.replayAnalyzerOrchestrator.runForBoundary(BASE_TIME + 120000);
+  assert.equal(bundle.analyzerHistory.all().length, 2);
+  assert.deepEqual(bundle.analyzerHistory.all(), analyzerInput.snapshots.slice(1));
+  assert.equal(reads.filter(key => key === 'MAX_HISTORY').length, 1);
+});
+
+test('rejects analyzer input symbol mismatch without coercion', () => {
+  assert.throws(
+    () => makeBundle({ analyzerInput: makeAnalyzerInput('btcusdt') }),
+    /symbol must match normalizedInput\.symbol/,
+  );
 });
 
 test('logger facade is run-local and does not mutate the supplied logger', () => {
@@ -494,12 +548,14 @@ test('invalid inputs reject deterministically', () => {
     symbol: 'BTCUSDT',
     config: makeConfig(),
     normalizedInput: makeInput(),
+    analyzerInput: makeAnalyzerInput(),
     clock: makeClock(),
   };
   const cases = [
     [{ ...valid, symbol: '' }, /symbol must be a non-empty string/],
     [{ ...valid, logger: null }, /logger must be an object/],
     [{ ...valid, config: {} }, /config\.get must be a function/],
+    [{ ...valid, analyzerInput: makeAnalyzerInput('btcusdt') }, /symbol must match normalizedInput\.symbol/],
     [{ ...valid, normalizedInput: { schemaVersion: 2, timeframe: '1h', candles: valid.normalizedInput.candles } }, /schemaVersion must be 1/],
     [{ ...valid, normalizedInput: { schemaVersion: 1, timeframe: '1h', candles: valid.normalizedInput.candles.slice() } }, /frozen array/],
     [{ ...valid, clock: { nowMs() {} } }, /clock\.monotonicMs must be a function/],
