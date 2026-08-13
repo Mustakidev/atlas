@@ -5,6 +5,8 @@ const { createReplayDependencies } = require('../../src/engine/replayDependencie
 const { CandleEngine } = require('../../src/engine/candles');
 const { normalizeReplayInput } = require('../../src/engine/replayInput');
 const { normalizeReplayAnalyzerInput } = require('../../src/engine/replayAnalyzerInput');
+const { createReplayAnalyzerHistory } = require('../../src/engine/replayAnalyzerHistory');
+const { createReplayAnalyzerOrchestrator } = require('../../src/engine/replayAnalyzerOrchestrator');
 const executionPipelineModule = require('../../src/core/executionPipeline');
 
 const pipelineSnapshots = [];
@@ -298,15 +300,13 @@ test('first cycle advances the historical clock to the candle close boundary', (
   assert.equal(pipelineSnapshots[pipelineSnapshots.length - 1].timestamp, closeTimestamp);
 });
 
-test('transactional cycle order is prepare, clock, commit, then pipeline', () => {
+test('committed-cycle order is prepare, clock, commit, validation, snapshot, orchestration, then pipeline', () => {
   const input = normalizedInput(2);
   const bundle = makeBundle(input);
   const order = [];
   const originalPrepare = bundle.candleEngine.prepareBoundary.bind(bundle.candleEngine);
   const originalAdvance = bundle.clockController.advanceTo.bind(bundle.clockController);
   const originalCommit = bundle.candleEngine.commitBoundary.bind(bundle.candleEngine);
-  const originalRun = bundle.candleEngine.getCandles.bind(bundle.candleEngine);
-  const originalAnalyze = bundle.analyzer.analyze.bind(bundle.analyzer);
 
   bundle.candleEngine.prepareBoundary = (...args) => {
     order.push('prepare');
@@ -314,15 +314,30 @@ test('transactional cycle order is prepare, clock, commit, then pipeline', () =>
   };
   bundle.candleEngine.commitBoundary = (...args) => {
     order.push('commit');
-    return originalCommit(...args);
+    const transition = originalCommit(...args);
+    let snapshotObserved = false;
+    return new Proxy(transition, {
+      get(target, property, receiver) {
+        if (property === 'sourceIndex' || property === 'lifecycleCandle') {
+          order.push('transition-validation');
+        }
+        if (property === 'active' && !snapshotObserved) {
+          snapshotObserved = true;
+          order.push('snapshot');
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
   };
-  bundle.candleEngine.getCandles = (...args) => {
-    order.push('pipeline-read');
-    return originalRun(...args);
-  };
-  bundle.analyzer.analyze = (...args) => {
-    order.push('analyzer');
-    return originalAnalyze(...args);
+  const orchestrator = bundle.replayAnalyzerOrchestrator;
+  const dependencies = {
+    ...bundle,
+    replayAnalyzerOrchestrator: {
+      runForBoundary(boundaryTime) {
+        order.push('orchestration');
+        return orchestrator.runForBoundary(boundaryTime);
+      },
+    },
   };
   const orderedClockController = {
     advanceTo(...args) {
@@ -330,11 +345,28 @@ test('transactional cycle order is prepare, clock, commit, then pipeline', () =>
       return originalAdvance(...args);
     },
   };
-  const { runner } = makeRunner(input, { ...bundle, clockController: orderedClockController });
+  dependencies.clockController = orderedClockController;
+  const { runner } = makeRunnerWithPipelineHook(input, dependencies, pipeline => {
+    const originalRun = pipeline.run.bind(pipeline);
+    pipeline.run = (...args) => {
+      order.push('pipeline');
+      return originalRun(...args);
+    };
+  });
 
   runQuietly(runner);
 
-  assert.deepEqual(order.slice(0, 5), ['prepare', 'clock', 'commit', 'analyzer', 'pipeline-read']);
+  assert.deepEqual(order.slice(0, 7), [
+    'prepare',
+    'clock',
+    'commit',
+    'transition-validation',
+    'transition-validation',
+    'snapshot',
+    'orchestration',
+  ]);
+  assert.equal(order.indexOf('commit') < order.indexOf('orchestration'), true);
+  assert.equal(order.indexOf('orchestration') < order.indexOf('pipeline'), true);
 });
 
 test('analyzer runs after commit and pipeline observes its causal analysis', () => {
@@ -354,11 +386,23 @@ test('analyzer runs after commit and pipeline observes its causal analysis', () 
   };
   const { runner } = makeRunner(input, bundle);
   for (let index = 0; index < 15; index++) runQuietly(runner);
+  const pipelineCallIndex = pipelineSnapshots.length;
   const finalResult = runQuietly(runner);
-  assert.equal(finalResult.timestamp, new Date(boundaryTime).toISOString());
+  const eventTime = BASE_TIME + 120_000;
+  const eventTimestamp = new Date(eventTime).toISOString();
+  const boundaryTimestamp = new Date(boundaryTime).toISOString();
+
+  assert.equal(eventTime < boundaryTime, true);
+  assert.equal(bundle.analyzerHistory.getEventTimestamp(), eventTime);
+  assert.equal(bundle.analyzer.getAnalysis().timestamp, eventTimestamp);
+  assert.equal(pipelineSnapshots[pipelineCallIndex].timestamp, boundaryTimestamp);
+  assert.equal(finalResult.decision.timestamp, boundaryTimestamp);
+  assert.equal(finalResult.timestamp, boundaryTimestamp);
+  assert.equal(bundle.clock.nowMs(), boundaryTime);
   assert.equal(finalResult.decision.engines.trend.price, 125);
-  assert.equal(finalResult.decision.engines.trend.timestamp, new Date(BASE_TIME + 120_000).toISOString());
-  assert.equal(bundle.analyzerHistory.getEventTimestamp(), BASE_TIME + 120_000);
+  assert.equal(finalResult.decision.engines.trend.timestamp, eventTimestamp);
+  assert.ok(bundle.analyzer.getAnalysis());
+  assert.deepEqual(finalResult.decision.engines.trend, bundle.analyzer.getAnalysis());
   assert.equal(order.length, 16);
   assert.equal(finalResult.timestamp, new Date(boundaryTime).toISOString());
 });
@@ -382,6 +426,25 @@ test('future analyzer events are excluded and pipeline remains at the replay bou
   assert.equal(result.decision.timestamp, new Date(boundaryTime).toISOString());
 });
 
+test('runner-level no-look-ahead uses event A at T minus 1ms and excludes event B at T plus 1ms', () => {
+  const input = normalizedInput(1);
+  const boundaryTime = BASE_TIME + HOUR;
+  const eventA = analyzerSnapshot(boundaryTime - 1, 111);
+  const eventB = analyzerSnapshot(boundaryTime + 1, 999);
+  const bundle = makeBundle(input, [eventA, eventB]);
+  const pipelineCall = pipelineCalls.length;
+  const { runner } = makeRunner(input, bundle);
+
+  const result = runQuietly(runner);
+
+  assert.equal(bundle.analyzerHistory.getEventTimestamp(), boundaryTime - 1);
+  assert.deepEqual(bundle.analyzerHistory.all(), [eventA]);
+  assert.equal(bundle.analyzerHistory.all().includes(eventB), false);
+  assert.equal(pipelineSnapshots[pipelineCall].timestamp, new Date(boundaryTime).toISOString());
+  assert.equal(result.timestamp, new Date(boundaryTime).toISOString());
+  assert.equal(runner.getState().status, 'EXHAUSTED');
+});
+
 test('multiple causal analyzer events are consumed once before one analysis', () => {
   const input = normalizedInput(16);
   const events = [
@@ -403,6 +466,8 @@ test('multiple causal analyzer events are consumed once before one analysis', ()
   assert.equal(analyzeCalls, 1);
   assert.equal(bundle.analyzerHistory.getEventTimestamp(), BASE_TIME + 180_000);
   assert.equal(bundle.analyzerHistory.all().length, 3);
+  assert.equal(bundle.analyzer.getAnalysis().price, 120);
+  assert.equal(bundle.analyzer.getAnalysis().timestamp, new Date(BASE_TIME + 180_000).toISOString());
 });
 
 test('reused causal event analyzes on each committed boundary without duplicate history advancement', () => {
@@ -423,6 +488,181 @@ test('reused causal event analyzes on each committed boundary without duplicate 
   assert.equal(bundle.analyzerHistory.getEventTimestamp(), BASE_TIME + 60_000);
   assert.equal(bundle.analyzerHistory.all().length, 1);
   assert.equal(runner.getState().cycleCount, 2);
+});
+
+test('runner invokes orchestration once per committed cycle and never retries a failed orchestration', () => {
+  const input = normalizedInput(2);
+  const successBundle = makeBundle(input);
+  const originalSuccessOrchestrator = successBundle.replayAnalyzerOrchestrator;
+  let successCalls = 0;
+  const successfulDependencies = {
+    ...successBundle,
+    replayAnalyzerOrchestrator: {
+      runForBoundary(boundaryTime) {
+        successCalls++;
+        return originalSuccessOrchestrator.runForBoundary(boundaryTime);
+      },
+    },
+  };
+  const { runner: successfulRunner } = makeRunner(input, successfulDependencies);
+
+  runQuietly(successfulRunner);
+  runQuietly(successfulRunner);
+
+  assert.equal(successCalls, 2);
+  assert.equal(successfulRunner.getState().cycleCount, 2);
+
+  const failedInput = normalizedInput(1);
+  const failedBundle = makeBundle(failedInput);
+  const orchestrationError = new Error('controlled orchestration failure');
+  orchestrationError.code = 'ORCHESTRATION_FAILED';
+  let failedCalls = 0;
+  let pipelineCallsBefore = pipelineCalls.length;
+  const failedDependencies = {
+    ...failedBundle,
+    replayAnalyzerOrchestrator: {
+      runForBoundary() {
+        failedCalls++;
+        throw orchestrationError;
+      },
+    },
+  };
+  const { runner: failedRunner } = makeRunner(failedInput, failedDependencies);
+
+  assert.throws(() => runQuietly(failedRunner), error => error.code === 'CYCLE_FAILED');
+  assert.throws(() => failedRunner.runNextCycle(), error => error.code === 'RUNNER_FAILED');
+
+  const state = failedRunner.getState();
+  assert.equal(failedCalls, 1, JSON.stringify(state));
+  assert.equal(pipelineCalls.length, pipelineCallsBefore);
+  assert.equal(state.status, 'FAILED');
+  assert.equal(state.failure.phase, 'PIPELINE');
+  assert.equal(state.failure.commitConfirmed, true);
+  assert.equal(state.failure.clockAdvanced, true);
+  assert.equal(state.cycleCount, 0);
+  assert.equal(state.lastResult, null);
+});
+
+test('runner converts A2 advancement failure into terminal PIPELINE failure after commit', () => {
+  const input = normalizedInput(1);
+  const bundle = makeBundle(input);
+  const source = analyzerInput([
+    analyzerSnapshot(BASE_TIME, 100),
+    analyzerSnapshot(BASE_TIME + 60_000, 101),
+  ]);
+  const historyError = new Error('controlled A2 advancement failure');
+  historyError.code = 'A2_ADVANCEMENT_FAILED';
+  let advanceCalls = 0;
+  const failingHistory = {
+    advanceThrough() {
+      advanceCalls++;
+      throw historyError;
+    },
+    all() { return []; },
+    getEventTimestamp() { return null; },
+  };
+  const orchestrator = createReplayAnalyzerOrchestrator({
+    source,
+    history: failingHistory,
+    analyzer: bundle.analyzer,
+    symbol: 'BTCUSDT',
+  });
+  const pipelineCallsBefore = pipelineCalls.length;
+  const { runner } = makeRunner(input, {
+    ...bundle,
+    replayAnalyzerOrchestrator: orchestrator,
+  });
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  const state = runner.getState();
+  assert.equal(advanceCalls, 1);
+  assert.equal(pipelineCalls.length, pipelineCallsBefore);
+  assert.equal(state.failure.phase, 'PIPELINE');
+  assert.equal(state.failure.causeCode, 'A2_ADVANCEMENT_FAILED');
+  assert.equal(state.failure.commitConfirmed, true);
+  assert.equal(state.failure.clockAdvanced, true);
+  assert.equal(state.cycleCount, 0);
+  assert.equal(state.lastResult, null);
+  assert.equal(state.status, 'FAILED');
+  assert.throws(() => runner.runNextCycle(), error => error.code === 'RUNNER_FAILED');
+  assert.equal(advanceCalls, 1);
+});
+
+test('runner converts source-history coherence failure into terminal PIPELINE failure', () => {
+  const input = normalizedInput(1);
+  const bundle = makeBundle(input);
+  const source = analyzerInput([
+    analyzerSnapshot(BASE_TIME, 100),
+    analyzerSnapshot(BASE_TIME + 60_000, 101),
+  ]);
+  const mismatchedSource = analyzerInput([
+    analyzerSnapshot(BASE_TIME, 500),
+    analyzerSnapshot(BASE_TIME + 60_000, 501),
+  ]);
+  const mismatchedHistory = createReplayAnalyzerHistory(mismatchedSource, {
+    symbol: 'BTCUSDT',
+    maxHistory: 500,
+  });
+  const orchestrator = createReplayAnalyzerOrchestrator({
+    source,
+    history: mismatchedHistory,
+    analyzer: bundle.analyzer,
+    symbol: 'BTCUSDT',
+  });
+  const pipelineCallsBefore = pipelineCalls.length;
+  const { runner } = makeRunner(input, {
+    ...bundle,
+    replayAnalyzerOrchestrator: orchestrator,
+  });
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  const state = runner.getState();
+  assert.equal(pipelineCalls.length, pipelineCallsBefore);
+  assert.equal(state.failure.phase, 'PIPELINE');
+  assert.equal(state.failure.causeCode, 'HISTORY_SOURCE_MISMATCH');
+  assert.equal(state.failure.commitConfirmed, true);
+  assert.equal(state.failure.clockAdvanced, true);
+  assert.equal(state.cycleCount, 0);
+  assert.equal(state.lastResult, null);
+  assert.equal(state.status, 'FAILED');
+  assert.throws(() => runner.runNextCycle(), error => error.code === 'RUNNER_FAILED');
+});
+
+test('pipeline failure after successful Analyzer orchestration is terminal and does not rerun Analyzer', () => {
+  const input = normalizedInput(2);
+  const bundle = makeBundle(input);
+  const originalOrchestrator = bundle.replayAnalyzerOrchestrator;
+  let orchestrationCalls = 0;
+  let analysisAtFailure = null;
+  const originalGetCandles = bundle.candleEngine.getCandles.bind(bundle.candleEngine);
+  bundle.candleEngine.getCandles = () => {
+    throw new Error('controlled pipeline failure after Analyzer');
+  };
+  const { runner } = makeRunner(input, {
+    ...bundle,
+    replayAnalyzerOrchestrator: {
+      runForBoundary(boundaryTime) {
+        orchestrationCalls++;
+        const result = originalOrchestrator.runForBoundary(boundaryTime);
+        analysisAtFailure = bundle.analyzer.getAnalysis();
+        return result;
+      },
+    },
+  });
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  const state = runner.getState();
+  assert.equal(orchestrationCalls, 1);
+  assert.ok(analysisAtFailure);
+  assert.equal(bundle.analyzer.getAnalysis().timestamp, new Date(BASE_TIME + 60_000).toISOString());
+  assert.equal(state.failure.phase, 'PIPELINE');
+  assert.equal(state.failure.commitConfirmed, true);
+  assert.equal(state.failure.clockAdvanced, true);
+  assert.equal(state.cycleCount, 0);
+  assert.equal(state.lastResult, null);
+  assert.throws(() => runner.runNextCycle(), error => error.code === 'RUNNER_FAILED');
+  assert.equal(orchestrationCalls, 1);
+  assert.equal(originalGetCandles('1h').length, 1);
 });
 
 test('first cycle without a causal analyzer event fails closed after commit', () => {
@@ -563,6 +803,8 @@ test('gap boundary uses the completed close without fabricating intervals', () =
   assert.equal(firstSnapshot.price, input.candles[0].close);
   assert.equal(bundle.candleEngine.getActive('1h'), null);
   assert.equal(firstResult.timestamp, new Date(BASE_TIME + HOUR).toISOString());
+  assert.equal(bundle.analyzerHistory.getEventTimestamp(), BASE_TIME + 60_000);
+  assert.equal(bundle.analyzer.getAnalysis().timestamp, new Date(BASE_TIME + 60_000).toISOString());
 
   const secondCall = pipelineCalls.length;
   const secondResult = runQuietly(runner);
@@ -570,6 +812,8 @@ test('gap boundary uses the completed close without fabricating intervals', () =
 
   assert.equal(secondSnapshot.price, input.candles[1].close);
   assert.equal(secondResult.timestamp, new Date(BASE_TIME + 4 * HOUR).toISOString());
+  assert.equal(bundle.analyzerHistory.getEventTimestamp(), BASE_TIME + 60_000);
+  assert.equal(bundle.analyzer.getAnalysis().timestamp, new Date(BASE_TIME + 60_000).toISOString());
   assert.equal(runner.getState().cycleCount, 2);
 });
 
@@ -947,6 +1191,45 @@ test('23:00 UTC candle executes at the new UTC day close boundary', () => {
   assert.equal(result.decision.timestamp, closeTimestamp);
   assert.equal(result.decision.risk.timestamp, closeTimestamp);
   assert.equal(result.decision.risk.session, 'ASIAN');
+  assert.equal(bundle.clock.nowMs(), Date.parse(closeTimestamp));
+});
+
+test('fresh replay graphs are semantically deterministic while analyzedAt remains diagnostic-only', () => {
+  const input = normalizedInput(16);
+  const snapshots = [
+    analyzerSnapshot(BASE_TIME + 60_000, 100),
+    analyzerSnapshot(BASE_TIME + 120_000, 125),
+  ];
+  const first = makeRunner(input, makeBundle(input, snapshots));
+  const second = makeRunner(input, makeBundle(input, snapshots));
+
+  for (let index = 0; index < 15; index++) {
+    runQuietly(first.runner);
+    runQuietly(second.runner);
+  }
+  const firstResult = runQuietly(first.runner);
+  const secondResult = runQuietly(second.runner);
+  const stable = result => ({
+    index: result.index,
+    openTime: result.openTime,
+    timestamp: result.timestamp,
+    price: result.price,
+    decision: {
+      timestamp: result.decision.timestamp,
+      confluence: result.decision.confluence,
+      marketRegime: result.decision.marketRegime,
+      risk: result.decision.risk,
+      verdict: result.decision.verdict,
+      trend: (({ analyzedAt, ...trend }) => trend)(result.decision.engines.trend),
+    },
+  });
+
+  assert.deepEqual(stable(firstResult), stable(secondResult));
+  assert.equal(firstResult.decision.engines.trend.timestamp, new Date(BASE_TIME + 120_000).toISOString());
+  assert.equal(firstResult.timestamp, new Date(BASE_TIME + 16 * HOUR).toISOString());
+  assert.notEqual(firstResult.decision.engines.trend.analyzedAt, undefined);
+  assert.notEqual(secondResult.decision.engines.trend.analyzedAt, undefined);
+  assert.equal(firstResult.decision.engines.trend.analyzedAt !== firstResult.timestamp, true);
 });
 
 test('schemaVersion 1 candles retain open-time identity without closeTime', () => {
