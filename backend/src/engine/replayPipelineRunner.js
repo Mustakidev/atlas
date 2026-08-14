@@ -51,6 +51,15 @@ function assertMethods(value, name, methods) {
   }
 }
 
+function assertMtfCapability(value, message, methods) {
+  if (!value
+    || typeof value !== 'object'
+    || Array.isArray(value)
+    || methods.some(method => typeof value[method] !== 'function')) {
+    fail('INVALID_DEPENDENCIES', message);
+  }
+}
+
 function deepFreeze(value, seen = new Set()) {
   if (!value || typeof value !== 'object' || seen.has(value)) return value;
 
@@ -81,6 +90,28 @@ function validateDependencies(dependencies) {
   if (typeof dependencies.candleEngine.timeframe !== 'string') {
     fail('INVALID_DEPENDENCIES', 'dependencies.candleEngine.timeframe must be a string');
   }
+
+  const hasAdapter = Object.hasOwn(dependencies, 'replayMtfCandleAdapter');
+  const hasView = Object.hasOwn(dependencies, 'replayCandleView');
+  if (hasAdapter !== hasView) {
+    fail(
+      'INVALID_DEPENDENCIES',
+      'dependencies.replayMtfCandleAdapter and dependencies.replayCandleView must be provided together',
+    );
+  }
+  if (!hasAdapter) return false;
+
+  assertMtfCapability(
+    dependencies.replayMtfCandleAdapter,
+    'dependencies.replayMtfCandleAdapter must expose prepareBoundary(), commitBoundary(), getCandles(), and getActive()',
+    ['prepareBoundary', 'commitBoundary', 'getCandles', 'getActive'],
+  );
+  assertMtfCapability(
+    dependencies.replayCandleView,
+    'dependencies.replayCandleView must expose getCandles(), getActive(), and getAllTimeframes()',
+    ['getCandles', 'getActive', 'getAllTimeframes'],
+  );
+  return true;
 }
 
 function validateNormalizedInput(normalizedInput, candleEngine) {
@@ -146,10 +177,15 @@ function isRetryableClockFailure(error) {
 }
 
 function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
-  validateDependencies(dependencies);
+  const mtfMode = validateDependencies(dependencies);
   validateNormalizedInput(normalizedInput, dependencies.candleEngine);
 
-  const executionPipeline = createExecutionPipeline(dependencies);
+  const executionPipeline = mtfMode
+    ? createExecutionPipeline({
+      ...dependencies,
+      mtfCandleEngine: dependencies.replayCandleView,
+    })
+    : createExecutionPipeline(dependencies);
   let status = 'READY';
   let cycleCount = 0;
   let lastResult = null;
@@ -229,6 +265,9 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
       const closeTimestamp = new Date(boundaryTime).toISOString();
 
       phase = 'PREPARE';
+      const secondaryPlan = mtfMode
+        ? dependencies.replayMtfCandleAdapter.prepareBoundary({ boundaryTime })
+        : null;
       const plan = dependencies.candleEngine.prepareBoundary({ boundaryTime });
       phase = 'CLOCK';
       dependencies.clockController.advanceTo(boundaryTime);
@@ -236,6 +275,12 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
       phase = 'COMMIT';
       const transition = dependencies.candleEngine.commitBoundary(plan);
       commitConfirmed = true;
+      if (mtfMode) {
+        const secondaryTransition = dependencies.replayMtfCandleAdapter.commitBoundary(secondaryPlan);
+        if (secondaryTransition?.boundaryTime !== boundaryTime) {
+          fail('MTF_BOUNDARY_MISMATCH', 'Replay MTF commit did not confirm boundaryTime');
+        }
+      }
 
       phase = 'TRANSITION_VALIDATION';
       if (transition.sourceIndex !== index || transition.lifecycleCandle !== expectedCandle) {
