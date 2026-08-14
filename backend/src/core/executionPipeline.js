@@ -1,4 +1,5 @@
 const { getFinalizedCandles } = require('../engine/candleUtils');
+const { ATREngine } = require('../engine/atr');
 const { captureCycleTime, resolveClock } = require('./clock');
 
 function isValidCandle(candle) {
@@ -43,6 +44,7 @@ function createExecutionPipeline({
   logger,
   symbol,
   candleEngine,
+  mtfCandleEngine,
   regimeEngine,
   confluenceEngine,
   atrEngine,
@@ -58,6 +60,14 @@ function createExecutionPipeline({
   paperTradeEngine,
   clock,
 }) {
+  const effectiveMtfCandleEngine = mtfCandleEngine ?? candleEngine;
+  const mtfAtrEngine = effectiveMtfCandleEngine === candleEngine
+    ? atrEngine
+    : new ATREngine({
+      candleEngine: effectiveMtfCandleEngine,
+      logger,
+      symbol,
+    });
   const time = resolveClock(clock);
   let lastSignalTime = 0;
   let pipelineCycleCount = 0;
@@ -294,10 +304,10 @@ function createExecutionPipeline({
     const mtfTimeframes = {};
     const mtfTFs = ['1m', '5m', '15m', '1h'];
     for (const mtfTF of mtfTFs) {
-      const mtfFinalized = getFinalizedCandles(candleEngine, mtfTF, 100);
+      const mtfFinalized = getFinalizedCandles(effectiveMtfCandleEngine, mtfTF, 100);
       if (mtfFinalized.length >= 15) {
         const mtfConfluence = safeExecute('MTF-Confluence', () => confluenceEngine.calculate(mtfFinalized, mtfTF), { score: 50, bias: 'Neutral', confidence: 0 }, cycle);
-        const mtfAtr = safeExecute('MTF-ATR', () => atrEngine.calculate(mtfTF), null, cycle);
+        const mtfAtr = safeExecute('MTF-ATR', () => mtfAtrEngine.calculate(mtfTF), null, cycle);
         mtfTimeframes[mtfTF] = {
           confluence: { score: mtfConfluence.score, bias: mtfConfluence.bias, confidence: mtfConfluence.confidence },
           volatilityLevel: mtfAtr?.volatilityLevel || null,

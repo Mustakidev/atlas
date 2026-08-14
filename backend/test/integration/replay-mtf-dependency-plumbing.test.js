@@ -240,11 +240,13 @@ test('existing graph consumers remain primary-backed and secondary advancement i
     optIn.bollingerEngine,
     optIn.confluenceEngine,
     optIn.regimeEngine,
-    optIn.mtfEngine,
   ]) {
     assert.strictEqual(consumer.candleEngine, optIn.candleEngine);
     assert.notStrictEqual(consumer.candleEngine, optIn.replayCandleView);
   }
+  assert.strictEqual(legacy.mtfEngine.candleEngine, legacy.candleEngine);
+  assert.strictEqual(optIn.mtfEngine.candleEngine, optIn.replayCandleView);
+  assert.notStrictEqual(optIn.mtfEngine.candleEngine, optIn.candleEngine);
 
   assert.deepEqual(optIn.candleEngine.getCandles('1h'), legacy.candleEngine.getCandles('1h'));
   assert.deepEqual(
@@ -265,13 +267,12 @@ test('existing graph consumers remain primary-backed and secondary advancement i
     withoutDiagnostics(legacy.mtfEngine.calculate()),
   );
 
-  commitBoundary(optIn.replayMtfCandleAdapter, BASE_TIME + HOUR);
+  commitBoundary(optIn.replayMtfCandleAdapter, BASE_TIME + 2 * HOUR);
   assert.deepEqual(optIn.candleEngine.getCandles('1h'), legacy.candleEngine.getCandles('1h'));
   assert.equal(optIn.candleEngine.getActive('1h'), legacy.candleEngine.getActive('1h'));
-  assert.deepEqual(
-    withoutDiagnostics(optIn.mtfEngine.calculate()),
-    mtfBeforeSecondary,
-  );
+  const mtfAfterSecondary = withoutDiagnostics(optIn.mtfEngine.calculate());
+  assert.equal(mtfAfterSecondary.timeframes['5m'].candleCount > 0, true);
+  assert.deepEqual(mtfAfterSecondary.timeframes['1h'], mtfBeforeSecondary.timeframes['1h']);
 });
 
 test('coherence rejects each indexed primary mismatch with the stable TypeError prefix', () => {
