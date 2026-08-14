@@ -198,6 +198,42 @@ test('non-array stream rejects', () => {
   assertRejects(input, /timeframes\.5m must be an array/);
 });
 
+test('sparse streams reject with the controlled dense-array error', () => {
+  for (const timeframe of REPLAY_MTF_TIMEFRAMES) {
+    const input = makeRawInput();
+    const stream = input.timeframes[timeframe];
+    const holeIndexes = [0, Math.floor(stream.length / 2), stream.length - 1];
+
+    for (const holeIndex of holeIndexes) {
+      delete stream[holeIndex];
+      assert.throws(
+        () => normalizeReplayMultiTimeframeInput(input),
+        error => error instanceof TypeError
+          && error.name === 'ReplayMultiTimeframeInputError'
+          && error.code === 'INVALID_STREAM'
+          && error.message === `timeframes.${timeframe} must be dense`,
+      );
+      stream[holeIndex] = makeCandle(
+        BASE_TIME + holeIndex * REPLAY_MTF_DURATIONS_MS[timeframe],
+        holeIndex,
+      );
+    }
+  }
+});
+
+test('dense streams retain existing normalization semantics', () => {
+  const input = makeRawInput({ equalValues: true });
+  const before = structuredClone(input);
+  const first = normalizeReplayMultiTimeframeInput(input);
+  const second = normalizeReplayMultiTimeframeInput(input);
+
+  assert.deepEqual(first, second);
+  assert.deepEqual(input, before);
+  assert.equal(first.timeframes['1m'][0].closeTime,
+    BASE_TIME + REPLAY_MTF_DURATIONS_MS['1m']);
+  assert.equal(first.timeframes['1h'].length, 51);
+});
+
 test('shared array reference between streams rejects', () => {
   const input = makeRawInput();
   input.timeframes['5m'] = input.timeframes['1m'];

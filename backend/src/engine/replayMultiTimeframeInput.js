@@ -212,6 +212,12 @@ function normalizeStream(rawCandles, timeframe, seenArrays, candleOwners) {
   }
   seenArrays.set(rawCandles, path);
 
+  for (let index = 0; index < rawCandles.length; index++) {
+    if (!Object.hasOwn(rawCandles, index)) {
+      fail('INVALID_STREAM', `${path} must be dense`);
+    }
+  }
+
   const normalizedCandles = rawCandles.map((candle, index) =>
     normalizeCandle(candle, timeframe, index, candleOwners));
   validateStreamSpacing(normalizedCandles, timeframe);
