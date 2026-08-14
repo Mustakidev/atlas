@@ -350,7 +350,7 @@ function createReplayDependencies({
     confluenceEngine,
     structureEngine,
     indicatorRegistry,
-    candleEngine,
+    candleEngine: replayCandleView ?? candleEngine,
     analyzer,
     logger: replayLogger,
     config: replayConfig,
