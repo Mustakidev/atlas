@@ -1,5 +1,8 @@
 const { assertTimestamp, resolveClock } = require('../core/clock');
 const { ReplayCandleEngine } = require('./replayCandleEngine');
+const { createReplayMtfCandleAdapter } = require('./replayMtfCandleAdapter');
+const { createReplayCandleView } = require('./replayCandleView');
+const { REPLAY_MTF_DURATIONS_MS } = require('./replayMultiTimeframeInput');
 const { createIndicatorRegistry } = require('./indicators');
 const { MarketAnalyzer } = require('./analyzer');
 const { StructureEngine } = require('./structure');
@@ -79,6 +82,37 @@ function assertNormalizedInput(normalizedInput) {
     normalizedInput.candles[0]?.openTime,
     'normalizedInput.candles[0].openTime',
   );
+}
+
+function assertReplayMtfPrimaryCoherence(normalizedInput, normalizedMtfInput) {
+  const primaryCandles = normalizedInput.candles;
+  const mtfPrimaryCandles = normalizedMtfInput.timeframes['1h'];
+  const prefix = 'Replay MTF primary coherence mismatch:';
+
+  if (primaryCandles.length !== mtfPrimaryCandles.length) {
+    throw new TypeError(`${prefix} length differs`);
+  }
+
+  const fields = ['openTime', 'timestamp', 'open', 'high', 'low', 'close', 'volume'];
+  for (let index = 0; index < primaryCandles.length; index++) {
+    const primaryCandle = primaryCandles[index];
+    const mtfCandle = mtfPrimaryCandles[index];
+
+    if (!mtfCandle || typeof mtfCandle !== 'object' || Array.isArray(mtfCandle)) {
+      throw new TypeError(`${prefix} candle ${index} is invalid`);
+    }
+
+    for (const field of fields) {
+      if (primaryCandle[field] !== mtfCandle[field]) {
+        throw new TypeError(`${prefix} candle ${index} ${field} differs`);
+      }
+    }
+
+    const expectedCloseTime = primaryCandle.openTime + REPLAY_MTF_DURATIONS_MS['1h'];
+    if (mtfCandle.closeTime !== expectedCloseTime) {
+      throw new TypeError(`${prefix} candle ${index} closeTime differs`);
+    }
+  }
 }
 
 function assertRiskPolicySource(riskPolicySource) {
@@ -238,6 +272,7 @@ function createReplayDependencies({
   analyzerInput,
   riskPolicySource,
   clock,
+  normalizedMtfInput,
 } = {}) {
   if (typeof symbol !== 'string' || symbol.trim() === '') {
     throw new TypeError('symbol must be a non-empty string');
@@ -251,6 +286,12 @@ function createReplayDependencies({
   assertRiskPolicySource(riskPolicySource);
 
   const riskPolicy = readRiskPolicy(riskPolicySource);
+  let replayMtfCandleAdapter;
+  if (normalizedMtfInput !== undefined) {
+    replayMtfCandleAdapter = createReplayMtfCandleAdapter(normalizedMtfInput);
+    assertReplayMtfPrimaryCoherence(normalizedInput, normalizedMtfInput);
+  }
+
   const replayLogger = createReplayLogger();
   const replayConfig = createConfigSnapshot(config);
   const maxHistory = replayConfig.get('MAX_HISTORY');
@@ -262,6 +303,12 @@ function createReplayDependencies({
     timeframe: normalizedInput.timeframe,
     candles: normalizedInput.candles,
   });
+  const replayCandleView = normalizedMtfInput === undefined
+    ? undefined
+    : createReplayCandleView({
+      primaryEngine: candleEngine,
+      secondaryAdapter: replayMtfCandleAdapter,
+    });
   const indicatorRegistry = createIndicatorRegistry(symbol);
   const analyzer = new MarketAnalyzer(replayLogger, symbol);
   const analyzerHistory = createReplayAnalyzerHistory(analyzerInput, { symbol, maxHistory });
@@ -324,7 +371,7 @@ function createReplayDependencies({
 
   applyRiskPolicy(advanceRiskEngine, riskPolicy);
 
-  return Object.freeze({
+  const dependencies = {
     candleEngine,
     indicatorRegistry,
     analyzer,
@@ -346,7 +393,14 @@ function createReplayDependencies({
     symbol,
     clock: replayClock,
     clockController,
-  });
+  };
+
+  if (normalizedMtfInput !== undefined) {
+    dependencies.replayMtfCandleAdapter = replayMtfCandleAdapter;
+    dependencies.replayCandleView = replayCandleView;
+  }
+
+  return Object.freeze(dependencies);
 }
 
 module.exports = { createReplayDependencies, SNAPSHOTTED_CONFIG_KEYS };
