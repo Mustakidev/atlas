@@ -19,7 +19,7 @@ const config = {
   },
 };
 
-function candleProvider(initial) {
+function candleProvider(initial, timeframes = ['1h']) {
   let candles = initial.map(candle => ({ ...candle }));
   return {
     set(next) { candles = next.map(candle => ({ ...candle })); },
@@ -28,7 +28,7 @@ function candleProvider(initial) {
       return limit ? result.slice(-limit) : result;
     },
     getActive() { return null; },
-    getAllTimeframes() { return ['1h']; },
+    getAllTimeframes() { return timeframes; },
   };
 }
 
@@ -67,6 +67,32 @@ function customPeriodCandles() {
     volume: 1,
     timestamp: new Date(BASE_TIME + index * 60000).toISOString(),
   }));
+}
+
+function rangeCandles(ranges) {
+  return ranges.map((range, index) => ({
+    open: 100,
+    high: 100 + range,
+    low: 100,
+    close: 100,
+    volume: 1,
+    timestamp: new Date(BASE_TIME + index * 60000).toISOString(),
+  }));
+}
+
+function wilderAtr(values, period) {
+  let atr = values.slice(0, period).reduce((sum, value) => sum + value, 0) / period;
+  for (let index = period; index < values.length; index++) {
+    atr = (atr * (period - 1) + values[index]) / period;
+  }
+  return atr;
+}
+
+function expectedTrend(currentAtr, previousAtr) {
+  const ratio = currentAtr / previousAtr;
+  if (ratio > 1.05) return 'Increasing';
+  if (ratio < 0.95) return 'Decreasing';
+  return 'Stable';
 }
 
 function stable(value) {
@@ -244,4 +270,96 @@ test('repeated default calculations remain deterministic', () => {
   const second = engine.calculate('1h', candles.length);
 
   assert.deepEqual(stable(second), stable(first));
+});
+
+test('volatilityTrend uses the immediately preceding ATR for long history', () => {
+  const period = 14;
+  const ranges = [...Array(14).fill(1), ...Array(16).fill(2)];
+  const engine = new ATREngine({ candleEngine: candleProvider(rangeCandles(ranges)), logger, period });
+  const result = engine.calculate('1h', ranges.length);
+  const currentAtr = wilderAtr(ranges, period);
+  const oldPreviousAtr = wilderAtr(ranges.slice(0, ranges.length - Math.min(period, ranges.length - period)), period);
+  const correctPreviousAtr = wilderAtr(ranges.slice(0, -1), period);
+
+  assert.ok(Math.abs(currentAtr - 1.6944761865961422) < 1e-12);
+  assert.ok(Math.abs(oldPreviousAtr - 1.1377551020408163) < 1e-12);
+  assert.ok(Math.abs(correctPreviousAtr - 1.6709743547958453) < 1e-12);
+  assert.equal(expectedTrend(currentAtr, oldPreviousAtr), 'Increasing');
+  assert.equal(expectedTrend(currentAtr, correctPreviousAtr), 'Stable');
+  assert.equal(result.ready, true);
+  assert.equal(result.atr, 1.69);
+  assert.equal(result.atrPercentage, 1.69);
+  assert.equal(result.volatilityLevel, 'Medium');
+  assert.equal(result.volatilityTrend, 'Stable');
+});
+
+test('volatilityTrend preserves minimum and period-boundary prefix semantics', () => {
+  const period = 14;
+  const cases = [
+    { name: 'minimum history', ranges: [...Array(14).fill(1), 2], expected: 'Increasing' },
+    { name: 'one beyond minimum', ranges: [...Array(14).fill(1), 2, 1.1], expected: 'Stable' },
+    { name: 'exactly two periods', ranges: [...Array(14).fill(1), ...Array(14).fill(2)], expected: 'Stable' },
+    { name: 'beyond two periods', ranges: [...Array(14).fill(1), ...Array(16).fill(2)], expected: 'Stable' },
+  ];
+
+  for (const { name, ranges, expected } of cases) {
+    const engine = new ATREngine({ candleEngine: candleProvider(rangeCandles(ranges)), logger, period });
+    const result = engine.calculate('1h', ranges.length);
+    const currentAtr = wilderAtr(ranges, period);
+    const previousAtr = wilderAtr(ranges.slice(0, -1), period);
+
+    assert.equal(result.ready, true, name);
+    assert.equal(result.volatilityTrend, expected, name);
+    assert.equal(result.volatilityTrend, expectedTrend(currentAtr, previousAtr), name);
+  }
+});
+
+test('volatilityTrend classifies flat, increasing, decreasing, and strict boundaries', () => {
+  const period = 14;
+  const cases = [
+    { name: 'flat', ranges: Array(30).fill(2), expected: 'Stable' },
+    { name: 'increasing', ranges: [...Array(14).fill(1), 2], expected: 'Increasing' },
+    { name: 'decreasing', ranges: [...Array(14).fill(2), 0.5], expected: 'Decreasing' },
+    { name: 'upper boundary', period: 1, ranges: [100, 105], expected: 'Stable' },
+    { name: 'lower boundary', period: 1, ranges: [100, 95], expected: 'Stable' },
+  ];
+
+  for (const { name, period: casePeriod = period, ranges, expected } of cases) {
+    const engine = new ATREngine({ candleEngine: candleProvider(rangeCandles(ranges)), logger, period: casePeriod });
+    const result = engine.calculate('1h', ranges.length);
+
+    assert.equal(result.volatilityTrend, expected, name);
+  }
+});
+
+test('volatilityTrend uses the immediately preceding ATR for custom periods', () => {
+  const period = 5;
+  const ranges = [...Array(5).fill(1), 2, 1.1];
+  const engine = new ATREngine({ candleEngine: candleProvider(rangeCandles(ranges)), logger, period });
+  const result = engine.calculate('1h', ranges.length);
+  const currentAtr = wilderAtr(ranges, period);
+  const previousAtr = wilderAtr(ranges.slice(0, -1), period);
+
+  assert.equal(result.volatilityTrend, expectedTrend(currentAtr, previousAtr));
+  assert.equal(result.volatilityTrend, 'Stable');
+});
+
+test('calculateAll preserves ATR result shape and per-timeframe behavior', () => {
+  const ranges = [...Array(14).fill(1), ...Array(16).fill(2)];
+  const candles = rangeCandles(ranges);
+  const engine = new ATREngine({
+    candleEngine: candleProvider(candles, ['1m', '1h']),
+    logger,
+  });
+  const results = engine.calculateAll(ranges.length);
+
+  assert.deepEqual(Object.keys(results), ['1m', '1h']);
+  for (const key of ['ready', 'period', 'atr', 'atrPercentage', 'volatilityLevel', 'volatilityTrend', 'candleCount']) {
+    assert.equal(results['1m'][key], results['1h'][key], key);
+  }
+  assert.deepEqual(Object.keys(results['1h']), [
+    'implemented', 'ready', 'symbol', 'timeframe', 'period', 'atr', 'atrPercentage',
+    'volatilityLevel', 'volatilityTrend', 'candleCount', 'calculationTime', 'lastUpdated',
+    'engineVersion', 'dataSource',
+  ]);
 });

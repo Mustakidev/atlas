@@ -54,10 +54,7 @@ class ATREngine {
 
     const trValues = this._trueRange(finalized);
     const atr = this._wilderATR(trValues);
-    const lookback = Math.min(this.period, trValues.length - this.period);
-    const previousAtr = lookback > 0
-      ? this._wilderATR(trValues.slice(0, trValues.length - lookback))
-      : atr;
+    const previousAtr = this._wilderATR(trValues.slice(0, -1));
 
     const lastClose = finalized[finalized.length - 1].close;
     const atrPercentage = lastClose > 0 ? (atr / lastClose) * 100 : 0;
