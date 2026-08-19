@@ -6,6 +6,7 @@ const path = require('path');
 const { createAuth } = require('./middleware/auth');
 const { createGlobalLimiter, createExpensiveLimiter, createConditionalExpensive } = require('./middleware/rateLimit');
 const { createRouter } = require('./routes/routes');
+const { createProductionReplayRouter } = require('./routes/productionReplayRoutes');
 
 function isMalformedJsonError(error) {
   return error instanceof SyntaxError
@@ -72,7 +73,11 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth 
     getLastDecision,
     getPipelineHealth,
   });
-  app.use('/api', expensiveLimiter, auth, router);
+  const canonicalRouter = createProductionReplayRouter({
+    application: routes.productionReplayApplication,
+    logger,
+  });
+  app.use('/api', expensiveLimiter, auth, canonicalRouter, router);
   app.use(createErrorHandler(logger));
 
   return app;

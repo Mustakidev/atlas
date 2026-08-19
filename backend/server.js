@@ -27,6 +27,7 @@ const { AdvanceRiskEngine } = require('./src/engine/advanceRisk');
 const { MTFConfirmationEngine } = require('./src/engine/mtfConfirmation');
 const { createValidationDependencies } = require('./src/engine/validationDependencies');
 const { createApp } = require('./src/app');
+const { createProductionReplayComposition } = require('./src/application/productionReplayComposition');
 const { createExecutionPipeline } = require('./src/core/executionPipeline');
 const { createSystemClock } = require('./src/core/clock');
 const { registerLiveSnapshotHandler } = require('./src/core/liveSnapshot');
@@ -73,6 +74,32 @@ const riskEngine = new RiskEngine({ logger, symbol });
 const regimeEngine = new RegimeEngine({ indicatorRegistry, atrEngine, candleEngine, analyzer, logger, config, symbol });
 const regimeDecisionEngine = new RegimeDecisionEngine({ logger, symbol });
 const advanceRiskEngine = new AdvanceRiskEngine({ logger, symbol, paperTradeEngine, config, clock });
+
+let productionReplayApplication = null;
+const providerKey = config.get('COINGECKO_API_KEY');
+if (typeof providerKey === 'string' && providerKey.trim() !== '') {
+  try {
+    const composition = createProductionReplayComposition({
+      fetch,
+      logger,
+      config,
+      clock,
+      riskPolicySource: advanceRiskEngine,
+      sleep: retry.sleep.bind(retry),
+    });
+    productionReplayApplication = composition.application;
+  } catch {
+    try {
+      logger.error('Server', 'Canonical replay composition construction failed', {
+        code: 'CANONICAL_REPLAY_COMPOSITION_FAILED',
+      });
+    } catch {
+      // Startup termination must not depend on logging success.
+    }
+    process.exit(1);
+  }
+}
+
 const mtfConfirmationEngine = new MTFConfirmationEngine({ logger, symbol, config });
 const strategyReplayEngine = new StrategyReplayEngine({ logger, symbol, config, riskPolicySource: advanceRiskEngine });
 const validationDependencyFactory = () => createValidationDependencies({ config, symbol });
@@ -131,6 +158,7 @@ const app = createApp({
     regimeDecisionEngine,
     advanceRiskEngine,
     mtfConfirmationEngine,
+    productionReplayApplication,
     symbol,
   },
   getLastDecision: executionPipeline.getLastDecision,
