@@ -17,6 +17,7 @@ const defaults = {
   MIN_API_INTERVAL: 5000,
   API_THROTTLE_TTL: 30000,
   API_KEY: '',
+  COINGECKO_API_KEY: '',
   CORS_ORIGIN: 'http://localhost:3000',
   MAX_BODY_SIZE: '16kb',
   RATE_LIMIT_MAX_REQUESTS: 500,
