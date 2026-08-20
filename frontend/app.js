@@ -805,99 +805,250 @@ async function fetchInspector() {
 // ---------------------------------------------------------------------------
 // Strategy Replay
 // ---------------------------------------------------------------------------
+function replayIsFiniteNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function replayText(value) {
+  if (value === null || value === undefined || value === '') return '--';
+  if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') return '--';
+  return String(value);
+}
+
+function replayMetricClass(base, cls) {
+  return base + (cls ? ' ' + cls : '');
+}
+
+function setReplayMetric(id, text, cls) {
+  var el = $(id);
+  if (!el) return;
+  el.textContent = text;
+  el.className = replayMetricClass('replay-stat-val', cls);
+}
+
+function replayPercent(value) {
+  return replayIsFiniteNumber(value) ? value + '%' : '--';
+}
+
+function replayMoney(value) {
+  if (!replayIsFiniteNumber(value)) return '--';
+  return (value >= 0 ? '+$' : '-$') + Math.abs(value).toFixed(2);
+}
+
+function replayPrice(value) {
+  return replayIsFiniteNumber(value) ? fmtUSD(value) : '--';
+}
+
+function replayDirectionStats(value) {
+  if (!value || !replayIsFiniteNumber(value.wins) || !replayIsFiniteNumber(value.losses)) return '--';
+  return value.wins + '/' + value.losses;
+}
+
+function replayDirectionClass(direction) {
+  if (direction === 'BUY') return 'dir-buy';
+  if (direction === 'SELL') return 'dir-sell';
+  return '';
+}
+
+function replayOutcomeClass(outcome) {
+  if (outcome === 'PROFIT') return 'outcome-profit';
+  if (outcome === 'LOSS') return 'outcome-loss';
+  if (outcome === 'BREAKEVEN') return 'outcome-breakeven';
+  if (outcome === 'OPEN') return 'outcome-open';
+  if (outcome === 'PENDING') return 'outcome-pending';
+  if (outcome === 'CLOSED') return 'outcome-closed';
+  return '';
+}
+
+function replayOutcomeText(trade) {
+  var text = replayText(trade.outcome);
+  var reason = replayText(trade.exitReason);
+  return reason === '--' ? text : text + ' · ' + reason;
+}
+
+function appendReplayCell(row, value, cls) {
+  var cell = document.createElement('span');
+  if (cls) cell.className = cls;
+  cell.textContent = replayText(value);
+  row.appendChild(cell);
+  return cell;
+}
+
+function renderReplayMessage(message) {
+  var list = $('replayTradesList');
+  if (!list) return;
+  list.textContent = '';
+  var messageEl = document.createElement('div');
+  messageEl.className = 'replay-empty';
+  messageEl.textContent = message;
+  list.appendChild(messageEl);
+}
+
+function resetReplayView(message) {
+  setReplayMetric('replayTrades', '--', '');
+  setReplayMetric('replayWinRate', '--', '');
+  setReplayMetric('replayPF', '--', '');
+  setReplayMetric('replayExpectancy', '--', '');
+  setReplayMetric('replayDD', '--', '');
+  setReplayMetric('replayPnl', '--', '');
+  setReplayMetric('replayLongs', '--', '');
+  setReplayMetric('replayShorts', '--', '');
+  $('replayStatus').textContent = message || '--';
+  renderReplayMessage('Click "Run 30D" to start replay');
+}
+
+function finishReplay(btn) {
+  if (!btn) return;
+  btn.disabled = false;
+  btn.textContent = 'Run 30D';
+  btn.className = 'replay-btn';
+}
+
+function replayStatusMessage(status) {
+  if (status === 400) return 'Replay request is invalid. Check the replay configuration.';
+  if (status === 401) return 'Authentication required. Check your API key.';
+  if (status === 429) return 'Replay is rate-limited. Try again shortly.';
+  if (status === 502) return 'Replay data source is temporarily unavailable.';
+  if (status === 503) return 'Replay service is temporarily unavailable.';
+  if (status === 500) return 'Replay failed on the server. Try again later.';
+  return 'Replay request failed.';
+}
+
+function renderReplayModel(model) {
+  var summary = model.summary;
+  var directions = model.directions;
+  var winRateClass = replayIsFiniteNumber(summary.winRate)
+    ? summary.winRate > 50 ? 'bullish' : summary.winRate < 40 ? 'bearish' : '' : '';
+  var profitFactorClass = replayIsFiniteNumber(summary.profitFactor)
+    ? summary.profitFactor > 1 ? 'bullish' : summary.profitFactor > 0 ? 'bearish' : '' : '';
+  var expectancyClass = replayIsFiniteNumber(summary.expectancy)
+    ? summary.expectancy > 0 ? 'bullish' : 'bearish' : '';
+  var drawdownClass = replayIsFiniteNumber(summary.maxDrawdownPct) && summary.maxDrawdownPct > 5 ? 'bearish' : '';
+  var pnlClass = replayIsFiniteNumber(summary.totalPnl)
+    ? summary.totalPnl >= 0 ? 'pnl-pos' : 'pnl-neg' : '';
+  var buyClass = directions.BUY && replayIsFiniteNumber(directions.BUY.winRate) && directions.BUY.winRate > 50 ? 'bullish' : '';
+  var sellClass = directions.SELL && replayIsFiniteNumber(directions.SELL.winRate) && directions.SELL.winRate > 50 ? 'bullish' : '';
+
+  setReplayMetric('replayTrades', replayIsFiniteNumber(summary.totalTrades) ? String(summary.totalTrades) : '--', '');
+  setReplayMetric('replayWinRate', replayPercent(summary.winRate), winRateClass);
+  setReplayMetric('replayPF', summary.profitFactor === 'Infinity'
+    || replayIsFiniteNumber(summary.profitFactor) ? String(summary.profitFactor) : '--', profitFactorClass);
+  setReplayMetric('replayExpectancy', replayIsFiniteNumber(summary.expectancy) ? '$' + summary.expectancy.toFixed(2) : '--', expectancyClass);
+  setReplayMetric('replayDD', replayPercent(summary.maxDrawdownPct), drawdownClass);
+  setReplayMetric('replayPnl', replayMoney(summary.totalPnl), pnlClass);
+  setReplayMetric('replayLongs', replayDirectionStats(directions.BUY), buyClass);
+  setReplayMetric('replayShorts', replayDirectionStats(directions.SELL), sellClass);
+
+  var cycleText;
+  if (model.completion.status && model.completion.status !== 'EXHAUSTED') {
+    cycleText = 'Replay status: ' + replayText(model.completion.status);
+  } else if (replayIsFiniteNumber(model.completion.cyclesProcessed)) {
+    cycleText = 'Completed · ' + model.completion.cyclesProcessed + ' cycles processed';
+  } else {
+    cycleText = 'Replay complete';
+  }
+  $('replayStatus').textContent = cycleText;
+
+  var list = $('replayTradesList');
+  list.textContent = '';
+  if (model.trades.length === 0) {
+    renderReplayMessage('No trades generated for this replay window');
+    return;
+  }
+
+  model.trades.forEach(function(trade) {
+    var row = document.createElement('div');
+    row.className = 'replay-row';
+    appendReplayCell(row, trade.tradeId);
+    appendReplayCell(row, trade.direction, replayDirectionClass(trade.direction));
+    appendReplayCell(row, replayPrice(trade.entry));
+    appendReplayCell(row, replayPrice(trade.exit));
+    appendReplayCell(row, replayPrice(trade.stopLoss));
+    appendReplayCell(row, replayPrice(trade.takeProfit));
+    appendReplayCell(row, trade.durationText);
+    appendReplayCell(row, replayOutcomeText(trade), replayOutcomeClass(trade.outcome));
+    list.appendChild(row);
+  });
+}
+
 window.runReplay = async function() {
   var btn = $('replayBtn');
   if (btn) { btn.disabled = true; btn.textContent = 'Running...'; btn.className = 'replay-btn loading'; }
+  resetReplayView('Running canonical replay...');
+  renderReplayMessage('Running canonical replay...');
 
-  $('replayStatus').textContent = 'Running...';
-  $('replayTradesList').innerHTML = '<div class="replay-empty">Replaying 30 days of candles...</div>';
-  $('replayRejectionsList').style.display = 'none';
-  $('replayRejectionsHeader').style.display = 'none';
-
-  try {
-    var d = await fetch(API + '/api/strategy/replay?timeframe=1h&days=30', { headers: authHeaders() });
-    var data = await d.json();
-
-    if (data.error) {
-      $('replayTradesList').innerHTML = '<div class="replay-empty">Error: ' + data.error + '</div>';
-      $('replayStatus').textContent = 'Error';
-      if (btn) { btn.disabled = false; btn.textContent = 'Run 30D'; btn.className = 'replay-btn'; }
-      return;
-    }
-
-    var s = data.stats || {};
-    $('replayTrades').textContent = s.totalTrades || 0;
-    $('replayWinRate').textContent = (s.winRate || 0) + '%';
-    setClass($('replayWinRate'), s.winRate > 50 ? 'bullish' : s.winRate < 40 ? 'bearish' : '');
-    $('replayPF').textContent = s.profitFactor || '0';
-    setClass($('replayPF'), s.profitFactor > 1 ? 'bullish' : s.profitFactor > 0 ? 'bearish' : '');
-    $('replayExpectancy').textContent = '$' + (s.expectancy || 0).toFixed(2);
-    setClass($('replayExpectancy'), s.expectancy > 0 ? 'bullish' : 'bearish');
-    $('replayAvgR').textContent = (s.averageR || 0) + 'R';
-    setClass($('replayAvgR'), s.averageR > 0 ? 'bullish' : 'bearish');
-    $('replayDD').textContent = (s.maxDrawdownPct || 0) + '%';
-    setClass($('replayDD'), s.maxDrawdownPct > 5 ? 'bearish' : '');
-    $('replayPnl').textContent = (s.netPnl >= 0 ? '+$' : '-$') + Math.abs(s.netPnl || 0).toFixed(2);
-    setClass($('replayPnl'), s.netPnl >= 0 ? 'pnl-pos' : 'pnl-neg');
-    $('replayLongs').textContent = (s.longs ? s.longs.wins : 0) + '/' + (s.longs ? s.longs.losses : 0);
-    setClass($('replayLongs'), s.longs && s.longs.winRate > 50 ? 'bullish' : '');
-    $('replayShorts').textContent = (s.shorts ? s.shorts.wins : 0) + '/' + (s.shorts ? s.shorts.losses : 0);
-    setClass($('replayShorts'), s.shorts && s.shorts.winRate > 50 ? 'bullish' : '');
-    $('replayRejections').textContent = s.totalRejections || 0;
-    $('replayStatus').textContent = (data.candlesAnalyzed || 0) + ' candles | ' + (data.calculationTime || 0) + 'ms';
-
-    var trades = data.trades || [];
-    var list = $('replayTradesList');
-    if (trades.length === 0) {
-      list.innerHTML = '<div class="replay-empty">No trades generated — market was neutral throughout</div>';
-    } else {
-      var html = '';
-      for (var i = 0; i < trades.length; i++) {
-        var t = trades[i];
-        var dirCls = t.direction === 'BUY' ? 'dir-buy' : 'dir-sell';
-        var outCls = t.win ? 'outcome-correct' : 'outcome-incorrect';
-        var outcomeText = t.win ? 'WIN' : 'LOSS';
-        var rText = (t.rMultiple >= 0 ? '+' : '') + (t.rMultiple || 0) + 'R';
-        var rCls = t.rMultiple > 0 ? 'pnl-pos' : 'pnl-neg';
-        var durText = t.duration != null ? t.duration + 'c' : '--';
-        html += '<div class="replay-row">' +
-          '<span>' + t.tradeId + '</span>' +
-          '<span class="' + dirCls + '">' + t.direction + '</span>' +
-          '<span>' + fmtUSD(t.entry) + '</span>' +
-          '<span>' + fmtUSD(t.exit) + '</span>' +
-          '<span>' + fmtUSD(t.stopLoss) + '</span>' +
-          '<span>' + fmtUSD(t.takeProfit) + '</span>' +
-          '<span class="' + rCls + '">' + rText + '</span>' +
-          '<span>' + durText + '</span>' +
-          '<span class="' + outCls + '">' + outcomeText + '</span>' +
-          '</div>';
-      }
-      list.innerHTML = html;
-    }
-
-    var rejections = data.rejections || [];
-    if (rejections.length > 0) {
-      $('replayRejectionsHeader').style.display = '';
-      $('replayRejCount').textContent = rejections.length + ' total';
-      var rejHtml = '';
-      for (var j = 0; j < rejections.length; j++) {
-        var r = rejections[j];
-        var time = fmtShortTime(r.timestamp);
-        rejHtml += '<div class="replay-rej-row"><span>' + time + '</span><span>' + (r.reason || '--') + '</span></div>';
-      }
-      $('replayRejectionsList').innerHTML = rejHtml;
-    }
-  } catch(e) {
-    $('replayTradesList').innerHTML = '<div class="replay-empty">Error: ' + e.message + '</div>';
-    $('replayStatus').textContent = 'Error';
+  if (!window.AtlasReplayRequest || typeof window.AtlasReplayRequest.buildUrl !== 'function'
+    || !window.AtlasReplayPresentation
+    || typeof window.AtlasReplayPresentation.presentCanonicalReplay !== 'function') {
+    resetReplayView('Replay could not be displayed.');
+    renderReplayMessage('Replay could not be displayed.');
+    finishReplay(btn);
+    return;
   }
 
-  if (btn) { btn.disabled = false; btn.textContent = 'Run 30D'; btn.className = 'replay-btn'; }
-};
+  var replayUrl;
+  try {
+    var nowMs = Date.now();
+    replayUrl = window.AtlasReplayRequest.buildUrl(API, nowMs);
+  } catch (error) {
+    resetReplayView('Replay could not be displayed.');
+    renderReplayMessage('Replay could not be displayed.');
+    finishReplay(btn);
+    return;
+  }
 
-window.toggleRejections = function() {
-  var el = $('replayRejectionsList');
-  el.style.display = el.style.display === 'none' ? '' : 'none';
+  var response;
+  try {
+    response = await fetch(replayUrl, { headers: authHeaders() });
+  } catch (error) {
+    resetReplayView('Unable to reach the replay service. Check your connection.');
+    renderReplayMessage('Unable to reach the replay service. Check your connection.');
+    finishReplay(btn);
+    return;
+  }
+
+  if (!response || typeof response.status !== 'number') {
+    resetReplayView('Replay returned an invalid response.');
+    renderReplayMessage('Replay returned an invalid response.');
+    finishReplay(btn);
+    return;
+  }
+
+  var data;
+  try {
+    data = await response.json();
+  } catch (error) {
+    resetReplayView('Replay returned an invalid response.');
+    renderReplayMessage('Replay returned an invalid response.');
+    finishReplay(btn);
+    return;
+  }
+
+  if (response.status < 200 || response.status >= 300) {
+    var statusMessage = replayStatusMessage(response.status);
+    resetReplayView(statusMessage);
+    renderReplayMessage(statusMessage);
+    finishReplay(btn);
+    return;
+  }
+
+  var model;
+  try {
+    model = window.AtlasReplayPresentation.presentCanonicalReplay(data);
+  } catch (error) {
+    resetReplayView('Replay returned invalid data.');
+    renderReplayMessage('Replay returned invalid data.');
+    finishReplay(btn);
+    return;
+  }
+
+  try {
+    renderReplayModel(model);
+  } catch (error) {
+    resetReplayView('Replay could not be displayed.');
+    renderReplayMessage('Replay could not be displayed.');
+  }
+  finishReplay(btn);
 };
 
 })();
