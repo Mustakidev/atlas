@@ -106,7 +106,6 @@ function baseDeps(overrides = {}) {
       getBalance: () => 10000,
     },
     riskEngine: null,
-    strategyReplayEngine: null,
     regimeEngine: null,
     regimeDecisionEngine: null,
     advanceRiskEngine: null,

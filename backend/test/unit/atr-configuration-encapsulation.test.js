@@ -5,7 +5,6 @@ const { ATREngine } = require('../../src/engine/atr');
 const { createIndicatorRegistry } = require('../../src/engine/indicators');
 const { RegimeEngine } = require('../../src/market-regime/RegimeEngine');
 const { AdvanceRiskEngine } = require('../../src/engine/advanceRisk');
-const { StrategyReplayEngine } = require('../../src/engine/strategyReplay');
 const { createValidationDependencies } = require('../../src/engine/validationDependencies');
 
 const logger = { info() {}, warn() {}, error() {}, system() {} };
@@ -218,19 +217,6 @@ test('production regime and risk decisions remain stable after mutation attempts
   graph.atrEngine.period = 5;
 
   const after = productionDecision(graph, candles);
-  assert.equal(graph.atrEngine.period, 14);
-  assert.deepEqual(stable(after), stable(before));
-});
-
-test('replay remains isolated from production ATR configuration', () => {
-  const candles = variedCandles();
-  const graph = makeProductionGraph(candles);
-  const replay = new StrategyReplayEngine({ logger, symbol: 'BTCUSDT', config });
-  const before = replay.run(candles, '1h');
-
-  graph.atrEngine.period = 5;
-
-  const after = replay.run(candles, '1h');
   assert.equal(graph.atrEngine.period, 14);
   assert.deepEqual(stable(after), stable(before));
 });
