@@ -137,7 +137,7 @@ class PaperTradingEngine {
       confidence: analysis.confidence,
       reason: analysis.reason,
       status: TRADE_STATES.OPEN,
-    });
+    }, context);
 
     this.lastUpdated = formatTimestamp(nowMs);
     this.calculationTime = elapsedMs(this.clock, start);
@@ -602,7 +602,7 @@ class PaperTradingEngine {
   // Trade Lifecycle
   // ---------------------------------------------------------------------------
 
-  _openTrade(params) {
+  _openTrade(params, context = {}) {
     this._tradeCounter++;
     const tradeId = `PT-${this._tradeCounter}`;
     const entryTime = params.entryTime || formatTimestamp(this.clock.nowMs());
@@ -635,12 +635,13 @@ class PaperTradingEngine {
 
     if (this._trades.length > this._maxTrades) {
       const overflow = this._trades.length - this._maxTrades;
-      const toRemove = this._trades.splice(0, overflow);
+      const toRemove = this._trades.slice(0, overflow);
       for (const t of toRemove) {
         if (t.status !== TRADE_STATES.CLOSED) {
-          this._closeTrade(t, t.currentPrice || t.entryPrice, EXIT_REASONS.INVALIDATED);
+          this._closeTrade(t, t.currentPrice || t.entryPrice, EXIT_REASONS.INVALIDATED, context);
         }
       }
+      this._trades.splice(0, overflow);
     }
 
     return trade;

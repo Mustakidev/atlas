@@ -372,7 +372,14 @@ function createExecutionPipeline({
     }
 
     const engines = { trend, structure: structureResult, rsi: rsiResult, ema: emaResult, macd: macdResult, atr, bollinger: bollingerResult, confluence, mtf: (() => { try { return mtfEngine.calculate(500); } catch (e) { return null; } })() };
-    const trade = safeExecute('PaperTrading', () => paperTradeEngine.signal(engines, price, tf, direction, riskResult, { nowMs: cycle.nowMs }), null, cycle);
+    const signalContext = Object.freeze({ nowMs: cycle.nowMs });
+    const closedBeforeSignal = paperTradeEngine.closed().length;
+    const trade = safeExecute('PaperTrading', () => paperTradeEngine.signal(engines, price, tf, direction, riskResult, signalContext), null, cycle);
+    const signalClosures = paperTradeEngine.closed().slice(closedBeforeSignal);
+    for (const t of signalClosures) {
+      safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl, signalContext), undefined, cycle);
+      console.log(`  Trade Closed (signal): ${t.tradeId} | ${t.exitReason} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
+    }
     if (trade) {
       lastSignalTime = now;
       decision.verdict.tradeOpened = true;
