@@ -42,15 +42,7 @@ function makeLogger(state = {}) {
   };
 }
 
-function makeLegacyResult() {
-  return {
-    legacy: true,
-    stats: { totalTrades: 0, winRate: 0, profitFactor: 0 },
-    calculationTime: 0,
-  };
-}
-
-function makeRoutes({ application, legacyRun, candleEngine, logger, config }) {
+function makeRoutes({ application, candleEngine, logger, config }) {
   return {
     apiManager: {},
     history: {},
@@ -73,7 +65,6 @@ function makeRoutes({ application, legacyRun, candleEngine, logger, config }) {
     analyticsEngine: {},
     paperTradeEngine: {},
     riskEngine: {},
-    strategyReplayEngine: { run: legacyRun },
     regimeEngine: {},
     regimeDecisionEngine: {},
     advanceRiskEngine: {},
@@ -85,7 +76,6 @@ function makeRoutes({ application, legacyRun, candleEngine, logger, config }) {
 
 function createTestApp({
   application,
-  legacyRun = () => makeLegacyResult(),
   candleEngine = {
     getAllTimeframes: () => ['1h'],
     getCandles: () => [{ openTime: START_TIME }],
@@ -98,7 +88,6 @@ function createTestApp({
   const logger = makeLogger(loggerState);
   const routes = makeRoutes({
     application,
-    legacyRun,
     candleEngine,
     logger,
     config,
@@ -206,9 +195,7 @@ test('canonical success uses only the injected application', async () => {
     getCandles() { throw new Error('canonical request read candle data'); },
     getActive() { throw new Error('canonical request read candle data'); },
   };
-  const legacyRun = () => { throw new Error('canonical request executed legacy replay'); };
-
-  await withApp({ application, candleEngine, legacyRun }, async server => {
+  await withApp({ application, candleEngine }, async server => {
     const result = await request(server, {
       path: `/api/strategy/replay/v2?${VALID_QUERY}`,
       headers: authHeaders(),
@@ -246,35 +233,29 @@ test('canonical availability is checked after parsing', async () => {
   });
 });
 
-test('legacy replay coexists and retains sanitizer ownership', async () => {
-  let legacyCalls = 0;
+test('removed legacy replay paths return the default authenticated 404', async () => {
   let canonicalCalls = 0;
   const application = { run: async () => { canonicalCalls++; return {}; } };
-  const legacyResult = makeLegacyResult();
 
-  await withApp({
-    application,
-    legacyRun() {
-      legacyCalls++;
-      return legacyResult;
-    },
-  }, async server => {
-    const legacy = await request(server, {
+  await withApp({ application }, async server => {
+    const getResult = await request(server, {
       path: '/api/strategy/replay',
       headers: authHeaders(),
     });
-    assert.equal(legacy.statusCode, 200);
-    assert.deepEqual(legacy.body, legacyResult);
+    assert.equal(getResult.statusCode, 404);
+    assert.match(getResult.headers['content-type'], /^text\/html; charset=utf-8/);
+    assert.match(getResult.text, /Cannot GET \/api\/strategy\/replay/);
 
-    const sanitized = await request(server, {
-      path: '/api/strategy/replay?direction=INVALID',
+    const postResult = await request(server, {
+      method: 'POST',
+      path: '/api/strategy/replay',
       headers: authHeaders(),
     });
-    assert.equal(sanitized.statusCode, 400);
-    assert.deepEqual(sanitized.body, { error: 'direction must be BUY or SELL' });
+    assert.equal(postResult.statusCode, 404);
+    assert.match(postResult.headers['content-type'], /^text\/html; charset=utf-8/);
+    assert.match(postResult.text, /Cannot POST \/api\/strategy\/replay/);
   });
 
-  assert.equal(legacyCalls, 1);
   assert.equal(canonicalCalls, 0);
 });
 

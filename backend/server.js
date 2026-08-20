@@ -20,7 +20,6 @@ const { BacktestEngine } = require('./src/engine/backtest');
 const { AnalyticsEngine } = require('./src/engine/analytics');
 const { PaperTradingEngine } = require('./src/engine/paperTrading');
 const { RiskEngine } = require('./src/engine/risk');
-const { StrategyReplayEngine } = require('./src/engine/strategyReplay');
 const { RegimeEngine } = require('./src/market-regime/RegimeEngine');
 const { RegimeDecisionEngine } = require('./src/market-regime/RegimeDecisionEngine');
 const { AdvanceRiskEngine } = require('./src/engine/advanceRisk');
@@ -101,7 +100,6 @@ if (typeof providerKey === 'string' && providerKey.trim() !== '') {
 }
 
 const mtfConfirmationEngine = new MTFConfirmationEngine({ logger, symbol, config });
-const strategyReplayEngine = new StrategyReplayEngine({ logger, symbol, config, riskPolicySource: advanceRiskEngine });
 const validationDependencyFactory = () => createValidationDependencies({ config, symbol });
 const validationEngine = new ValidationEngine({
   ...validationDependencyFactory(),
@@ -153,7 +151,6 @@ const app = createApp({
     analyticsEngine,
     paperTradeEngine,
     riskEngine,
-    strategyReplayEngine,
     regimeEngine,
     regimeDecisionEngine,
     advanceRiskEngine,

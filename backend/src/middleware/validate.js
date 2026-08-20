@@ -18,7 +18,7 @@ function sanitizeQuery(req, res, next) {
     q.limit = String(clampInt(q.limit, 1, 10000, 100));
   }
 
-  const intParams = ['predictionCandles', 'warmupCandles', 'minSignalConfidence', 'days', 'period'];
+  const intParams = ['predictionCandles', 'warmupCandles', 'minSignalConfidence', 'period'];
   for (const key of intParams) {
     if (q[key] !== undefined) {
       q[key] = String(clampInt(q[key], 0, 10000, 0));

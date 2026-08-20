@@ -3,7 +3,6 @@ const assert = require('node:assert/strict');
 
 const { createExecutionPipeline } = require('../../src/core/executionPipeline');
 const { MTFConfirmationEngine } = require('../../src/engine/mtfConfirmation');
-const { StrategyReplayEngine } = require('../../src/engine/strategyReplay');
 
 const FIXED_ISO = '2024-01-01T00:00:00.000Z';
 const BASE_TIME = Date.parse('2024-01-01T00:00:00.000Z');
@@ -109,29 +108,6 @@ function createPipelineHarness() {
   return { pipeline, mtfConfirmationEngine, signals };
 }
 
-function makeReplay(mtfConfirmationEngine) {
-  const replay = new StrategyReplayEngine({
-    logger,
-    symbol: 'BTCUSDT',
-    config,
-    mtfConfirmationEngine,
-    advanceRiskEngine: { evaluate: () => ({ tradeAllowed: true, rejectionReason: null }) },
-  });
-  replay._runMarketRegime = () => ({ regime: 'TRENDING', confidence: 80, trendScore: 80, rangeScore: 20, volatility: 'LOW' });
-  replay._runConfluence = (_candles, timeframe) => timeframe === '1m'
-    ? { score: 30, bias: 'Bearish', confidence: 60 }
-    : { score: 80, bias: 'Bullish', confidence: 80 };
-  replay._runATR = () => ({ ready: true, atr: 1, atrPercentage: 1 });
-  replay._runStructure = () => ({ ready: true, direction: 'bullish', structure: 'Bullish', score: 80 });
-  replay._synthesizeAnalyzer = () => ({ trend: { '1H': 'Bullish' } });
-  replay._runRSI = () => ({ ready: true, value: 70, state: 'Overbought' });
-  replay._runEMA = () => ({ ready: true, value: 110, trend: 'Above' });
-  replay._runMACD = () => ({ ready: true, trend: 'Bullish', histogram: 1 });
-  replay._runBollinger = () => ({ ready: true, pricePosition: 'Inside Bands' });
-  replay._analyzeEngines = () => ({ direction: 'BUY', confidence: 80, reason: 'controlled probe', buyRatio: 0.8, sellRatio: 0.2 });
-  return replay;
-}
-
 test('normal pipeline remains isolated after an aggressive evaluation attempt', () => {
   const clean = createPipelineHarness();
   const cleanOutcome = runPipeline(clean);
@@ -145,18 +121,4 @@ test('normal pipeline remains isolated after an aggressive evaluation attempt', 
   assert.equal(reusedOutcome.mtf.mtfAllowed, false);
   assert.equal(reusedOutcome.tradeOpened, false);
   assert.equal(reusedOutcome.signalCount, 0);
-});
-
-test('strategy replay is unchanged after an aggressive evaluation attempt', () => {
-  const candles = makeCandles(52);
-  const contaminatedEngine = new MTFConfirmationEngine({ logger, symbol: 'BTCUSDT', config });
-  contaminatedEngine.evaluate({ direction: 'BUY', aggressive: true, timeframes: mixedTimeframes() });
-  const cleanEngine = new MTFConfirmationEngine({ logger, symbol: 'BTCUSDT', config });
-
-  const contaminated = makeReplay(contaminatedEngine).run(candles, '1h');
-  const clean = makeReplay(cleanEngine).run(candles, '1h');
-
-  assert.deepEqual(contaminated.trades, clean.trades);
-  assert.deepEqual(contaminated.rejections, clean.rejections);
-  assert.deepEqual(contaminated.stats, clean.stats);
 });
