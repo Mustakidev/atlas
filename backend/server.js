@@ -19,7 +19,6 @@ const { SignalHistoryEngine } = require('./src/engine/signalHistory');
 const { BacktestEngine } = require('./src/engine/backtest');
 const { AnalyticsEngine } = require('./src/engine/analytics');
 const { PaperTradingEngine } = require('./src/engine/paperTrading');
-const { RiskEngine } = require('./src/engine/risk');
 const { RegimeEngine } = require('./src/market-regime/RegimeEngine');
 const { RegimeDecisionEngine } = require('./src/market-regime/RegimeDecisionEngine');
 const { AdvanceRiskEngine } = require('./src/engine/advanceRisk');
@@ -69,7 +68,6 @@ const signalHistoryEngine = new SignalHistoryEngine({ config, logger, symbol, hi
 const backtestEngine = new BacktestEngine({ structureEngine, indicatorRegistry, logger, symbol });
 const analyticsEngine = new AnalyticsEngine({ logger, symbol });
 const paperTradeEngine = new PaperTradingEngine({ logger, symbol, clock });
-const riskEngine = new RiskEngine({ logger, symbol });
 const regimeEngine = new RegimeEngine({ indicatorRegistry, atrEngine, candleEngine, analyzer, logger, config, symbol });
 const regimeDecisionEngine = new RegimeDecisionEngine({ logger, symbol });
 const advanceRiskEngine = new AdvanceRiskEngine({ logger, symbol, paperTradeEngine, config, clock });
@@ -150,7 +148,6 @@ const app = createApp({
     backtestEngine,
     analyticsEngine,
     paperTradeEngine,
-    riskEngine,
     regimeEngine,
     regimeDecisionEngine,
     advanceRiskEngine,
