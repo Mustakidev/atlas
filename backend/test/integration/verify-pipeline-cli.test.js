@@ -454,7 +454,7 @@ test('CLI environment overrides take precedence over CLI duration and interval a
   }, {
     args: ['--duration', '1', '--interval', '1'],
     environment: {
-      ATLAS_VERIFY_DURATION_MS: '900',
+      ATLAS_VERIFY_DURATION_MS: '5000',
       ATLAS_VERIFY_INTERVAL_MS: '100',
     },
   });
@@ -462,13 +462,13 @@ test('CLI environment overrides take precedence over CLI duration and interval a
   completedRun(run);
   const { json, markdown } = run.reports;
   equal(run, run.result.code, 0, 'valid override precedence run exits zero');
-  equal(run, json.verification.runtime.requestedDurationMs, 900, 'duration environment override wins over CLI duration');
+  equal(run, json.verification.runtime.requestedDurationMs, 5000, 'duration environment override wins over CLI duration');
   equal(run, json.verification.runtime.runCompleted, true, 'CLI completes under the effective environment duration');
-  equal(run, json.verification.polling.expectedPollAttempts, 9, 'interval environment override wins over CLI interval');
+  equal(run, json.verification.polling.expectedPollAttempts, 50, 'interval environment override wins over CLI interval');
   check(run, run.fixture.requests.length > 0, 'base URL override directs requests to the fixture');
   equal(run, run.reports.jsonFiles.length, 1, 'output directory override receives JSON');
   equal(run, run.reports.markdownFiles.length, 1, 'output directory override receives Markdown');
-  match(run, markdown, /Requested Duration \| 900ms/, 'Markdown reports the effective duration override');
+  match(run, markdown, /Requested Duration \| 5000ms/, 'Markdown reports the effective duration override');
   match(run, markdown, /\*\*Poll Interval:\*\* 0\.1s/, 'Markdown reports the effective interval override');
 });
 
@@ -483,6 +483,7 @@ test('CLI HTTPS run uses the secure fixture and preserves all verification contr
     ],
     paper: validPaperSequence(),
   }, {
+    durationMs: 5000,
     assertCleanup: true,
     environment: { NODE_TLS_REJECT_UNAUTHORIZED: '0' },
   });
@@ -517,6 +518,7 @@ test('CLI classifies HTTPS invalid JSON as a contract failure', async t => {
     ],
     paper: validPaperSequence(),
   }, {
+    durationMs: 5000,
     assertCleanup: true,
     environment: { NODE_TLS_REJECT_UNAUTHORIZED: '0' },
   });
@@ -582,6 +584,8 @@ test('CLI passing run writes reports and preserves diagnostic gap telemetry', as
       jsonResponse(rejectedInspector(12), { label: 'runtime-duplicate-12' }),
     ],
     paper: validPaperSequence(),
+  }, {
+    durationMs: 5000,
   });
 
   completedRun(run);
@@ -603,6 +607,7 @@ test('CLI passing run writes reports and preserves diagnostic gap telemetry', as
   equal(run, json.verification.source.missingSourceCycleCount, 1, 'gap count is exact');
   deepEqual(run, json.verification.source.missingSourceCycleRanges, [{ from: 11, to: 11, count: 1 }], 'gap range is compact');
   equal(run, json.verification.source.sourceCycleRegressions, 0, 'passing run has no regressions');
+  check(run, run.fixture.requests.some(request => request.label === 'runtime-duplicate-12'), 'duplicate source fixture event is observed');
   check(run, json.verification.source.duplicateSourceObservations > 0, 'duplicate source observations are counted');
   equal(run, json.verification.runtime.runCompleted, true, 'runtime completed');
   equal(run, json.verification.errors.inspectorEndpoint.count, 0, 'inspector endpoint errors are zero');
@@ -632,6 +637,8 @@ test('CLI accepts unavailable startup and records later available progress', asy
       jsonResponse(rejectedInspector(2), { label: 'runtime-cycle-2' }),
     ],
     paper: validPaperSequence(),
+  }, {
+    durationMs: 5000,
   });
 
   completedRun(run);
@@ -655,6 +662,8 @@ test('CLI records inspector schema failure while continuing paper processing', a
       jsonResponse(canonicalInspector(2), { label: 'runtime-cycle-2' }),
     ],
     paper: validPaperSequence(),
+  }, {
+    durationMs: 5000,
   });
 
   completedRun(run);
@@ -686,6 +695,8 @@ test('CLI records paper contract failure while preserving inspector metrics', as
       jsonResponse({ open: [], closed: {} }, { label: 'paper-malformed-later' }),
       ...validPaperSequence(),
     ],
+  }, {
+    durationMs: 5000,
   });
 
   completedRun(run);
@@ -726,7 +737,7 @@ for (const endpoint of ['inspector', 'paper']) {
         ]
         : validPaperSequence(),
     };
-    const run = await runScenario(t, fixture);
+    const run = await runScenario(t, fixture, { durationMs: 5000 });
 
     completedRun(run);
     const { json, markdown } = run.reports;
@@ -757,6 +768,8 @@ test('CLI isolates an inspector endpoint failure from paper processing', async t
       jsonResponse(canonicalInspector(2), { label: 'runtime-cycle-2' }),
     ],
     paper: validPaperSequence(),
+  }, {
+    durationMs: 5000,
   });
 
   completedRun(run);
