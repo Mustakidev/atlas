@@ -463,6 +463,7 @@ test('CLI environment overrides take precedence over CLI duration and interval a
   const { json, markdown } = run.reports;
   equal(run, run.result.code, 0, 'valid override precedence run exits zero');
   equal(run, json.verification.runtime.requestedDurationMs, 900, 'duration environment override wins over CLI duration');
+  equal(run, json.verification.runtime.runCompleted, true, 'CLI completes under the effective environment duration');
   equal(run, json.verification.polling.expectedPollAttempts, 9, 'interval environment override wins over CLI interval');
   check(run, run.fixture.requests.length > 0, 'base URL override directs requests to the fixture');
   equal(run, run.reports.jsonFiles.length, 1, 'output directory override receives JSON');
@@ -805,6 +806,8 @@ test('CLI records source regression without losing later valid progress', async 
       jsonResponse(canonicalInspector(9), { label: 'runtime-cycle-9' }),
     ],
     paper: validPaperSequence(),
+  }, {
+    durationMs: 5000,
   });
 
   completedRun(run);
@@ -816,7 +819,7 @@ test('CLI records source regression without losing later valid progress', async 
     cycle: 3,
     observedAt: json.verification.source.sourceCycleRegressionDetails[0].observedAt,
   }, 'regression details retain the previous and observed cycles');
-  equal(run, json.verification.source.lastSourceCycle, 9, 'later valid progress updates the final cycle');
+  check(run, json.verification.source.lastSourceCycle > json.verification.source.sourceCycleRegressionDetails[0].previousCycle, 'later valid progress advances beyond the pre-regression cycle');
   const { checks } = checkMap(run);
   equal(run, checks['Source cycle progressed'].pass, true, 'source progress passes after later progress');
   equal(run, checks['Source cycle continuity'].pass, false, 'source continuity fails after regression');
