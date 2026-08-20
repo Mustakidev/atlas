@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const express = require('express');
 
 const { createApp, createErrorHandler } = require('../../src/app');
+const { AdvanceRiskEngine } = require('../../src/engine/advanceRisk');
 const { cloneFixture, validMarketSnapshot } = require('../fixtures/market');
 
 const API_KEY = 'integration-test-key';
@@ -48,6 +49,28 @@ function logger(state) {
 
 function createTestApp(state) {
   const snapshot = cloneFixture(validMarketSnapshot());
+  const testLogger = logger(state);
+  const testConfig = config(state);
+  const advanceRiskEngine = state.disableAdvanceRisk ? null : new AdvanceRiskEngine({
+    logger: testLogger,
+    symbol: 'BTCUSDT',
+    paperTradeEngine: null,
+    config: testConfig,
+    clock: {
+      nowMs: () => Date.parse('2024-01-01T00:00:00.000Z'),
+      monotonicMs: () => 0,
+    },
+  });
+  if (advanceRiskEngine) {
+    state.advanceRiskEngine = advanceRiskEngine;
+    const onTradeClosed = advanceRiskEngine.onTradeClosed.bind(advanceRiskEngine);
+    advanceRiskEngine.onTradeClosed = (pnl, context) => {
+      state.riskClosures = state.riskClosures || [];
+      state.riskClosures.push({ pnl, context });
+      if (state.throwRisk) throw new Error('controlled risk synchronization failure');
+      return onTradeClosed(pnl, context);
+    };
+  }
   const deps = {
     apiManager: {
       isConnected: () => true,
@@ -70,8 +93,8 @@ function createTestApp(state) {
       getCandles: () => [],
       getActive: () => null,
     },
-    logger: logger(state),
-    config: config(state),
+    logger: testLogger,
+    config: testConfig,
     eventBus: {},
     cache: { getAge: () => 100 },
     indicatorRegistry: {
@@ -89,7 +112,7 @@ function createTestApp(state) {
     signalHistoryEngine: null,
     backtestEngine: null,
     analyticsEngine: null,
-    paperTradeEngine: {
+    paperTradeEngine: state.disablePaperTrade ? null : {
       open: () => [],
       history: () => [],
       stats: () => ({ totalTrades: 0, openTrades: 0, closedTrades: 0 }),
@@ -97,13 +120,26 @@ function createTestApp(state) {
       getBalance: () => 10000,
       close: (tradeId, reason) => {
         state.closeRequest = { tradeId, reason };
-        return { tradeId, reason, status: 'CLOSED' };
+        state.closeCalls = state.closeCalls || [];
+        state.closeCalls.push({ tradeId, reason });
+        const result = Array.isArray(state.closeResults)
+          ? state.closeResults.shift()
+          : Object.hasOwn(state, 'closeResult')
+            ? state.closeResult
+            : {
+              tradeId,
+              reason,
+              status: 'CLOSED',
+              pnl: 25,
+              exitTime: '2024-01-01T00:00:00.000Z',
+            };
+        if (result) state.paperClosed = true;
+        return result;
       },
     },
-    riskEngine: null,
     regimeEngine: null,
     regimeDecisionEngine: null,
-    advanceRiskEngine: null,
+    advanceRiskEngine,
     mtfConfirmationEngine: null,
     symbol: 'BTCUSDT',
   };
@@ -265,7 +301,202 @@ test('JSON parsing reaches a protected endpoint after authentication', async () 
 
     assert.equal(result.statusCode, 200);
     assert.deepEqual(state.closeRequest, { tradeId: 'T-1', reason: 'Integration test' });
-    assert.deepEqual(result.json(), { tradeId: 'T-1', reason: 'Integration test', status: 'CLOSED' });
+    assert.equal(state.advanceRiskEngine.getDailyPnL(), 25);
+    assert.equal(state.advanceRiskEngine.getConsecutiveLosses(), 0);
+    assert.deepEqual(state.riskClosures, [{
+      pnl: 25,
+      context: { nowMs: Date.parse('2024-01-01T00:00:00.000Z') },
+    }]);
+    assert.deepEqual(result.json(), {
+      tradeId: 'T-1',
+      reason: 'Integration test',
+      status: 'CLOSED',
+      pnl: 25,
+      exitTime: '2024-01-01T00:00:00.000Z',
+    });
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('manual close with a missing tradeId does not notify risk', async () => {
+  const state = {};
+  const server = await startApp(state);
+  try {
+    const result = await request(server, {
+      method: 'POST',
+      path: '/api/paper-trades/close',
+      headers: { 'x-api-key': API_KEY },
+      body: {},
+    });
+
+    assert.equal(result.statusCode, 400);
+    assert.deepEqual(result.json(), { error: 'tradeId is required' });
+    assert.equal(state.closeCalls?.length || 0, 0);
+    assert.equal(state.riskClosures?.length || 0, 0);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('manual close of an unknown trade preserves 404 and does not notify risk', async () => {
+  const state = { closeResult: null };
+  const server = await startApp(state);
+  try {
+    const result = await request(server, {
+      method: 'POST',
+      path: '/api/paper-trades/close',
+      headers: { 'x-api-key': API_KEY },
+      body: { tradeId: 'missing' },
+    });
+
+    assert.equal(result.statusCode, 404);
+    assert.deepEqual(result.json(), { error: 'Trade not found or already closed' });
+    assert.equal(state.closeCalls.length, 1);
+    assert.equal(state.riskClosures?.length || 0, 0);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('repeated manual close notifies risk only for the first closure', async () => {
+  const state = {
+    closeResults: [
+      { tradeId: 'T-1', reason: 'Manual', status: 'CLOSED', pnl: -25, exitTime: '2024-01-01T00:00:00.000Z' },
+      null,
+    ],
+  };
+  const server = await startApp(state);
+  try {
+    const first = await request(server, {
+      method: 'POST',
+      path: '/api/paper-trades/close',
+      headers: { 'x-api-key': API_KEY },
+      body: { tradeId: 'T-1' },
+    });
+    const second = await request(server, {
+      method: 'POST',
+      path: '/api/paper-trades/close',
+      headers: { 'x-api-key': API_KEY },
+      body: { tradeId: 'T-1' },
+    });
+
+    assert.equal(first.statusCode, 200);
+    assert.equal(second.statusCode, 404);
+    assert.equal(state.riskClosures.length, 1);
+    assert.equal(state.advanceRiskEngine.getDailyPnL(), -25);
+    assert.equal(state.advanceRiskEngine.getConsecutiveLosses(), 1);
+    assert.deepEqual(state.riskClosures[0], {
+      pnl: -25,
+      context: { nowMs: Date.parse('2024-01-01T00:00:00.000Z') },
+    });
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('malformed manual close snapshots fail without notifying risk', async () => {
+  for (const closeResult of [
+    { tradeId: 'T-1', status: 'OPEN', pnl: 25, exitTime: '2024-01-01T00:00:00.000Z' },
+    { tradeId: 'T-1', status: 'CLOSED', pnl: NaN, exitTime: '2024-01-01T00:00:00.000Z' },
+    { tradeId: 'T-1', status: 'CLOSED', pnl: 25, exitTime: 'not-a-date' },
+  ]) {
+    const state = { closeResult };
+    const server = await startApp(state);
+    try {
+      const result = await request(server, {
+        method: 'POST',
+        path: '/api/paper-trades/close',
+        headers: { 'x-api-key': API_KEY },
+        body: { tradeId: 'T-1' },
+      });
+
+      assert.equal(result.statusCode, 500);
+      assert.deepEqual(result.json(), { error: 'Internal server error' });
+      assert.equal(state.riskClosures?.length || 0, 0);
+      assert.equal(state.paperClosed, true);
+    } finally {
+      await stopApp(server);
+    }
+  }
+});
+
+test('risk synchronization failure returns generic error without reopening the trade', async () => {
+  const state = { throwRisk: true };
+  const server = await startApp(state);
+  try {
+    const result = await request(server, {
+      method: 'POST',
+      path: '/api/paper-trades/close',
+      headers: { 'x-api-key': API_KEY },
+      body: { tradeId: 'T-1' },
+    });
+
+    assert.equal(result.statusCode, 500);
+    assert.deepEqual(result.json(), { error: 'Internal server error' });
+    assert.equal(state.paperClosed, true);
+    assert.equal(state.riskClosures.length, 1);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('manual close preflights the canonical risk dependency', async () => {
+  for (const [state, expectedError] of [
+    [{ disableAdvanceRisk: true }, 'Advance Risk engine not available'],
+    [{ disablePaperTrade: true }, 'Paper trading engine not available'],
+  ]) {
+    const server = await startApp(state);
+    try {
+      const result = await request(server, {
+        method: 'POST',
+        path: '/api/paper-trades/close',
+        headers: { 'x-api-key': API_KEY },
+        body: { tradeId: 'T-1' },
+      });
+
+      assert.equal(result.statusCode, 503);
+      assert.deepEqual(result.json(), { error: expectedError });
+      assert.equal(state.closeCalls?.length || 0, 0);
+      assert.equal(state.paperClosed, undefined);
+      assert.equal(state.riskClosures?.length || 0, 0);
+    } finally {
+      await stopApp(server);
+    }
+  }
+});
+
+test('missing tradeId wins before unavailable close dependencies', async () => {
+  const state = { disablePaperTrade: true };
+  const server = await startApp(state);
+  try {
+    const result = await request(server, {
+      method: 'POST',
+      path: '/api/paper-trades/close',
+      headers: { 'x-api-key': API_KEY },
+      body: {},
+    });
+
+    assert.equal(result.statusCode, 400);
+    assert.deepEqual(result.json(), { error: 'tradeId is required' });
+    assert.equal(state.closeCalls?.length || 0, 0);
+    assert.equal(state.riskClosures?.length || 0, 0);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('retired risk route returns the default authenticated 404', async () => {
+  const server = await startApp({});
+  try {
+    const result = await request(server, {
+      path: '/api/risk?entryPrice=100&direction=BUY',
+      headers: { 'x-api-key': API_KEY },
+    });
+
+    assert.equal(result.statusCode, 404);
+    assert.match(result.headers['content-type'], /^text\/html; charset=utf-8/);
+    assert.match(result.text, /Cannot GET \/api\/risk/);
   } finally {
     await stopApp(server);
   }

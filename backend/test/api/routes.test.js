@@ -2,7 +2,6 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { createRouter } = require('../../src/routes/routes');
-const { RiskEngine } = require('../../src/engine/risk');
 const { AdvanceRiskEngine } = require('../../src/engine/advanceRisk');
 const { cloneFixture, validMarketSnapshot } = require('../fixtures/market');
 
@@ -32,7 +31,6 @@ function riskApiDependencies() {
     regimeEngine: {
       calculate: () => ({ regime: 'TRENDING_BULL' }),
     },
-    riskEngine: new RiskEngine({ logger: riskLogger, symbol: 'BTCUSDT' }),
     advanceRiskEngine: new AdvanceRiskEngine({
       logger: riskLogger,
       symbol: 'BTCUSDT',
@@ -105,7 +103,6 @@ function baseDeps(overrides = {}) {
       performance: () => ({ profitFactor: 0 }),
       getBalance: () => 10000,
     },
-    riskEngine: null,
     regimeEngine: null,
     regimeDecisionEngine: null,
     advanceRiskEngine: null,
@@ -199,36 +196,14 @@ test('GET /api/candles returns timeframe and candle collections', async () => {
 });
 
 test('invalid entryPrice is rejected by query sanitization', async () => {
-  const result = await dispatch('/risk', { entryPrice: 'not-a-number' });
+  const result = await dispatch('/advance-risk', { entryPrice: 'not-a-number' });
 
   assert.equal(result.statusCode, 400);
   assert.equal(result.body.error, 'entryPrice must be a positive number');
 });
 
-test('GET /api/risk returns the standalone calculator contract', async () => {
-  const result = await dispatch('/risk', { entryPrice: '100', direction: 'BUY' }, riskApiDependencies());
-
-  assert.equal(result.statusCode, 200);
-  assert.equal(result.body.engineVersion, '1.0.0');
-  assert.equal(result.body.tradeAllowed, true);
-  assert.equal(result.body.stopLoss, 96);
-  assert.equal(result.body.takeProfit, 108);
-  assert.equal(result.body.riskReward, 2);
-  assert.equal(result.body.risk, 4);
-  assert.equal(result.body.reward, 8);
-  assert.equal(result.body.rejectionReason, null);
-
-  for (const field of [
-    'positionSize', 'accountBalance', 'riskPerTradePct', 'dailyPnL',
-    'dailyDrawdownPct', 'consecutiveLosses', 'regime', 'session',
-  ]) {
-    assert.equal(Object.hasOwn(result.body, field), false, `/risk should not expose ${field}`);
-  }
-});
-
 test('GET /api/advance-risk returns the canonical execution-plan contract', async () => {
   const result = await dispatch('/advance-risk', { entryPrice: '100', direction: 'BUY' }, riskApiDependencies());
-  const standalone = await dispatch('/risk', { entryPrice: '100', direction: 'BUY' }, riskApiDependencies());
 
   assert.equal(result.statusCode, 200);
   assert.equal(result.body.engineVersion, '2.0.0');
@@ -245,10 +220,6 @@ test('GET /api/advance-risk returns the canonical execution-plan contract', asyn
   assert.equal(result.body.dailyDrawdownPct, 0);
   assert.equal(result.body.consecutiveLosses, 0);
   assert.equal(result.body.rejectionReason, null);
-
-  assert.notEqual(result.body.takeProfit, standalone.body.takeProfit);
-  assert.notEqual(result.body.riskReward, standalone.body.riskReward);
-  assert.equal(Object.hasOwn(standalone.body, 'positionSize'), false);
   assert.equal(Object.hasOwn(result.body, 'positionSize'), true);
 });
 

@@ -409,45 +409,6 @@ async function updatePipelineDirection() {
   }
 }
 
-async function fetchRisk() {
-  try {
-    var price = currentPrice;
-    var dir = pipelineDirection;
-    if (!price || !dir) return;
-    var d = await dedupedFetch('risk-' + chartCurrentTF + '-' + dir, API + '/api/risk?timeframe=' + chartCurrentTF + '&entryPrice=' + price + '&direction=' + dir);
-    if (!d) return;
-    $('riskStatus').textContent = d.tradeAllowed ? 'Allowed' : 'Rejected';
-    setClass($('riskDir'), d.direction === 'BUY' ? 'bullish' : 'bearish');
-    $('riskDir').textContent = d.direction || '--';
-    $('riskEntry').textContent = d.entryPrice != null ? fmtUSD(d.entryPrice) : '--';
-    $('riskSL').textContent = d.stopLoss != null ? fmtUSD(d.stopLoss) : '--';
-    setClass($('riskSL'), 'bearish');
-    $('riskTP').textContent = d.takeProfit != null ? fmtUSD(d.takeProfit) : '--';
-    setClass($('riskTP'), 'bullish');
-    $('riskRR').textContent = d.riskReward != null ? '1:' + d.riskReward : '--';
-
-    var verdict = $('riskVerdict');
-    var icon = $('riskVerdictIcon');
-    var text = $('riskVerdictText');
-    var rej = $('riskRejection');
-    if (d.tradeAllowed) {
-      verdict.className = 'risk-verdict allowed';
-      icon.textContent = '\u2713';
-      icon.style.color = '#00e676';
-      text.textContent = 'TRADE ALLOWED';
-      text.style.color = '#00e676';
-      rej.textContent = '';
-    } else {
-      verdict.className = 'risk-verdict rejected';
-      icon.textContent = '\u2717';
-      icon.style.color = '#ff5252';
-      text.textContent = 'TRADE REJECTED';
-      text.style.color = '#ff5252';
-      rej.textContent = d.rejectionReason || '';
-    }
-  } catch(e) {}
-}
-
 async function fetchAdvanceRisk() {
   try {
     var price = currentPrice;
@@ -668,7 +629,6 @@ function startPolling() {
   fetchIndicators();
   fetchConfluence();
   fetchMarketRegime();
-  fetchRisk();
   fetchAdvanceRisk();
   fetchMtfConfirmation();
   fetchPaperTrades();
@@ -683,7 +643,6 @@ function startPolling() {
     fetchIndicators();
     fetchConfluence();
     fetchMarketRegime();
-    fetchRisk();
     fetchAdvanceRisk();
     fetchMtfConfirmation();
     fetchPaperTrades();

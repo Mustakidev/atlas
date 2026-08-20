@@ -3,7 +3,7 @@ const { sanitizeQuery } = require('../middleware/validate');
 const { getFinalizedCandles } = require('../engine/candleUtils');
 
 function createRouter(deps) {
-  const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, riskEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision } = deps;
+  const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision } = deps;
   const router = express.Router();
 
   router.use(sanitizeQuery);
@@ -670,86 +670,35 @@ function createRouter(deps) {
   });
 
   router.post('/paper-trades/close', (req, res) => {
-    if (!paperTradeEngine) {
-      return res.status(503).json({ error: 'Paper trading engine not available' });
-    }
     const { tradeId, reason } = req.body || {};
     if (!tradeId) {
       return res.status(400).json({ error: 'tradeId is required' });
     }
-    const closed = paperTradeEngine.close(tradeId, reason || 'Manual');
+
+    if (!paperTradeEngine || typeof paperTradeEngine.close !== 'function') {
+      return res.status(503).json({ error: 'Paper trading engine not available' });
+    }
+    if (!advanceRiskEngine || typeof advanceRiskEngine.onTradeClosed !== 'function') {
+      return res.status(503).json({ error: 'Advance Risk engine not available' });
+    }
+
+    const normalizedReason = reason || 'Manual';
+    const closed = paperTradeEngine.close(tradeId, normalizedReason);
     if (!closed) {
       return res.status(404).json({ error: 'Trade not found or already closed' });
     }
-    logger.info('PaperTrades', `POST /paper-trades/close | ${tradeId} | reason=${reason || 'Manual'} | pnl=${closed.pnl}`);
+
+    const nowMs = typeof closed.exitTime === 'string' ? Date.parse(closed.exitTime) : NaN;
+    if (closed.status !== 'CLOSED'
+      || typeof closed.pnl !== 'number'
+      || !Number.isFinite(closed.pnl)
+      || !Number.isFinite(nowMs)) {
+      throw new TypeError('Paper trade close returned an invalid closed trade');
+    }
+
+    advanceRiskEngine.onTradeClosed(closed.pnl, { nowMs });
+    logger.info('PaperTrades', `POST /paper-trades/close | ${tradeId} | reason=${normalizedReason} | pnl=${closed.pnl}`);
     res.json(closed);
-  });
-
-  // ---------------------------------------------------------------------------
-  // Standalone Risk Calculator API — simple ATR-based stop loss/take profit evaluation
-  // ---------------------------------------------------------------------------
-
-  router.get('/risk', (req, res) => {
-    if (!riskEngine) {
-      return res.status(503).json({ error: 'Risk engine not available' });
-    }
-
-    const tf = (req.query.timeframe || '1h').toLowerCase();
-    const entryPrice = parseFloat(req.query.entryPrice);
-    const direction = (req.query.direction || 'BUY').toUpperCase();
-
-    if (!entryPrice || entryPrice <= 0) {
-      return res.status(400).json({ error: 'Valid entryPrice query parameter required' });
-    }
-    if (!['BUY', 'SELL'].includes(direction)) {
-      return res.status(400).json({ error: 'direction must be BUY or SELL' });
-    }
-
-    // Gather ATR data
-    let atr = null;
-    const valid = candleEngine.getAllTimeframes();
-    if (valid.includes(tf) && atrEngine) {
-      atr = atrEngine.calculate(tf);
-    }
-
-    // Gather trend data
-    let trend = null;
-    if (analyzer) {
-      trend = analyzer.getAnalysis();
-    }
-
-    // Gather structure data
-    let structure = null;
-    if (structureEngine && candleEngine) {
-      const candles = candleEngine.getCandles(tf, 100);
-      if (candles.length > 0) {
-        structure = structureEngine.calculate(candles);
-      }
-    }
-
-    // Gather confluence data
-    let confluence = null;
-    if (confluenceEngine && candleEngine) {
-      const candles = candleEngine.getCandles(tf, 100);
-      if (candles.length > 0) {
-        confluence = confluenceEngine.calculate(candles, tf);
-      }
-    }
-
-    const result = riskEngine.evaluate({
-      symbol: symbol,
-      timeframe: tf,
-      entryPrice,
-      atr: atr || { ready: false, atr: null, atrPercentage: 0 },
-      direction,
-      trend,
-      structure,
-      confluence,
-    });
-
-    logger.info('Risk', `Risk | ${tf} | ${direction} @ ${entryPrice} | allowed=${result.tradeAllowed} | ${result.calculationTime}ms`);
-
-    res.json(result);
   });
 
   // ---------------------------------------------------------------------------

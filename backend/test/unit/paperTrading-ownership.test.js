@@ -65,6 +65,7 @@ function responseHarness(resolve, reject) {
 function dispatch(engine, method, path, body = {}, query = {}) {
   const router = createRouter({
     paperTradeEngine: engine,
+    advanceRiskEngine: { onTradeClosed() {} },
     logger,
   });
   const request = { method, url: path, originalUrl: path, path, query, body, headers: {}, ip: '127.0.0.1' };
