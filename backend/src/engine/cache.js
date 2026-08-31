@@ -16,16 +16,25 @@ class CacheEngine {
   }
 
   get() {
+    return this.getWithMetadata()?.snapshot || null;
+  }
+
+  getWithMetadata(nowMs = Date.now()) {
     if (!this.snapshot) return null;
 
-    const age = Date.now() - this.timestamp;
-    if (age > this.ttl) {
+    const ageMs = nowMs - this.timestamp;
+    const expired = ageMs > this.ttl;
+    if (expired) {
       this.logger.warn('CacheEngine', 'Cache expired, returning stale data', {
-        ageMs: age,
+        ageMs,
       });
     }
 
-    return { ...this.snapshot, cached: true };
+    return {
+      snapshot: { ...this.snapshot, cached: true },
+      cacheAgeMs: ageMs,
+      expired,
+    };
   }
 
   has() {

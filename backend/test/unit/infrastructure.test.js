@@ -132,6 +132,19 @@ test('CacheEngine returns stale data after TTL without losing the snapshot', () 
   assert.equal(warnings[0].module, 'CacheEngine');
 });
 
+test('CacheEngine metadata observes age without refreshing the snapshot timestamp', () => {
+  const cache = new CacheEngine(config({ CACHE_TTL: 1000 }), logger(), 'BTCUSDT');
+  const stored = snapshot({ timestamp: new Date(BASE_TIME).toISOString() });
+
+  withNow(BASE_TIME, () => cache.store(stored));
+  const observed = withNow(BASE_TIME + 1001, () => cache.getWithMetadata());
+
+  assert.equal(observed.cacheAgeMs, 1001);
+  assert.equal(observed.expired, true);
+  assert.equal(observed.snapshot.timestamp, stored.timestamp);
+  assert.equal(cache.get().timestamp, stored.timestamp);
+});
+
 test('CacheEngine replaces duplicate stores and isolates input mutation', () => {
   const cache = new CacheEngine(config({ CACHE_TTL: 1000 }), logger());
   const first = snapshot({ price: 100 });
