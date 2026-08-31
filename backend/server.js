@@ -243,26 +243,25 @@ async function fetchCycle() {
 
   fetchInProgress = true;
   try {
-    const snapshot = await apiManager.fetchMarketData();
+    const result = await apiManager.fetchMarketData();
+    if (!result || result.status !== 'FRESH' || !result.snapshot) {
+      logger.warn('Server', 'Live cycle skipped — market data is not fresh', {
+        status: result?.status || 'INVALID_ACQUISITION_RESULT',
+        cacheAgeMs: result?.provenance?.cacheAgeMs ?? null,
+        fallbackReason: result?.provenance?.fallbackReason ?? null,
+      });
+      return;
+    }
+
+    const snapshot = result.snapshot;
     history.add(snapshot);
     const transition = candleEngine.ingest(snapshot);
     eventBus.emit('market:snapshot', snapshot, transition);
   } catch (err) {
     apiManager.fail();
-    const fallback = cache.get();
-    if (fallback) {
-      const freshFallback = { ...fallback, timestamp: new Date().toISOString() };
-      history.add(freshFallback);
-      const transition = candleEngine.ingest(freshFallback);
-      eventBus.emit('market:snapshot', freshFallback, transition);
-      logger.warn('Server', 'Using cached data after failure', {
-        error: err.message,
-      });
-    } else {
-      logger.error('Server', 'Fetch failed and no cache available', {
-        error: err.message,
-      });
-    }
+    logger.error('Server', 'Market-data acquisition failed before live-cycle admission', {
+      error: err.message,
+    });
   } finally {
     fetchInProgress = false;
   }

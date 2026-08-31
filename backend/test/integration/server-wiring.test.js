@@ -77,6 +77,18 @@ function waitForCycle(port, probePath, expectedCycle) {
   });
 }
 
+async function waitForProbeCondition(port, probePath, condition) {
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    const statusResponse = await request(port, '/api/status');
+    const probe = readProbe(probePath);
+    if (condition(probe, statusResponse)) return { statusResponse, probe };
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+
+  throw new Error('Timed out waiting for probe condition');
+}
+
 function waitForStartup(child) {
   return new Promise((resolve, reject) => {
     let output = '';
@@ -138,6 +150,7 @@ const counters = {
   advanceRiskOnTradeClosed: 0,
   simplePriceFetch: 0,
   marketSnapshotEmitCount: 0,
+  marketDataCalls: 0,
 };
 const pipelineCalls = [];
 const marketSnapshotEmits = [];
@@ -247,16 +260,42 @@ const liveSnapshots = [
   { symbol: 'BTCUSDT', price: 120, volume: 1, timestamp: '2024-01-01T11:00:00.000Z' },
 ];
 let liveSnapshotIndex = 0;
+function freshResult(snapshot) {
+  return {
+    status: 'FRESH',
+    snapshot,
+    provenance: {
+      source: 'TestProvider',
+      observedAt: snapshot.timestamp,
+      sourceTimestamp: null,
+      effectiveAgeMs: 0,
+      cacheAgeMs: null,
+      fallbackReason: null,
+    },
+  };
+}
 ApiManager.prototype.fetchMarketData = async function () {
-  if (liveSnapshotIndex === liveSnapshots.length) {
-    liveSnapshotIndex++;
-    throw new Error('forced live fetch failure');
+  count('marketDataCalls');
+  if (liveSnapshotIndex >= liveSnapshots.length) {
+    const cached = this.cache.get();
+    return {
+      status: 'CACHE_HIT',
+      snapshot: cached,
+      provenance: {
+        source: 'TestProvider',
+        observedAt: cached.timestamp,
+        sourceTimestamp: null,
+        effectiveAgeMs: null,
+        cacheAgeMs: this.cache.getAge(),
+        fallbackReason: 'PROVIDER_UNAVAILABLE',
+      },
+    };
   }
   const snapshot = { ...liveSnapshots[Math.min(liveSnapshotIndex++, liveSnapshots.length - 1)] };
   counters.simplePriceFetch++;
   this.cache.store(snapshot);
   saveProbe();
-  return snapshot;
+  return freshResult(snapshot);
 };
 
 saveProbe();
@@ -413,25 +452,22 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     });
     assert.deepEqual(third.probe.order.slice(-3), ['analyzer', 'signalHistory', 'pipeline']);
 
-    const fourth = await waitForCycle(port, probePath, 4);
-    assert.equal(fourth.probe.pipelineRun, 4);
-    assert.equal(fourth.probe.marketSnapshotEmits[3].argumentCount, 2);
-    assert.equal(fourth.probe.pipelineCalls[3].argumentCount, 2);
-    assert.equal(fourth.probe.pipelineCalls[3].price, 120);
-    assert.equal(fourth.probe.pipelineCalls[3].sameSnapshot, true);
-    assert.equal(fourth.probe.pipelineCalls[3].lifecycleOpenTime, Date.parse('2024-01-01T11:00:00.000Z'));
-    assert.deepEqual(fourth.probe.pipelineCalls[3].finalizedOpenTimes, [
-      Date.parse('2024-01-01T10:00:00.000Z'),
-      Date.parse('2024-01-01T11:00:00.000Z'),
-    ]);
-    assert.notEqual(fourth.probe.pipelineCalls[3].activeOpenTime, fourth.probe.pipelineCalls[3].lifecycleOpenTime);
-    assert.equal(fourth.probe.pipelineCalls[3].sameLifecycle, true);
-    assert.equal(fourth.probe.paperEvaluateTrades, 4);
-    assert.equal(fourth.probe.paperOnCandle, 4);
-    assert.equal(fourth.probe.paperSignal, 0);
-    assert.equal(fourth.probe.advanceRiskEvaluate, 0);
-    assert.equal(fourth.probe.advanceRiskOnTradeClosed, 0);
-    assert.deepEqual(fourth.probe.order.slice(-3), ['analyzer', 'signalHistory', 'pipeline']);
+    const stable = await waitForProbeCondition(
+      port,
+      probePath,
+      probe => probe.marketDataCalls >= 4,
+    );
+    assert.equal(stable.probe.pipelineRun, 3);
+    assert.equal(stable.probe.marketSnapshotEmitCount, 3);
+    assert.equal(stable.probe.marketSnapshotEmits.length, 3);
+    assert.equal(stable.probe.pipelineCalls.length, 3);
+    assert.equal(stable.probe.simplePriceFetch, 3);
+    assert.equal(stable.probe.paperEvaluateTrades, 3);
+    assert.equal(stable.probe.paperOnCandle, 3);
+    assert.equal(stable.probe.paperSignal, 0);
+    assert.equal(stable.probe.advanceRiskEvaluate, 0);
+    assert.equal(stable.probe.advanceRiskOnTradeClosed, 0);
+    assert.deepEqual(stable.probe.order.slice(-3), ['analyzer', 'signalHistory', 'pipeline']);
     assert.equal(child.exitCode, null);
   } finally {
     await stopServer(child);
