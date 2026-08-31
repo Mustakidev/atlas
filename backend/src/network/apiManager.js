@@ -2,6 +2,38 @@ const fetch = require('node-fetch');
 
 const DEFAULT_MIN_INTERVAL = 5000;
 const DEFAULT_THROTTLE_TTL = 30000;
+const LIVE_SYMBOL_TO_PROVIDER_ASSET = Object.freeze({
+  BTCUSDT: 'bitcoin',
+});
+
+function resolveProviderAsset(symbol) {
+  if (!Object.hasOwn(LIVE_SYMBOL_TO_PROVIDER_ASSET, symbol)) {
+    const error = new TypeError(`Unsupported live symbol: ${String(symbol)}`);
+    error.code = 'UNSUPPORTED_LIVE_SYMBOL';
+    throw error;
+  }
+  return LIVE_SYMBOL_TO_PROVIDER_ASSET[symbol];
+}
+
+function buildProviderUrl(apiUrl, providerAssetId) {
+  let url;
+  try {
+    url = new URL(apiUrl);
+  } catch {
+    const error = new TypeError('API_URL must be a valid live provider URL');
+    error.code = 'INVALID_LIVE_PROVIDER_URL';
+    throw error;
+  }
+
+  if (!['http:', 'https:'].includes(url.protocol)) {
+    const error = new TypeError('API_URL must use HTTP or HTTPS');
+    error.code = 'INVALID_LIVE_PROVIDER_URL';
+    throw error;
+  }
+
+  url.searchParams.set('ids', providerAssetId);
+  return url.toString();
+}
 
 const ACQUISITION_STATUSES = Object.freeze({
   FRESH: 'FRESH',
@@ -18,7 +50,8 @@ class ApiManager {
     this.cache = cache;
     this.fetch = fetchClient;
     this.symbol = config.get('SYMBOL') || 'BTCUSDT';
-    this.url = config.get('API_URL');
+    this.providerAssetId = resolveProviderAsset(this.symbol);
+    this.url = buildProviderUrl(config.get('API_URL'), this.providerAssetId);
     this.timeout = config.get('REQUEST_TIMEOUT');
     this.connected = false;
     this.lastFetchTime = null;
@@ -36,7 +69,7 @@ class ApiManager {
     const cacheAge = this.cache.getAge();
     if (cacheAge !== null && cacheAge < this._throttleTtl) {
       const cached = this.cache.getWithMetadata(now);
-      if (cached) {
+      if (this._isMatchingCache(cached)) {
         this.logger.info('ApiManager', 'Throttle: using cached data', {
           cacheAgeMs: cacheAge,
           throttleTtl: this._throttleTtl,
@@ -86,7 +119,7 @@ class ApiManager {
         this.fail();
         const fallbackNowMs = Date.now();
         const cached = this.cache.getWithMetadata(fallbackNowMs);
-        if (cached) {
+        if (this._isMatchingCache(cached)) {
           return this._cacheResult(cached, fallbackNowMs, ACQUISITION_STATUSES.INVALID_PROVIDER_DATA);
         }
         return this._unavailableResult(ACQUISITION_STATUSES.INVALID_PROVIDER_DATA);
@@ -106,7 +139,7 @@ class ApiManager {
       this.fail();
       const fallbackNowMs = Date.now();
       const cached = this.cache.getWithMetadata(fallbackNowMs);
-      if (cached) {
+      if (this._isMatchingCache(cached)) {
         return this._cacheResult(cached, fallbackNowMs, ACQUISITION_STATUSES.PROVIDER_UNAVAILABLE);
       }
       return this._unavailableResult(ACQUISITION_STATUSES.PROVIDER_UNAVAILABLE);
@@ -114,28 +147,32 @@ class ApiManager {
   }
 
   buildSnapshot(raw, observedAtMs = Date.now()) {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)
-      || !raw.bitcoin || typeof raw.bitcoin !== 'object' || Array.isArray(raw.bitcoin)) {
-      throw new TypeError('Provider response must contain a bitcoin object');
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new TypeError('Provider response must be an object');
     }
 
-    const btc = raw.bitcoin;
-    if (typeof btc.usd !== 'number' || !Number.isFinite(btc.usd) || btc.usd <= 0) {
-      throw new TypeError('Provider response must contain a positive finite bitcoin.usd price');
+    const providerData = raw[this.providerAssetId];
+    if (!providerData || typeof providerData !== 'object' || Array.isArray(providerData)) {
+      throw new TypeError(`Provider response must contain a ${this.providerAssetId} object`);
     }
 
-    const volume = btc.usd_24h_vol == null ? 0 : btc.usd_24h_vol;
+    if (typeof providerData.usd !== 'number'
+      || !Number.isFinite(providerData.usd) || providerData.usd <= 0) {
+      throw new TypeError(`Provider response must contain a positive finite ${this.providerAssetId}.usd price`);
+    }
+
+    const volume = providerData.usd_24h_vol == null ? 0 : providerData.usd_24h_vol;
     if (typeof volume !== 'number' || !Number.isFinite(volume) || volume < 0) {
       throw new TypeError('Provider response volume must be finite and non-negative');
     }
 
-    const change24h = btc.usd_24h_change == null ? 0 : btc.usd_24h_change;
+    const change24h = providerData.usd_24h_change == null ? 0 : providerData.usd_24h_change;
     if (typeof change24h !== 'number' || !Number.isFinite(change24h)) {
       throw new TypeError('Provider response change24h must be finite');
     }
 
-    const high = btc.usd_24h_high == null ? 0 : btc.usd_24h_high;
-    const low = btc.usd_24h_low == null ? 0 : btc.usd_24h_low;
+    const high = providerData.usd_24h_high == null ? 0 : providerData.usd_24h_high;
+    const low = providerData.usd_24h_low == null ? 0 : providerData.usd_24h_low;
     if (![high, low].every(value => typeof value === 'number' && Number.isFinite(value))) {
       throw new TypeError('Provider response high and low values must be finite');
     }
@@ -143,7 +180,7 @@ class ApiManager {
     return {
       symbol: this.symbol,
       exchange: 'CoinGecko',
-      price: btc.usd,
+      price: providerData.usd,
       open: 0,
       high,
       low,
@@ -170,6 +207,10 @@ class ApiManager {
         fallbackReason,
       ),
     };
+  }
+
+  _isMatchingCache(entry) {
+    return Boolean(entry?.snapshot && entry.snapshot.symbol === this.symbol);
   }
 
   _unavailableResult(status) {
