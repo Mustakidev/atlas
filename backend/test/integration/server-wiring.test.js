@@ -9,6 +9,7 @@ const test = require('node:test');
 
 const BACKEND = path.join(__dirname, '../..');
 const NODE_FETCH_ENTRY = path.join(BACKEND, 'node_modules/node-fetch');
+const API_KEY = 'server-wiring-test-api-key-32-characters';
 
 function reservePort() {
   return new Promise((resolve, reject) => {
@@ -21,9 +22,9 @@ function reservePort() {
   });
 }
 
-function request(port, requestPath) {
+function request(port, requestPath, headers = { 'x-api-key': API_KEY }) {
   return new Promise((resolve, reject) => {
-    const req = http.get({ host: '127.0.0.1', port, path: requestPath }, res => {
+    const req = http.get({ host: '127.0.0.1', port, path: requestPath, headers }, res => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', chunk => { body += chunk; });
@@ -329,7 +330,7 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     env: {
       ...process.env,
       PORT: String(port),
-      API_KEY: '',
+      API_KEY,
       REFRESH_INTERVAL: '1500',
       MIN_API_INTERVAL: '1',
       API_THROTTLE_TTL: '1',
@@ -343,6 +344,10 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
 
   try {
     await waitForStartup(child);
+
+    const healthResponse = await request(port, '/healthz', {});
+    assert.equal(healthResponse.statusCode, 200);
+    assert.deepEqual(healthResponse.body, { status: 'ok' });
 
     const configResponse = await request(port, '/api/config');
     assert.equal(configResponse.statusCode, 200);

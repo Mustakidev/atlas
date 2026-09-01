@@ -4,7 +4,7 @@ const test = require('node:test');
 
 const { createApp } = require('../../src/app');
 
-const API_KEY = 'integration-test-key';
+const API_KEY = 'production-replay-test-api-key-32-characters';
 const START_TIME = Date.parse('2024-01-01T00:00:00.000Z');
 const END_TIME = START_TIME + (51 * 3_600_000);
 const VALID_QUERY = `symbol=BTCUSDT&startTime=${START_TIME}&endTime=${END_TIME}`;

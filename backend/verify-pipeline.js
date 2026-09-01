@@ -125,10 +125,29 @@ function getHttpTransport(url) {
   throw new Error(`Unsupported URL protocol: ${url.protocol}`);
 }
 
+function resolveVerifierApiKey() {
+  const value = process.env.ATLAS_VERIFY_API_KEY;
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error('ATLAS_VERIFY_API_KEY must be configured for authenticated Atlas requests');
+  }
+  return value;
+}
+
 function fetchJSON(urlPath) {
   return new Promise((resolve, reject) => {
+    let apiKey;
+    try {
+      apiKey = resolveVerifierApiKey();
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
     const requestUrl = new URL(`${BASE_URL}${urlPath}`);
-    const req = getHttpTransport(requestUrl).get(requestUrl, { timeout: 5000 }, (res) => {
+    const req = getHttpTransport(requestUrl).get(requestUrl, {
+      timeout: 5000,
+      headers: { 'X-API-Key': apiKey },
+    }, (res) => {
       let data = '';
       res.on('data', (chunk) => data += chunk);
       res.on('end', () => {
@@ -1150,6 +1169,14 @@ async function main() {
   console.log('  Atlas Pipeline End-to-End Verification');
   console.log(`  Duration: ${REPORT_DURATION_MIN} min | Interval: ${REPORT_INTERVAL_SEC}s`);
   console.log('═══════════════════════════════════════════════\n');
+
+  try {
+    resolveVerifierApiKey();
+  } catch (e) {
+    console.error(`❌ ${e.message}`);
+    process.exitCode = 1;
+    return;
+  }
 
   // Check server is running
   try {

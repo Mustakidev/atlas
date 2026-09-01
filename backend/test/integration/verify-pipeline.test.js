@@ -1007,18 +1007,25 @@ test('open trade disappearance does not delete the logical record', () => {
 });
 
 test('HTTP and JSON failures reject fetchJSON', async () => {
-  const httpServer = await startResponseServer({ error: 'unavailable' }, 503);
+  const previousApiKey = process.env.ATLAS_VERIFY_API_KEY;
+  process.env.ATLAS_VERIFY_API_KEY = 'verifier-test-api-key-32-characters';
   try {
-    await assert.rejects(fetchJSON('/api/paper-trades'), /HTTP 503/);
-  } finally {
-    await stopServer(httpServer);
-  }
+    const httpServer = await startResponseServer({ error: 'unavailable' }, 503);
+    try {
+      await assert.rejects(fetchJSON('/api/paper-trades'), /HTTP 503/);
+    } finally {
+      await stopServer(httpServer);
+    }
 
-  const jsonServer = await startResponseServer('{invalid}');
-  try {
-    await assert.rejects(fetchJSON('/api/paper-trades'), /JSON parse error/);
+    const jsonServer = await startResponseServer('{invalid}');
+    try {
+      await assert.rejects(fetchJSON('/api/paper-trades'), /JSON parse error/);
+    } finally {
+      await stopServer(jsonServer);
+    }
   } finally {
-    await stopServer(jsonServer);
+    if (previousApiKey === undefined) delete process.env.ATLAS_VERIFY_API_KEY;
+    else process.env.ATLAS_VERIFY_API_KEY = previousApiKey;
   }
 });
 

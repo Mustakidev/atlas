@@ -9,6 +9,7 @@ const test = require('node:test');
 
 const BACKEND = path.join(__dirname, '../..');
 const NODE_FETCH_ENTRY = path.join(BACKEND, 'node_modules/node-fetch');
+const API_KEY = 'live-cycle-test-api-key-32-characters';
 
 function reservePort() {
   return new Promise((resolve, reject) => {
@@ -21,9 +22,9 @@ function reservePort() {
   });
 }
 
-function request(port, requestPath) {
+function request(port, requestPath, headers = { 'x-api-key': API_KEY }) {
   return new Promise((resolve, reject) => {
-    const req = http.get({ host: '127.0.0.1', port, path: requestPath }, res => {
+    const req = http.get({ host: '127.0.0.1', port, path: requestPath, headers }, res => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', chunk => { body += chunk; });
@@ -224,7 +225,7 @@ saveProbe();
     env: {
       ...process.env,
       PORT: String(port),
-      API_KEY: '',
+      API_KEY,
       REFRESH_INTERVAL: '100',
       MIN_API_INTERVAL: '1',
       API_THROTTLE_TTL: '1',

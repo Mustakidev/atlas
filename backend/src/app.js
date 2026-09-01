@@ -56,6 +56,10 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth 
   app.use(express.json({ limit: config.get('MAX_BODY_SIZE') }));
   app.use(globalLimiter);
 
+  app.get('/healthz', (req, res) => {
+    res.status(200).json({ status: 'ok' });
+  });
+
   // Serve index.html with injected API key (must be before static middleware)
   app.get('/', (req, res) => {
     const htmlPath = path.join(__dirname, '../../frontend/index.html');
@@ -77,7 +81,7 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth 
     application: routes.productionReplayApplication,
     logger,
   });
-  app.use('/api', expensiveLimiter, auth, canonicalRouter, router);
+  app.use('/api', auth, expensiveLimiter, canonicalRouter, router);
   app.use(createErrorHandler(logger));
 
   return app;
