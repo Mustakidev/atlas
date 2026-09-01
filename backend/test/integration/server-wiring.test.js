@@ -10,6 +10,7 @@ const test = require('node:test');
 const BACKEND = path.join(__dirname, '../..');
 const NODE_FETCH_ENTRY = path.join(BACKEND, 'node_modules/node-fetch');
 const API_KEY = 'server-wiring-test-api-key-32-characters';
+const OPERATOR_HASH = 'scrypt$N=16384$r=8$p=1$MDEyMzQ1Njc4OWFiY2RlZg$tjK03tRvEjqCcPwmgtddMkgjlXrk8U_b9rIvfeBMKCc';
 
 function reservePort() {
   return new Promise((resolve, reject) => {
@@ -331,6 +332,9 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
       ...process.env,
       PORT: String(port),
       API_KEY,
+      ATLAS_OPERATOR_PASSWORD_HASH: OPERATOR_HASH,
+      ATLAS_ORIGIN: `http://127.0.0.1:${port}`,
+      ATLAS_COOKIE_SECURE: 'false',
       REFRESH_INTERVAL: '1500',
       MIN_API_INTERVAL: '1',
       API_THROTTLE_TTL: '1',

@@ -55,6 +55,30 @@ function createExpensiveLimiter(config, logger) {
   });
 }
 
+function createLoginLimiter(config, logger) {
+  const windowMs = config.get('RATE_LIMIT_LOGIN_WINDOW_MS');
+  const max = config.get('RATE_LIMIT_LOGIN_MAX_REQUESTS');
+
+  return rateLimit({
+    windowMs,
+    max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res, next, options) => {
+      logger.warn('RateLimit', 'Login rate limit exceeded', {
+        path: req.originalUrl,
+        ip: req.ip,
+        limit: max,
+        windowSec: Math.ceil(windowMs / 1000),
+      });
+      res.status(options.statusCode).json({
+        error: 'Too many login attempts',
+        message: 'Try again later',
+      });
+    },
+  });
+}
+
 function createConditionalExpensive(expensiveLimiter) {
   return (req, res, next) => {
     if (EXPENSIVE_PATHS.some(p => req.originalUrl.startsWith(p))) {
@@ -64,4 +88,9 @@ function createConditionalExpensive(expensiveLimiter) {
   };
 }
 
-module.exports = { createGlobalLimiter, createExpensiveLimiter, createConditionalExpensive };
+module.exports = {
+  createGlobalLimiter,
+  createExpensiveLimiter,
+  createConditionalExpensive,
+  createLoginLimiter,
+};

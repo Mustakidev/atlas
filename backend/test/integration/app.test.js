@@ -9,15 +9,23 @@ const { cloneFixture, validMarketSnapshot } = require('../fixtures/market');
 
 const API_KEY = 'integration-test-api-key-32-characters';
 const ALLOWED_ORIGIN = 'http://allowed.test';
+const ATLAS_ORIGIN = 'http://127.0.0.1';
+const OPERATOR_HASH = 'scrypt$N=16384$r=8$p=1$MDEyMzQ1Njc4OWFiY2RlZg$tjK03tRvEjqCcPwmgtddMkgjlXrk8U_b9rIvfeBMKCc';
+const OPERATOR_PASSWORD = 'correct horse battery staple';
 
 function config(state = {}) {
   const values = {
     API_KEY,
+    ATLAS_OPERATOR_PASSWORD_HASH: OPERATOR_HASH,
+    ATLAS_ORIGIN,
+    ATLAS_COOKIE_SECURE: false,
     CORS_ORIGIN: ALLOWED_ORIGIN,
     MAX_BODY_SIZE: '1mb',
     RATE_LIMIT_WINDOW_MS: 60 * 1000,
     RATE_LIMIT_MAX_REQUESTS: 1000,
     RATE_LIMIT_EXPENSIVE_MAX: 1000,
+    RATE_LIMIT_LOGIN_MAX_REQUESTS: 10,
+    RATE_LIMIT_LOGIN_WINDOW_MS: 15 * 60 * 1000,
     PORT: 3000,
     REFRESH_INTERVAL: 2000,
     CACHE_TTL: 30000,
@@ -200,6 +208,10 @@ async function stopApp(server) {
   await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 }
 
+function sessionCookie(result) {
+  return result.headers['set-cookie'][0].split(';', 1)[0];
+}
+
 test('real Express app serves the public health endpoint without authentication', async () => {
   const server = await startApp({});
   try {
@@ -212,13 +224,230 @@ test('real Express app serves the public health endpoint without authentication'
   }
 });
 
-test('temporary PH-2A transition keeps the configured browser API key bootstrap', async () => {
+test('root HTML contains no browser API-key bootstrap', async () => {
   const server = await startApp({});
   try {
     const result = await request(server, { path: '/' });
 
     assert.equal(result.statusCode, 200);
-    assert.match(result.text, new RegExp(`window\\.__ATLAS_API_KEY="${API_KEY}"`));
+    assert.equal(result.text.includes(API_KEY), false);
+    assert.equal(result.text.includes('window.__ATLAS_API_KEY'), false);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('session status is public, generic, and never API-key based', async () => {
+  const server = await startApp({});
+  try {
+    const result = await request(server, { path: '/api/auth/session', headers: { 'x-api-key': API_KEY } });
+
+    assert.equal(result.statusCode, 200);
+    assert.deepEqual(result.json(), { authenticated: false });
+    assert.equal(result.headers['cache-control'], 'no-store');
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('malformed login JSON keeps the parser error and no-store policy', async () => {
+  const server = await startApp({});
+  try {
+    const result = await request(server, {
+      method: 'POST',
+      path: '/api/auth/login',
+      headers: { origin: ATLAS_ORIGIN, 'content-type': 'application/json' },
+      rawBody: '{invalid}',
+    });
+
+    assert.equal(result.statusCode, 400);
+    assert.deepEqual(result.json(), { error: 'Invalid JSON payload' });
+    assert.equal(result.headers['cache-control'], 'no-store');
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('global rate-limit rejection for auth routes keeps no-store policy', async () => {
+  const server = await startApp({ configValues: { RATE_LIMIT_MAX_REQUESTS: 1 } });
+  try {
+    const first = await request(server, { path: '/api/auth/session' });
+    const second = await request(server, { path: '/api/auth/session' });
+
+    assert.equal(first.statusCode, 200);
+    assert.equal(second.statusCode, 429);
+    assert.equal(second.headers['cache-control'], 'no-store');
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('login rejects wrong origin before validation or password verification', async () => {
+  const server = await startApp({});
+  try {
+    const result = await request(server, {
+      method: 'POST',
+      path: '/api/auth/login',
+      headers: { origin: 'https://attacker.test' },
+      body: {},
+    });
+
+    assert.equal(result.statusCode, 403);
+    assert.deepEqual(result.json(), { error: 'Forbidden', message: 'Origin not allowed' });
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('login validates password shape and rejects incorrect credentials generically', async () => {
+  const server = await startApp({});
+  try {
+    for (const body of [{}, { password: '' }, { password: ' '.repeat(3) }, { password: 42 }]) {
+      const result = await request(server, {
+        method: 'POST',
+        path: '/api/auth/login',
+        headers: { origin: ATLAS_ORIGIN },
+        body,
+      });
+      assert.equal(result.statusCode, 400);
+      assert.deepEqual(result.json(), { error: 'Invalid login request', message: 'Invalid password' });
+    }
+
+    const wrong = await request(server, {
+      method: 'POST',
+      path: '/api/auth/login',
+      headers: { origin: ATLAS_ORIGIN },
+      body: { password: 'wrong password' },
+    });
+    assert.equal(wrong.statusCode, 401);
+    assert.deepEqual(wrong.json(), { error: 'Authentication failed', message: 'Invalid credentials' });
+    assert.equal(wrong.headers['set-cookie'], undefined);
+    assert.equal(JSON.stringify(wrong).includes(OPERATOR_PASSWORD), false);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('valid login creates an HttpOnly session and protected APIs accept it', async () => {
+  const server = await startApp({});
+  try {
+    const login = await request(server, {
+      method: 'POST',
+      path: '/api/auth/login',
+      headers: { origin: ATLAS_ORIGIN },
+      body: { password: OPERATOR_PASSWORD },
+    });
+    assert.equal(login.statusCode, 204);
+    assert.equal(login.headers['cache-control'], 'no-store');
+    assert.match(login.headers['set-cookie'][0], /^atlas_session=[A-Za-z0-9_-]{43}; Max-Age=28800; Path=\/; HttpOnly; SameSite=Strict$/);
+
+    const cookie = sessionCookie(login);
+    const session = await request(server, { path: '/api/auth/session', headers: { cookie } });
+    assert.deepEqual(session.json(), { authenticated: true });
+
+    const status = await request(server, { path: '/api/status', headers: { cookie } });
+    assert.equal(status.statusCode, 200);
+    assert.equal(typeof status.json().uptime, 'number');
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('missing, malformed, and invalid session cookies fail protected APIs generically', async () => {
+  const server = await startApp({});
+  try {
+    for (const cookie of [undefined, 'atlas_session=bad', 'atlas_session=' + 'a'.repeat(42)]) {
+      const headers = cookie ? { cookie } : {};
+      const result = await request(server, { path: '/api/status', headers });
+      assert.equal(result.statusCode, 401);
+      assert.deepEqual(result.json(), { error: 'Authentication required', message: 'Authentication required' });
+      assert.match(result.headers['set-cookie'][0], /^atlas_session=; Max-Age=0; Path=\/; HttpOnly; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT$/);
+    }
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('credential precedence rejects invalid explicit API keys without session fallback', async () => {
+  const server = await startApp({});
+  try {
+    const login = await request(server, {
+      method: 'POST', path: '/api/auth/login', headers: { origin: ATLAS_ORIGIN }, body: { password: OPERATOR_PASSWORD },
+    });
+    const cookie = sessionCookie(login);
+    const invalidKey = await request(server, {
+      path: '/api/status', headers: { cookie, 'x-api-key': 'invalid-api-key' },
+    });
+    assert.equal(invalidKey.statusCode, 401);
+    assert.equal(invalidKey.json().message, 'Invalid API key');
+    assert.equal(invalidKey.headers['set-cookie'], undefined);
+
+    const validKey = await request(server, {
+      path: '/api/status', headers: { cookie: 'atlas_session=invalid', 'x-api-key': API_KEY },
+    });
+    assert.equal(validKey.statusCode, 200);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('session-authenticated mutation requires exact Origin before state mutation', async () => {
+  const state = {};
+  const server = await startApp(state);
+  try {
+    const login = await request(server, {
+      method: 'POST', path: '/api/auth/login', headers: { origin: ATLAS_ORIGIN }, body: { password: OPERATOR_PASSWORD },
+    });
+    const cookie = sessionCookie(login);
+    for (const origin of [undefined, 'null', 'https://attacker.test']) {
+      const result = await request(server, {
+        method: 'POST',
+        path: '/api/paper-trades/close',
+        headers: { cookie, ...(origin === undefined ? {} : { origin }) },
+        body: { tradeId: 'T-1' },
+      });
+      assert.equal(result.statusCode, 403);
+    }
+    assert.equal(state.closeCalls?.length || 0, 0);
+    assert.equal(state.riskClosures?.length || 0, 0);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('logout is idempotent, clears the session cookie, and invalidates access', async () => {
+  const server = await startApp({});
+  try {
+    const login = await request(server, {
+      method: 'POST', path: '/api/auth/login', headers: { origin: ATLAS_ORIGIN }, body: { password: OPERATOR_PASSWORD },
+    });
+    const cookie = sessionCookie(login);
+    const logout = await request(server, { method: 'POST', path: '/api/auth/logout', headers: { origin: ATLAS_ORIGIN, cookie } });
+    assert.equal(logout.statusCode, 204);
+    assert.equal(logout.headers['cache-control'], 'no-store');
+    assert.match(logout.headers['set-cookie'][0], /^atlas_session=; Max-Age=0; Path=\/; HttpOnly; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT$/);
+
+    const status = await request(server, { path: '/api/status', headers: { cookie } });
+    assert.equal(status.statusCode, 401);
+
+    const noSessionLogout = await request(server, { method: 'POST', path: '/api/auth/logout', headers: { origin: ATLAS_ORIGIN } });
+    assert.equal(noSessionLogout.statusCode, 204);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('login rate limiting is dedicated and IP-based', async () => {
+  const server = await startApp({ configValues: { RATE_LIMIT_LOGIN_MAX_REQUESTS: 1 } });
+  try {
+    const first = await request(server, {
+      method: 'POST', path: '/api/auth/login', headers: { origin: ATLAS_ORIGIN }, body: { password: 'wrong password' },
+    });
+    const second = await request(server, {
+      method: 'POST', path: '/api/auth/login', headers: { origin: ATLAS_ORIGIN }, body: { password: 'wrong password' },
+    });
+    assert.equal(first.statusCode, 401);
+    assert.equal(second.statusCode, 429);
   } finally {
     await stopApp(server);
   }
@@ -231,7 +460,7 @@ test('real Express app protects the operational status endpoint', async () => {
     assert.equal(missing.statusCode, 401);
     assert.deepEqual(missing.json(), {
       error: 'Authentication required',
-      message: 'Missing X-API-Key header',
+      message: 'Authentication required',
     });
 
     const valid = await request(server, {
@@ -365,7 +594,7 @@ test('unauthenticated manual close cannot mutate paper or risk state', async () 
     assert.equal(result.statusCode, 401);
     assert.deepEqual(result.json(), {
       error: 'Authentication required',
-      message: 'Missing X-API-Key header',
+      message: 'Authentication required',
     });
     assert.equal(state.closeCalls?.length || 0, 0);
     assert.equal(state.riskClosures?.length || 0, 0);

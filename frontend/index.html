@@ -7,6 +7,18 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <div class="auth-gate" id="authGate">
+    <div class="auth-card">
+      <div class="auth-kicker">ATLAS OPERATOR ACCESS</div>
+      <h2>Sign in to continue</h2>
+      <p id="authMessage">Checking session...</p>
+      <form id="authForm" autocomplete="on">
+        <label for="authPassword">Operator password</label>
+        <input id="authPassword" name="password" type="password" autocomplete="current-password" maxlength="1024">
+        <button id="authSubmit" type="submit">Sign in</button>
+      </form>
+    </div>
+  </div>
   <div class="terminal">
     <!-- Header -->
     <header class="header">
@@ -31,10 +43,11 @@
           <button class="tf-btn" data-tf="24h">24H</button>
         </div>
         <span class="header-sep"></span>
-        <div class="status-indicator">
+         <div class="status-indicator">
           <span class="status-dot" id="statusDot"></span>
-          <span id="statusText">Connecting...</span>
-        </div>
+           <span id="statusText">Connecting...</span>
+         </div>
+         <button class="auth-logout hidden" id="logoutBtn" type="button">Log out</button>
       </div>
     </header>
 

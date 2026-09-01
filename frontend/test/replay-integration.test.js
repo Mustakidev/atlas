@@ -24,7 +24,7 @@ test('production replay uses both canonical globals and the V2 helper', () => {
   assert.match(runReplaySource, /window\.AtlasReplayRequest\.buildUrl/);
   assert.match(runReplaySource, /window\.AtlasReplayPresentation\.presentCanonicalReplay/);
   assert.match(requestSource, /\/api\/strategy\/replay\/v2/);
-  assert.match(runReplaySource, /fetch\(replayUrl, \{ headers: authHeaders\(\) \}\)/);
+  assert.match(runReplaySource, /fetch\(replayUrl, \{ credentials: 'same-origin' \}\)/);
 });
 
 test('calls Date.now exactly once for each replay request construction', () => {
