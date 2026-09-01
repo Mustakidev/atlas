@@ -3,26 +3,71 @@
 'use strict';
 
 var API = '';
-var API_KEY = window.__ATLAS_API_KEY || '';
 var REFRESH = 3000;
 var CANDLE_REFRESH = 2000;
 var chartCurrentTF = '1h';
 var chartLastCandles = [];
 var chartPrevFinalizedCount = 0;
 var chartFirstLoad = true;
+var chartInitialized = false;
 var lastLogCount = 0;
 var lastLogId = 0;
 var currentPrice = null;
 var pipelineDirection = null;
+var authState = {
+  authenticated: false,
+  polling: false,
+  pollingTimer: null,
+  candleTimer: null,
+};
 
 // Request deduplication: track in-flight fetches to prevent duplicates
 var inflight = {};
-function authHeaders() {
-  return API_KEY ? { 'X-API-Key': API_KEY } : {};
+function showAuthGate(message) {
+  var gate = $('authGate');
+  var messageEl = $('authMessage');
+  var logout = $('logoutBtn');
+  if (messageEl && message) messageEl.textContent = message;
+  if (gate) gate.classList.remove('hidden');
+  if (logout) logout.classList.add('hidden');
 }
+
+function hideAuthGate() {
+  var gate = $('authGate');
+  var logout = $('logoutBtn');
+  if (gate) gate.classList.add('hidden');
+  if (logout) logout.classList.remove('hidden');
+}
+
+function stopPolling() {
+  if (authState.pollingTimer !== null) {
+    clearInterval(authState.pollingTimer);
+    authState.pollingTimer = null;
+  }
+  if (authState.candleTimer !== null) {
+    clearInterval(authState.candleTimer);
+    authState.candleTimer = null;
+  }
+  authState.polling = false;
+}
+
+function handleAuthenticationLoss(message) {
+  if (!authState.authenticated && $('authGate') && !$('authGate').classList.contains('hidden')) return;
+  authState.authenticated = false;
+  stopPolling();
+  showAuthGate(message || 'Session expired. Sign in again.');
+}
+
 function dedupedFetch(key, url) {
   if (inflight[key]) return inflight[key];
-  inflight[key] = fetch(url, { headers: authHeaders() })
+  inflight[key] = fetch(url, { credentials: 'same-origin' })
+    .then(function(r) {
+      if (r.status === 401) {
+        handleAuthenticationLoss('Session expired. Sign in again.');
+        throw new Error('Authentication required');
+      }
+      return r;
+    })
     .then(function(r) { return r.json(); })
     .then(function(d) { delete inflight[key]; return d; })
     .catch(function(e) { delete inflight[key]; throw e; });
@@ -614,15 +659,21 @@ async function fetchLogs() {
 function initChart() {
   var container = $('chartContainer');
   if (!container || typeof AtlasChart === 'undefined') return;
-  AtlasChart.init(container);
-  AtlasChart.onCrosshairMove(function(data) { updateCrosshair(data); });
+  if (!chartInitialized) {
+    AtlasChart.init(container);
+    AtlasChart.onCrosshairMove(function(data) { updateCrosshair(data); });
+    initTimeframeSelector();
+    chartInitialized = true;
+  }
   updateWaitingOverlay(0);
-  initTimeframeSelector();
   fetchCandles();
-  setInterval(fetchCandles, CANDLE_REFRESH);
+  if (authState.candleTimer === null) authState.candleTimer = setInterval(fetchCandles, CANDLE_REFRESH);
 }
 
 function startPolling() {
+  if (authState.polling) return;
+  authState.authenticated = true;
+  authState.polling = true;
   fetchMarket();
   fetchAnalysis();
   fetchStructure();
@@ -636,7 +687,7 @@ function startPolling() {
   fetchLogs();
   updatePipelineDirection();
 
-  setInterval(function() {
+  authState.pollingTimer = setInterval(function() {
     fetchMarket();
     fetchAnalysis();
     fetchStructure();
@@ -654,7 +705,95 @@ function startPolling() {
   initChart();
 }
 
-startPolling();
+function setAuthMessage(message) {
+  var messageEl = $('authMessage');
+  if (messageEl) messageEl.textContent = message;
+}
+
+async function submitLogin(event) {
+  event.preventDefault();
+  var input = $('authPassword');
+  var password = input ? input.value : '';
+  if (input) input.value = '';
+  if (!password) {
+    setAuthMessage('Enter the operator password.');
+    return;
+  }
+
+  var submit = $('authSubmit');
+  if (submit) submit.disabled = true;
+  setAuthMessage('Signing in...');
+  try {
+    var response = await fetch(API + '/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ password: password }),
+    });
+    if (response.status === 204) {
+      hideAuthGate();
+      startPolling();
+      return;
+    }
+    if (response.status === 429) setAuthMessage('Too many attempts. Try again later.');
+    else if (response.status === 403) setAuthMessage('Sign-in is blocked by the browser origin policy.');
+    else setAuthMessage('Authentication failed.');
+  } catch (error) {
+    setAuthMessage('Unable to reach the authentication service.');
+  } finally {
+    if (submit) submit.disabled = false;
+  }
+}
+
+async function logout() {
+  var button = $('logoutBtn');
+  if (button) button.disabled = true;
+  try {
+    var response = await fetch(API + '/api/auth/logout', {
+      method: 'POST',
+      credentials: 'same-origin',
+    });
+    if (response.status === 204) {
+      handleAuthenticationLoss('Signed out.');
+    } else if (response.status === 403) {
+      setAuthMessage('Sign-out was blocked by the browser origin policy.');
+    }
+  } catch (error) {
+    setAuthMessage('Unable to reach the authentication service.');
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function bootstrapAuth() {
+  showAuthGate('Checking session...');
+  try {
+    var response = await fetch(API + '/api/auth/session', { credentials: 'same-origin' });
+    if (response.status !== 200) {
+      showAuthGate('Unable to check the current session.');
+      return;
+    }
+    var data = await response.json();
+    if (data && data.authenticated === true) {
+      hideAuthGate();
+      startPolling();
+    } else {
+      showAuthGate('Sign in to continue.');
+    }
+  } catch (error) {
+    showAuthGate('Unable to check the current session.');
+  }
+}
+
+function setupAuthUi() {
+  var form = $('authForm');
+  var logoutButton = $('logoutBtn');
+  if (form) form.addEventListener('submit', submitLogin);
+  if (logoutButton) logoutButton.addEventListener('click', logout);
+  bootstrapAuth();
+}
+
+setupAuthUi();
 
 // ---------------------------------------------------------------------------
 // Signal Inspector
@@ -865,7 +1004,7 @@ function finishReplay(btn) {
 
 function replayStatusMessage(status) {
   if (status === 400) return 'Replay request is invalid. Check the replay configuration.';
-  if (status === 401) return 'Authentication required. Check your API key.';
+  if (status === 401) return 'Authentication required. Sign in again.';
   if (status === 429) return 'Replay is rate-limited. Try again shortly.';
   if (status === 502) return 'Replay data source is temporarily unavailable.';
   if (status === 503) return 'Replay service is temporarily unavailable.';
@@ -958,7 +1097,7 @@ window.runReplay = async function() {
 
   var response;
   try {
-    response = await fetch(replayUrl, { headers: authHeaders() });
+    response = await fetch(replayUrl, { credentials: 'same-origin' });
   } catch (error) {
     resetReplayView('Unable to reach the replay service. Check your connection.');
     renderReplayMessage('Unable to reach the replay service. Check your connection.');
@@ -969,6 +1108,14 @@ window.runReplay = async function() {
   if (!response || typeof response.status !== 'number') {
     resetReplayView('Replay returned an invalid response.');
     renderReplayMessage('Replay returned an invalid response.');
+    finishReplay(btn);
+    return;
+  }
+
+  if (response.status === 401) {
+    handleAuthenticationLoss('Session expired. Sign in again.');
+    resetReplayView('Session expired. Sign in again.');
+    renderReplayMessage('Session expired. Sign in again.');
     finishReplay(btn);
     return;
   }

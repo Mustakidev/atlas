@@ -5,6 +5,7 @@ const test = require('node:test');
 const { createApp } = require('../../src/app');
 
 const API_KEY = 'production-replay-test-api-key-32-characters';
+const OPERATOR_HASH = 'scrypt$N=16384$r=8$p=1$MDEyMzQ1Njc4OWFiY2RlZg$tjK03tRvEjqCcPwmgtddMkgjlXrk8U_b9rIvfeBMKCc';
 const START_TIME = Date.parse('2024-01-01T00:00:00.000Z');
 const END_TIME = START_TIME + (51 * 3_600_000);
 const VALID_QUERY = `symbol=BTCUSDT&startTime=${START_TIME}&endTime=${END_TIME}`;
@@ -12,11 +13,16 @@ const VALID_QUERY = `symbol=BTCUSDT&startTime=${START_TIME}&endTime=${END_TIME}`
 function makeConfig(overrides = {}) {
   const values = {
     API_KEY,
+    ATLAS_OPERATOR_PASSWORD_HASH: OPERATOR_HASH,
+    ATLAS_ORIGIN: 'http://127.0.0.1',
+    ATLAS_COOKIE_SECURE: false,
     CORS_ORIGIN: 'http://allowed.test',
     MAX_BODY_SIZE: '1mb',
     RATE_LIMIT_WINDOW_MS: 60 * 1000,
     RATE_LIMIT_MAX_REQUESTS: 1000,
     RATE_LIMIT_EXPENSIVE_MAX: 1000,
+    RATE_LIMIT_LOGIN_MAX_REQUESTS: 10,
+    RATE_LIMIT_LOGIN_WINDOW_MS: 15 * 60 * 1000,
     ...overrides,
   };
 
@@ -265,7 +271,7 @@ test('canonical route inherits authentication', async () => {
     assert.equal(missing.statusCode, 401);
     assert.deepEqual(missing.body, {
       error: 'Authentication required',
-      message: 'Missing X-API-Key header',
+      message: 'Authentication required',
     });
 
     const invalid = await request(server, {

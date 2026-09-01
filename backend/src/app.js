@@ -1,10 +1,11 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
 const path = require('path');
 
-const { createAuth } = require('./middleware/auth');
-const { createGlobalLimiter, createExpensiveLimiter, createConditionalExpensive } = require('./middleware/rateLimit');
+const { SingleOperatorSessionStore } = require('./auth/sessionStore');
+const { createAuthRouter } = require('./routes/authRoutes');
+const { createAuth, createSessionOriginGuard } = require('./middleware/auth');
+const { createGlobalLimiter, createExpensiveLimiter, createConditionalExpensive, createLoginLimiter } = require('./middleware/rateLimit');
 const { createRouter } = require('./routes/routes');
 const { createProductionReplayRouter } = require('./routes/productionReplayRoutes');
 
@@ -38,10 +39,19 @@ function createErrorHandler(logger) {
 
 function createApp({ config, logger, routes, getLastDecision, getPipelineHealth }) {
   const app = express();
-  const auth = createAuth(config, logger);
+  const sessionStore = new SingleOperatorSessionStore();
+  const auth = createAuth(config, logger, { sessionStore });
+  const sessionOriginGuard = createSessionOriginGuard(config);
   const globalLimiter = createGlobalLimiter(config, logger);
   const expensiveLimiter = createConditionalExpensive(createExpensiveLimiter(config, logger));
+  const loginLimiter = createLoginLimiter(config, logger);
+  const authRouter = createAuthRouter({ config, sessionStore, loginLimiter });
   const allowedOrigins = config.get('CORS_ORIGIN').split(',').map(s => s.trim());
+
+  app.use('/api/auth', (req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+  });
 
   app.use(cors({
     origin(origin, callback) {
@@ -60,13 +70,9 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth 
     res.status(200).json({ status: 'ok' });
   });
 
-  // Serve index.html with injected API key (must be before static middleware)
+  // Serve the frontend without interpolating server credentials.
   app.get('/', (req, res) => {
-    const htmlPath = path.join(__dirname, '../../frontend/index.html');
-    const html = fs.readFileSync(htmlPath, 'utf8');
-    const apiKey = config.get('API_KEY');
-    const injected = html.replace('<head>', '<head>\n  <script>window.__ATLAS_API_KEY="' + apiKey + '";</script>');
-    res.type('html').send(injected);
+    res.sendFile(path.join(__dirname, '../../frontend/index.html'));
   });
 
   // Static files (CSS, JS, images) — index:false avoids serving index.html for /
@@ -81,7 +87,8 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth 
     application: routes.productionReplayApplication,
     logger,
   });
-  app.use('/api', auth, expensiveLimiter, canonicalRouter, router);
+  app.use('/api/auth', authRouter);
+  app.use('/api', auth, sessionOriginGuard, expensiveLimiter, canonicalRouter, router);
   app.use(createErrorHandler(logger));
 
   return app;
