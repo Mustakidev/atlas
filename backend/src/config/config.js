@@ -67,8 +67,10 @@ class ConfigManager {
     }
 
     const apiKey = this.config.API_KEY;
-    if (apiKey !== '' && apiKey.length < 32) {
-      errors.push(`API_KEY must be empty (disabled) or >= 32 characters, got: ${apiKey.length} characters`);
+    if (typeof apiKey !== 'string' || apiKey.length === 0 || apiKey.trim().length === 0) {
+      errors.push('API_KEY must be a non-empty, non-whitespace string');
+    } else if (apiKey.length < 32) {
+      errors.push(`API_KEY must be at least 32 characters, got: ${apiKey.length} characters`);
     }
 
     const corsOrigin = this.config.CORS_ORIGIN;

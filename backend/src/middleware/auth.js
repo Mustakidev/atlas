@@ -3,16 +3,13 @@ const crypto = require('crypto');
 function createAuth(config, logger) {
   const apiKey = config.get('API_KEY');
 
-  if (!apiKey) {
-    return (req, res, next) => next();
+  if (typeof apiKey !== 'string' || apiKey.length === 0 || apiKey.trim().length === 0) {
+    throw new TypeError('API_KEY must be configured before authentication middleware creation');
   }
 
   const keyBuffer = Buffer.from(apiKey, 'utf8');
-  const SKIP_PATHS = ['/status'];
 
   return (req, res, next) => {
-    if (SKIP_PATHS.includes(req.path)) return next();
-
     const provided = req.headers['x-api-key'];
     if (!provided) {
       logger.warn('Auth', 'Rejected request — missing API key', { path: req.path, ip: req.ip });

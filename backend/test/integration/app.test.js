@@ -7,7 +7,7 @@ const { createApp, createErrorHandler } = require('../../src/app');
 const { AdvanceRiskEngine } = require('../../src/engine/advanceRisk');
 const { cloneFixture, validMarketSnapshot } = require('../fixtures/market');
 
-const API_KEY = 'integration-test-key';
+const API_KEY = 'integration-test-api-key-32-characters';
 const ALLOWED_ORIGIN = 'http://allowed.test';
 
 function config(state = {}) {
@@ -200,13 +200,46 @@ async function stopApp(server) {
   await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 }
 
-test('real Express app serves an allowed health endpoint without authentication', async () => {
+test('real Express app serves the public health endpoint without authentication', async () => {
   const server = await startApp({});
   try {
-    const result = await request(server, { path: '/api/status' });
+    const result = await request(server, { path: '/healthz' });
 
     assert.equal(result.statusCode, 200);
-    assert.equal(typeof result.json().uptime, 'number');
+    assert.deepEqual(result.json(), { status: 'ok' });
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('temporary PH-2A transition keeps the configured browser API key bootstrap', async () => {
+  const server = await startApp({});
+  try {
+    const result = await request(server, { path: '/' });
+
+    assert.equal(result.statusCode, 200);
+    assert.match(result.text, new RegExp(`window\\.__ATLAS_API_KEY="${API_KEY}"`));
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('real Express app protects the operational status endpoint', async () => {
+  const server = await startApp({});
+  try {
+    const missing = await request(server, { path: '/api/status' });
+    assert.equal(missing.statusCode, 401);
+    assert.deepEqual(missing.json(), {
+      error: 'Authentication required',
+      message: 'Missing X-API-Key header',
+    });
+
+    const valid = await request(server, {
+      path: '/api/status',
+      headers: { 'x-api-key': API_KEY },
+    });
+    assert.equal(valid.statusCode, 200);
+    assert.equal(typeof valid.json().uptime, 'number');
   } finally {
     await stopApp(server);
   }
@@ -259,7 +292,7 @@ test('CORS with a disallowed origin does not grant an allow-origin header', asyn
   const server = await startApp({});
   try {
     const result = await request(server, {
-      path: '/api/status',
+      path: '/healthz',
       headers: { origin: 'http://blocked.test' },
     });
 
@@ -314,6 +347,28 @@ test('JSON parsing reaches a protected endpoint after authentication', async () 
       pnl: 25,
       exitTime: '2024-01-01T00:00:00.000Z',
     });
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('unauthenticated manual close cannot mutate paper or risk state', async () => {
+  const state = {};
+  const server = await startApp(state);
+  try {
+    const result = await request(server, {
+      method: 'POST',
+      path: '/api/paper-trades/close',
+      body: { tradeId: 'T-1' },
+    });
+
+    assert.equal(result.statusCode, 401);
+    assert.deepEqual(result.json(), {
+      error: 'Authentication required',
+      message: 'Missing X-API-Key header',
+    });
+    assert.equal(state.closeCalls?.length || 0, 0);
+    assert.equal(state.riskClosures?.length || 0, 0);
   } finally {
     await stopApp(server);
   }
@@ -576,7 +631,10 @@ test('synchronous dependency failures return a generic JSON 500 and preserve pro
     )));
 
     state.throwHistory = false;
-    const health = await request(server, { path: '/api/status' });
+    const health = await request(server, {
+      path: '/api/status',
+      headers: { 'x-api-key': API_KEY },
+    });
     assert.equal(health.statusCode, 200);
   } finally {
     await stopApp(server);
@@ -623,12 +681,29 @@ test('validation errors remain explicit 400 responses', async () => {
 test('rate limiting remains an explicit 429 response', async () => {
   const server = await startApp({ configValues: { RATE_LIMIT_MAX_REQUESTS: 1 } });
   try {
-    const first = await request(server, { path: '/api/status' });
-    const second = await request(server, { path: '/api/status' });
+    const first = await request(server, { path: '/healthz' });
+    const second = await request(server, { path: '/healthz' });
 
     assert.equal(first.statusCode, 200);
     assert.equal(second.statusCode, 429);
     assert.equal(second.json().error, 'Rate limit exceeded');
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('authentication precedes the expensive-route limiter', async () => {
+  const server = await startApp({ configValues: { RATE_LIMIT_EXPENSIVE_MAX: 1 } });
+  try {
+    const missing = await request(server, { path: '/api/backtest?timeframe=1h' });
+    assert.equal(missing.statusCode, 401);
+
+    const valid = await request(server, {
+      path: '/api/backtest?timeframe=1h',
+      headers: { 'x-api-key': API_KEY },
+    });
+    assert.equal(valid.statusCode, 503);
+    assert.equal(valid.json().error, 'Backtest engine not available');
   } finally {
     await stopApp(server);
   }

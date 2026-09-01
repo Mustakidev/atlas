@@ -15,6 +15,7 @@ const UNAVAILABLE_MESSAGE = 'No decision data yet — waiting for first pipeline
 const VERIFY_DURATION_MS = 900;
 const VERIFY_INTERVAL_MS = 100;
 const WATCHDOG_MS = 10000;
+const VERIFY_API_KEY = 'verifier-cli-test-api-key-32-characters';
 const HTTPS_TEST_KEY = `-----BEGIN PRIVATE KEY-----
 MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCtDkBb2V14OBu7
 QSLNRUMuwEVv5k4O7PWWnoiRwLw0t5NP8IoVWeTQyKEMqHd2CR+SS7/Khz7pTD5X
@@ -223,7 +224,13 @@ async function startFixture({ inspector, paper, secure = false }) {
 
     const index = counters[endpoint]++;
     const configured = responseAt(endpoint === 'inspector' ? inspector : paper, index);
-    requests.push({ endpoint, index, label: configured.label || null, observedAt: Date.now() });
+    requests.push({
+      endpoint,
+      index,
+      label: configured.label || null,
+      authenticated: req.headers['x-api-key'] === VERIFY_API_KEY,
+      observedAt: Date.now(),
+    });
 
     if (configured.destroy) {
       req.socket.destroy();
@@ -325,6 +332,7 @@ async function runScenario(t, fixtureConfig, options = {}) {
     ...process.env,
     ATLAS_VERIFY_BASE_URL: fixture.url,
     ATLAS_VERIFY_OUTPUT_DIR: temporaryDirectory,
+    ATLAS_VERIFY_API_KEY: VERIFY_API_KEY,
     ATLAS_VERIFY_DURATION_MS: String(options.durationMs || VERIFY_DURATION_MS),
     ATLAS_VERIFY_INTERVAL_MS: String(options.intervalMs || VERIFY_INTERVAL_MS),
     ...(options.environment || {}),
@@ -466,6 +474,7 @@ test('CLI environment overrides take precedence over CLI duration and interval a
   equal(run, json.verification.runtime.runCompleted, true, 'CLI completes under the effective environment duration');
   equal(run, json.verification.polling.expectedPollAttempts, 50, 'interval environment override wins over CLI interval');
   check(run, run.fixture.requests.length > 0, 'base URL override directs requests to the fixture');
+  check(run, run.fixture.requests.every(request => request.authenticated), 'Atlas requests carry the verifier API key');
   equal(run, run.reports.jsonFiles.length, 1, 'output directory override receives JSON');
   equal(run, run.reports.markdownFiles.length, 1, 'output directory override receives Markdown');
   match(run, markdown, /Requested Duration \| 5000ms/, 'Markdown reports the effective duration override');
@@ -574,6 +583,21 @@ for (const invalidCase of INVALID_OVERRIDE_CASES) {
     equal(run, run.reports.entries.length, 0, 'invalid configuration leaves the temporary directory empty');
   });
 }
+
+test('CLI fails before making requests when verifier API-key configuration is empty', async t => {
+  const run = await runScenario(t, {
+    inspector: [jsonResponse(canonicalInspector(1), { label: 'not-contacted' })],
+    paper: validPaperSequence(),
+  }, {
+    environment: { ATLAS_VERIFY_API_KEY: '' },
+  });
+
+  equal(run, run.result.code, 1, 'missing verifier key exits nonzero');
+  match(run, `${run.stdout}\n${run.stderr}`, /ATLAS_VERIFY_API_KEY must be configured/,
+    'missing verifier key is reported deterministically');
+  equal(run, run.fixture.requests.length, 0, 'missing verifier key makes no requests');
+  equal(run, run.reports.entries.length, 0, 'missing verifier key creates no reports');
+});
 
 test('CLI passing run writes reports and preserves diagnostic gap telemetry', async t => {
   const run = await runScenario(t, {
