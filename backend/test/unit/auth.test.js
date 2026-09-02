@@ -75,6 +75,7 @@ test('missing credentials return a generic browser-safe 401 contract', () => {
     error: 'Authentication required',
     message: 'Authentication required',
   });
+  assert.equal(result.responseHeaders['cache-control'], 'no-store');
   assert.equal(JSON.stringify(logs).includes(API_KEY), false);
 });
 
@@ -91,6 +92,7 @@ test('invalid X-API-Key returns 401 without logging supplied credentials', () =>
     error: 'Authentication required',
     message: 'Invalid API key',
   });
+  assert.equal(result.responseHeaders['cache-control'], 'no-store');
   assert.equal(JSON.stringify(result.body).includes(supplied), false);
   assert.equal(JSON.stringify(logs).includes(supplied), false);
   assert.equal(JSON.stringify(logs).includes(API_KEY), false);
@@ -130,6 +132,7 @@ test('invalid explicit X-API-Key does not fall back to a valid session', () => {
   assert.equal(result.nextCalled, false);
   assert.equal(result.statusCode, 401);
   assert.equal(result.body.message, 'Invalid API key');
+  assert.equal(result.responseHeaders['cache-control'], 'no-store');
   assert.equal(result.responseHeaders['set-cookie'], undefined);
 });
 

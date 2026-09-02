@@ -58,6 +58,7 @@ function createAuthRouter({ config, sessionStore, loginLimiter }) {
 
   router.get('/session', (req, res) => {
     const authenticated = Boolean(sessionStore.lookup(parseSessionCookie(req.headers.cookie)));
+    if (!authenticated) res.set('Set-Cookie', clearSessionCookie({ secure }));
     return res.json({ authenticated });
   });
 

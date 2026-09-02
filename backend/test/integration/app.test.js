@@ -245,8 +245,40 @@ test('session status is public, generic, and never API-key based', async () => {
     assert.equal(result.statusCode, 200);
     assert.deepEqual(result.json(), { authenticated: false });
     assert.equal(result.headers['cache-control'], 'no-store');
+    assert.match(result.headers['set-cookie'][0], /^atlas_session=; Max-Age=0; Path=\/; HttpOnly; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT$/);
   } finally {
     await stopApp(server);
+  }
+});
+
+test('session status clears a stale cookie after session-store reconstruction', async () => {
+  const firstServer = await startApp({});
+  let secondServer;
+  let firstStopped = false;
+  try {
+    const login = await request(firstServer, {
+      method: 'POST',
+      path: '/api/auth/login',
+      headers: { origin: ATLAS_ORIGIN },
+      body: { password: OPERATOR_PASSWORD },
+    });
+    const oldCookie = sessionCookie(login);
+    await stopApp(firstServer);
+    firstStopped = true;
+
+    secondServer = await startApp({});
+    const result = await request(secondServer, {
+      path: '/api/auth/session',
+      headers: { cookie: oldCookie },
+    });
+
+    assert.equal(result.statusCode, 200);
+    assert.deepEqual(result.json(), { authenticated: false });
+    assert.equal(result.headers['cache-control'], 'no-store');
+    assert.match(result.headers['set-cookie'][0], /^atlas_session=; Max-Age=0; Path=\/; HttpOnly; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT$/);
+  } finally {
+    if (secondServer) await stopApp(secondServer);
+    if (!firstStopped) await stopApp(firstServer);
   }
 });
 
@@ -344,6 +376,7 @@ test('valid login creates an HttpOnly session and protected APIs accept it', asy
     const cookie = sessionCookie(login);
     const session = await request(server, { path: '/api/auth/session', headers: { cookie } });
     assert.deepEqual(session.json(), { authenticated: true });
+    assert.equal(session.headers['set-cookie'], undefined);
 
     const status = await request(server, { path: '/api/status', headers: { cookie } });
     assert.equal(status.statusCode, 200);
@@ -361,6 +394,7 @@ test('missing, malformed, and invalid session cookies fail protected APIs generi
       const result = await request(server, { path: '/api/status', headers });
       assert.equal(result.statusCode, 401);
       assert.deepEqual(result.json(), { error: 'Authentication required', message: 'Authentication required' });
+      assert.equal(result.headers['cache-control'], 'no-store');
       assert.match(result.headers['set-cookie'][0], /^atlas_session=; Max-Age=0; Path=\/; HttpOnly; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT$/);
     }
   } finally {
@@ -380,6 +414,7 @@ test('credential precedence rejects invalid explicit API keys without session fa
     });
     assert.equal(invalidKey.statusCode, 401);
     assert.equal(invalidKey.json().message, 'Invalid API key');
+    assert.equal(invalidKey.headers['cache-control'], 'no-store');
     assert.equal(invalidKey.headers['set-cookie'], undefined);
 
     const validKey = await request(server, {

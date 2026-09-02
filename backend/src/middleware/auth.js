@@ -1,6 +1,11 @@
 const crypto = require('crypto');
 const { clearSessionCookie, parseSessionCookie } = require('../auth/cookie');
 
+function unauthorized(res, body) {
+  res.set('Cache-Control', 'no-store');
+  return res.status(401).json(body);
+}
+
 function createApiKeyResolver(config, logger) {
   const apiKey = config.get('API_KEY');
 
@@ -31,7 +36,7 @@ function createAuth(config, logger, { sessionStore } = {}) {
   return (req, res, next) => {
     const apiKeyResult = resolveApiKey(req);
     if (apiKeyResult === false) {
-      return res.status(401).json({ error: 'Authentication required', message: 'Invalid API key' });
+      return unauthorized(res, { error: 'Authentication required', message: 'Invalid API key' });
     }
 
     if (apiKeyResult) {
@@ -43,7 +48,7 @@ function createAuth(config, logger, { sessionStore } = {}) {
     if (!session) {
       res.set('Set-Cookie', clearSessionCookie({ secure }));
       logger.warn('Auth', 'Rejected request — authentication required', { path: req.path, ip: req.ip });
-      return res.status(401).json({ error: 'Authentication required', message: 'Authentication required' });
+      return unauthorized(res, { error: 'Authentication required', message: 'Authentication required' });
     }
 
     req.auth = session;
