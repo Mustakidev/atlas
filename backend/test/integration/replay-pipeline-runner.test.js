@@ -1869,19 +1869,90 @@ test('causal snapshot construction failure is terminal SNAPSHOT failure', () => 
   assert.equal(runner.getState().cycleCount, 0);
 });
 
-test('safeExecute component failure still publishes a successful cycle', () => {
-  const input = normalizedInput(2);
+test('critical lifecycle failure is terminal and does not publish a cycle', () => {
+  const input = normalizedInput(16);
   const bundle = makeBundle(input);
   bundle.paperTradeEngine.onCandle = () => { throw new Error('absorbed component failure'); };
   const { runner } = makeRunner(input, bundle);
 
-  const result = runQuietly(runner);
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  assert.equal(runner.getState().status, 'FAILED');
+  assert.equal(runner.getState().failure.phase, 'PIPELINE');
+  assert.equal(runner.getState().failure.causeCode, 'LIFECYCLE_ENGINE_FAILURE');
+  assert.equal(runner.getState().cycleCount, 0);
+});
 
-  assert.ok(result);
-  assert.equal(runner.getState().status, 'READY');
-  assert.equal(runner.getState().cycleCount, 1);
-  assert.equal(runner.getState().failure, null);
-  assert.equal(runner.getState().lastResult.index, 0);
+test('malformed EOD closure PnL fails terminally without publishing a result', () => {
+  const input = normalizedInput(1);
+  const bundle = makeBundle(input);
+  assert.ok(openPaperTrade(bundle));
+  bundle.paperTradeEngine._trades[0].positionSize = NaN;
+  const { runner } = makeRunner(input, bundle);
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  const state = runner.getState();
+  assert.equal(state.status, 'FAILED');
+  assert.equal(state.failure.phase, 'EOD_SETTLEMENT');
+  assert.equal(state.failure.causeCode, 'RISK_STATE_SYNC_FAILURE');
+  assert.equal(state.cycleCount, 0);
+  assert.equal(state.lastResult, null);
+  assert.equal(bundle.advanceRiskEngine.isRiskStateHealthy(), false);
+  assert.equal(bundle.paperTradeEngine.closed().length, 1);
+});
+
+test('critical regime failure is terminal and does not publish a cycle', () => {
+  const input = normalizedInput(16);
+  const bundle = makeBundle(input);
+  prepareEligibleBundle(bundle, { allowMtf: true });
+  const { runner } = makeRunner(input, bundle);
+
+  warmupToEligibleCycle(runner, 14);
+  bundle.regimeEngine.calculate = () => { throw new Error('regime failure'); };
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  assert.equal(runner.getState().status, 'FAILED');
+  assert.equal(runner.getState().failure.phase, 'PIPELINE');
+  assert.equal(runner.getState().failure.causeCode, 'REGIME_ENGINE_FAILURE');
+  assert.equal(runner.getState().cycleCount, 14);
+  assert.equal(runner.getState().lastResult.index, 13);
+});
+
+test('critical risk failure is terminal and does not publish a cycle', () => {
+  const input = normalizedInput(16);
+  const bundle = makeBundle(input);
+  prepareEligibleBundle(bundle, { allowMtf: true });
+  const { runner } = makeRunner(input, bundle);
+
+  warmupToEligibleCycle(runner, 14);
+  bundle.advanceRiskEngine.evaluate = () => { throw new Error('risk failure'); };
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  assert.equal(runner.getState().status, 'FAILED');
+  assert.equal(runner.getState().failure.phase, 'PIPELINE');
+  assert.equal(runner.getState().failure.causeCode, 'RISK_ENGINE_FAILURE');
+  assert.equal(runner.getState().cycleCount, 14);
+  assert.equal(runner.getState().lastResult.index, 13);
+});
+
+test('pre-open replay risk synchronization failure prevents replacement publication', () => {
+  const input = normalizedInput(17);
+  const bundle = makeBundle(input);
+  prepareEligibleBundle(bundle, { allowMtf: true });
+  bundle.paperTradeEngine._maxTrades = 1;
+  const { runner } = makeRunner(input, bundle);
+
+  warmupToEligibleCycle(runner, 14);
+  runQuietly(runner);
+  bundle.advanceRiskEngine.onTradeClosed = () => { throw new Error('risk sync failure'); };
+
+  assert.throws(() => runQuietly(runner), error => error.code === 'CYCLE_FAILED');
+  assert.equal(runner.getState().status, 'FAILED');
+  assert.equal(runner.getState().failure.phase, 'PIPELINE');
+  assert.equal(runner.getState().failure.causeCode, 'RISK_STATE_SYNC_FAILURE');
+  assert.equal(runner.getState().cycleCount, 15);
+  assert.equal(runner.getState().lastResult.index, 14);
+  assert.deepEqual(bundle.paperTradeEngine.open(), []);
+  assert.equal(bundle.paperTradeEngine.history().length, 1);
 });
 
 test('getLastDecision failure is terminal DECISION_CAPTURE failure', () => {

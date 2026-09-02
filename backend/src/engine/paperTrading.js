@@ -606,6 +606,8 @@ class PaperTradingEngine {
     this._tradeCounter++;
     const tradeId = `PT-${this._tradeCounter}`;
     const entryTime = params.entryTime || formatTimestamp(this.clock.nowMs());
+    const overflow = this._trades.length + 1 - this._maxTrades;
+    let overflowPrepared = false;
 
     const trade = {
       tradeId,
@@ -631,18 +633,28 @@ class PaperTradingEngine {
       timestamp: entryTime,
     };
 
-    this._trades.push(trade);
+    const prepareOverflow = () => {
+      if (overflow <= 0 || overflowPrepared) return [];
 
-    if (this._trades.length > this._maxTrades) {
-      const overflow = this._trades.length - this._maxTrades;
+      const closed = [];
       const toRemove = this._trades.slice(0, overflow);
       for (const t of toRemove) {
         if (t.status !== TRADE_STATES.CLOSED) {
-          this._closeTrade(t, t.currentPrice || t.entryPrice, EXIT_REASONS.INVALIDATED, context);
+          const closedTrade = this._closeTrade(t, t.currentPrice || t.entryPrice, EXIT_REASONS.INVALIDATED, context);
+          if (closedTrade) closed.push(this._copyTrade(closedTrade));
         }
       }
       this._trades.splice(0, overflow);
+      overflowPrepared = true;
+      return closed;
+    };
+
+    if (overflow > 0 && typeof context.beforeOpen === 'function') {
+      context.beforeOpen(prepareOverflow);
     }
+
+    this._trades.push(trade);
+    if (overflow > 0 && !overflowPrepared) prepareOverflow();
 
     return trade;
   }

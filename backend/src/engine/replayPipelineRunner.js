@@ -301,6 +301,13 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
       executionPipeline.run(snapshot, {
         lifecycleCandle: transition.lifecycleCandle,
       });
+      const pipelineStatus = executionPipeline.getLastRunStatus?.();
+      if (pipelineStatus?.status === 'FAILED') {
+        fail(
+          pipelineStatus.failure?.code || 'PIPELINE_FAILED',
+          `Canonical execution pipeline failed: ${pipelineStatus.failure?.code || 'unknown failure'}`,
+        );
+      }
 
       phase = 'DECISION_CAPTURE';
       const decision = executionPipeline.getLastDecision();

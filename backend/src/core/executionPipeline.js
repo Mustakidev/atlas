@@ -1,6 +1,50 @@
 const { getFinalizedCandles } = require('../engine/candleUtils');
 const { ATREngine } = require('../engine/atr');
 const { captureCycleTime, resolveClock } = require('./clock');
+const { REGIMES } = require('../market-regime/RegimeTypes');
+
+const EXECUTABLE_REGIMES = new Set([
+  REGIMES.TRENDING_BULL,
+  REGIMES.TRENDING_BEAR,
+  REGIMES.RANGING,
+  REGIMES.HIGH_VOLATILITY,
+  REGIMES.LOW_VOLATILITY,
+]);
+
+function regimeOutputFailure(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return 'REGIME_INVALID';
+  if (result.regime === REGIMES.UNKNOWN || result.regime == null) return 'REGIME_UNKNOWN';
+  if (!EXECUTABLE_REGIMES.has(result.regime)
+    || !Number.isFinite(result.confidence)
+    || result.confidence < 0
+    || result.confidence > 100) {
+    return 'REGIME_INVALID';
+  }
+  return null;
+}
+
+function isValidRegimeDecision(result) {
+  return Boolean(result)
+    && typeof result === 'object'
+    && !Array.isArray(result)
+    && typeof result.allowTrade === 'boolean'
+    && typeof result.reason === 'string'
+    && result.reason.length > 0
+    && (result.penalty === undefined || Number.isFinite(result.penalty));
+}
+
+function isValidApprovedRiskPlan(result, entryPrice, direction) {
+  if (!result || typeof result !== 'object' || Array.isArray(result) || typeof result.tradeAllowed !== 'boolean') return false;
+  if (!result.tradeAllowed) return true;
+
+  if (!['stopLoss', 'takeProfit', 'positionSize', 'riskReward']
+    .every(key => Number.isFinite(result[key]))) return false;
+  if (!(result.stopLoss > 0) || !(result.takeProfit > 0)
+    || !(result.positionSize > 0) || !(result.riskReward > 0)) return false;
+  if (direction === 'BUY') return result.stopLoss < entryPrice && entryPrice < result.takeProfit;
+  if (direction === 'SELL') return result.takeProfit < entryPrice && entryPrice < result.stopLoss;
+  return false;
+}
 
 function isValidCandle(candle) {
   return Boolean(candle)
@@ -75,34 +119,66 @@ function createExecutionPipeline({
   let pipelineErrors = 0;
   let lastPipelineError = null;
   let lastSuccessfulCycle = null;
+  let lastRunStatus = null;
+  let riskSyncFailure = null;
 
-  function safeExecute(engineName, fn, fallback, cycle) {
+  function safeExecute(engineName, fn, fallback, cycle, { critical = false, failureCode = 'ENGINE_FAILURE' } = {}) {
     try {
       return fn();
     } catch (err) {
       pipelineErrors++;
       lastPipelineError = { engine: engineName, timestamp: cycle.isoNow, error: err.message };
+      if (failureCode === 'RISK_STATE_SYNC_FAILURE' && !riskSyncFailure) {
+        riskSyncFailure = { engine: engineName, error: err.message };
+      }
+      if (critical && !cycle.criticalFailure) {
+        cycle.criticalFailure = { code: failureCode, engine: engineName, error: err.message };
+      }
       logger.error('Pipeline', `Engine failure: ${engineName}`, { error: err.message });
       return fallback;
     }
   }
 
+  function markCriticalFailure(cycle, code, engine, error) {
+    if (!cycle.criticalFailure) cycle.criticalFailure = { code, engine, error };
+  }
+
   function processTradeLifecycle(price, activeCandle, cycle) {
     const context = Object.freeze({ nowMs: cycle.nowMs });
-    const closed = safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price, context), [], cycle);
+    const closed = safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price, context), [], cycle, {
+      critical: true,
+      failureCode: 'LIFECYCLE_ENGINE_FAILURE',
+    });
+    if (!Array.isArray(closed)) {
+      markCriticalFailure(cycle, 'LIFECYCLE_ENGINE_FAILURE', 'PaperTrading', 'evaluateTrades returned an invalid result');
+      return;
+    }
     if (closed.length > 0) {
       for (const t of closed) {
-        safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl, context), undefined, cycle);
+        safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl, context), undefined, cycle, {
+          critical: true,
+          failureCode: 'RISK_STATE_SYNC_FAILURE',
+        });
         console.log(`  Trade Closed: ${t.tradeId} | ${t.exitReason} | Entry=$${t.entryPrice} → Exit=$${t.exitPrice} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
       }
     }
 
-    if (!isValidCandle(activeCandle)) return;
+    if (cycle.criticalFailure || !isValidCandle(activeCandle)) return;
 
-    const candleResult = safeExecute('PaperTrading', () => paperTradeEngine.onCandle(activeCandle, context), null, cycle);
+    const candleResult = safeExecute('PaperTrading', () => paperTradeEngine.onCandle(activeCandle, context), null, cycle, {
+      critical: true,
+      failureCode: 'LIFECYCLE_ENGINE_FAILURE',
+    });
+    if (!candleResult || typeof candleResult !== 'object' || !Array.isArray(candleResult.closed)) {
+      markCriticalFailure(cycle, 'LIFECYCLE_ENGINE_FAILURE', 'PaperTrading', 'onCandle returned an invalid result');
+      return;
+    }
     if (candleResult && candleResult.closed && candleResult.closed.length > 0) {
       for (const t of candleResult.closed) {
-        safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl, context), undefined, cycle);
+        safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl, context), undefined, cycle, {
+          critical: true,
+          failureCode: 'RISK_STATE_SYNC_FAILURE',
+        });
         console.log(`  Trade Closed (candle): ${t.tradeId} | ${t.exitReason} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
       }
     }
@@ -111,7 +187,7 @@ function createExecutionPipeline({
   function run(snapshot, options) {
     const validatedOptions = validateRunOptions(options);
     pipelineCycleCount++;
-    const cycle = captureCycleTime(time);
+    const cycle = { ...captureCycleTime(time), criticalFailure: null };
     const tf = '1h';
     const price = snapshot?.price;
 
@@ -135,6 +211,34 @@ function createExecutionPipeline({
       risk: null,
       verdict: { tradeOpened: false, rejectionReason: null, trade: null },
     };
+    const previousSuccessfulCycle = lastSuccessfulCycle;
+    lastRunStatus = { status: 'COMPLETED', failure: null };
+
+    const failClosed = (code, gate, detail = code, { terminal = true } = {}) => {
+      decision.gates[gate] = { pass: false, value: 'BLOCKED', detail };
+      decision.verdict.rejectionReason = code;
+      if (terminal) lastSuccessfulCycle = previousSuccessfulCycle;
+      lastDecision = decision;
+      lastRunStatus = {
+        status: terminal ? 'FAILED' : 'REJECTED',
+        failure: {
+          code,
+          ...(cycle.criticalFailure ? {
+            engine: cycle.criticalFailure.engine,
+            error: cycle.criticalFailure.error,
+          } : {}),
+        },
+      };
+      console.log(`  Trade Allowed: NO`);
+      console.log(`  Execution Triggered: NO`);
+      console.log(`  Reason: ${code}`);
+      console.log(divider);
+    };
+
+    if (riskSyncFailure) {
+      failClosed('RISK_STATE_SYNC_FAILURE', 'advanceRisk');
+      return;
+    }
 
     if (!Number.isFinite(price) || price <= 0) {
       decision.verdict.rejectionReason = 'No valid price data';
@@ -153,6 +257,10 @@ function createExecutionPipeline({
       ? validatedOptions.lifecycleCandle
       : activeCandle;
     processTradeLifecycle(price, lifecycleCandle, cycle);
+    if (cycle.criticalFailure) {
+      failClosed(cycle.criticalFailure.code, 'lifecycle');
+      return;
+    }
 
     const finalized = getFinalizedCandles(candleEngine, tf, 500);
 
@@ -173,7 +281,18 @@ function createExecutionPipeline({
     const marketRegime = safeExecute('RegimeEngine', () => regimeEngine.calculate(finalized, tf), {
       regime: 'UNKNOWN', confidence: 0, trendScore: 50, rangeScore: 50,
       volatility: 'UNKNOWN', decisionReason: 'Regime engine failed',
-    }, cycle);
+    }, cycle, { critical: true, failureCode: 'REGIME_ENGINE_FAILURE' });
+    if (cycle.criticalFailure) {
+      failClosed(cycle.criticalFailure.code, 'regime');
+      return;
+    }
+    const regimeFailure = regimeOutputFailure(marketRegime);
+    if (regimeFailure) {
+      if (regimeFailure !== 'REGIME_UNKNOWN') {
+        failClosed(regimeFailure, 'regime');
+        return;
+      }
+    }
     decision.marketRegime = {
       regime: marketRegime.regime,
       confidence: marketRegime.confidence,
@@ -227,6 +346,11 @@ function createExecutionPipeline({
     decision.engines.bollinger = { ready: bollingerResult?.ready, middleBand: bollingerResult?.middleBand, upperBand: bollingerResult?.upperBand, lowerBand: bollingerResult?.lowerBand, pricePosition: bbPos, percentB: bbPB, squeeze: bollingerResult?.squeeze };
     decision.gates.bollinger = { pass: bbPass, value: bbPos, detail: bollingerResult?.ready ? `Upper: $${bollingerResult.upperBand} | Mid: $${bollingerResult.middleBand} | Lower: $${bollingerResult.lowerBand} | %B: ${bbPB}` : 'Not ready' };
 
+    if (regimeFailure === 'REGIME_UNKNOWN') {
+      failClosed('REGIME_UNKNOWN', 'regime', 'REGIME_UNKNOWN', { terminal: false });
+      return;
+    }
+
     let direction = null;
     if (confluence.bias === 'Bullish') direction = 'BUY';
     else if (confluence.bias === 'Bearish') direction = 'SELL';
@@ -251,7 +375,14 @@ function createExecutionPipeline({
         confidence: marketRegime.confidence,
         direction: null,
         confluenceScore: confluence.score,
-      }), { allowTrade: false, penalty: 0, preferredDirection: null, reason: 'Regime decision engine failed' }, cycle);
+      }), { allowTrade: false, penalty: 0, preferredDirection: null, reason: 'Regime decision engine failed' }, cycle, {
+        critical: true,
+        failureCode: 'REGIME_ENGINE_FAILURE',
+      });
+      if (cycle.criticalFailure || !isValidRegimeDecision(neutralRegimeDecision)) {
+        failClosed(cycle.criticalFailure?.code || 'REGIME_INVALID', 'regimeDecision');
+        return;
+      }
       decision.regimeDecision = neutralRegimeDecision;
       decision.gates.regimeDecision = {
         pass: true,
@@ -278,7 +409,14 @@ function createExecutionPipeline({
       confidence: marketRegime.confidence,
       direction,
       confluenceScore: confluence.score,
-    }), { allowTrade: false, penalty: 0, preferredDirection: direction, reason: 'Regime decision engine failed' }, cycle);
+    }), { allowTrade: false, penalty: 0, preferredDirection: direction, reason: 'Regime decision engine failed' }, cycle, {
+      critical: true,
+      failureCode: 'REGIME_ENGINE_FAILURE',
+    });
+    if (cycle.criticalFailure || !isValidRegimeDecision(regimeDecision)) {
+      failClosed(cycle.criticalFailure?.code || 'REGIME_INVALID', 'regimeDecision');
+      return;
+    }
     decision.regimeDecision = regimeDecision;
     decision.gates.regimeDecision = {
       pass: regimeDecision.allowTrade,
@@ -336,7 +474,23 @@ function createExecutionPipeline({
     const riskResult = safeExecute('AdvanceRisk', () => advanceRiskEngine.evaluate({
       symbol, timeframe: tf, entryPrice: price, atr: atr || { ready: false, atr: null, atrPercentage: 0 }, direction, trend, structure: structureResult, confluence, regime: marketRegime.regime,
       nowMs: cycle.nowMs,
-    }), { tradeAllowed: false, rejectionReason: 'Advance risk engine failed', positionSize: 0, stopLoss: 0, takeProfit: 0, riskReward: 0, session: null }, cycle);
+    }), { tradeAllowed: false, rejectionReason: 'Advance risk engine failed', positionSize: 0, stopLoss: 0, takeProfit: 0, riskReward: 0, session: null }, cycle, {
+      critical: true,
+      failureCode: 'RISK_ENGINE_FAILURE',
+    });
+    if (cycle.criticalFailure) {
+      failClosed(cycle.criticalFailure.code, 'advanceRisk');
+      return;
+    }
+    if (!isValidApprovedRiskPlan(riskResult, price, direction)) {
+      failClosed('RISK_INVALID', 'advanceRisk');
+      return;
+    }
+    if (!riskResult.tradeAllowed && riskResult.rejectionReason === 'RISK_STATE_UNHEALTHY') {
+      riskSyncFailure = riskSyncFailure || { engine: 'AdvanceRisk', error: 'RISK_STATE_UNHEALTHY' };
+      failClosed('RISK_STATE_UNHEALTHY', 'advanceRisk');
+      return;
+    }
     decision.risk = riskResult;
     decision.gates.advanceRisk = { pass: riskResult.tradeAllowed, value: riskResult.tradeAllowed ? 'ALLOWED' : 'BLOCKED', detail: riskResult.tradeAllowed ? `AdvanceRisk | pos=${riskResult.positionSize} | SL=$${riskResult.stopLoss} | TP=$${riskResult.takeProfit} | R:R 1:${riskResult.riskReward}` : riskResult.rejectionReason };
 
@@ -372,13 +526,38 @@ function createExecutionPipeline({
     }
 
     const engines = { trend, structure: structureResult, rsi: rsiResult, ema: emaResult, macd: macdResult, atr, bollinger: bollingerResult, confluence, mtf: (() => { try { return mtfEngine.calculate(500); } catch (e) { return null; } })() };
-    const signalContext = Object.freeze({ nowMs: cycle.nowMs });
+    const synchronizedClosureIds = new Set();
+    const signalContext = Object.freeze({
+      nowMs: cycle.nowMs,
+      beforeOpen: prepareOverflow => {
+        const closures = prepareOverflow();
+        for (const t of closures) {
+          synchronizedClosureIds.add(t.tradeId);
+          safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl, { nowMs: cycle.nowMs }), undefined, cycle, {
+            critical: true,
+            failureCode: 'RISK_STATE_SYNC_FAILURE',
+          });
+          if (cycle.criticalFailure) throw new Error('Canonical risk synchronization failed before trade admission');
+        }
+      },
+    });
     const closedBeforeSignal = paperTradeEngine.closed().length;
-    const trade = safeExecute('PaperTrading', () => paperTradeEngine.signal(engines, price, tf, direction, riskResult, signalContext), null, cycle);
-    const signalClosures = paperTradeEngine.closed().slice(closedBeforeSignal);
+    const trade = safeExecute('PaperTrading', () => paperTradeEngine.signal(engines, price, tf, direction, riskResult, signalContext), null, cycle, {
+      critical: true,
+      failureCode: 'EXECUTION_ENGINE_FAILURE',
+    });
+    const signalClosures = paperTradeEngine.closed().slice(closedBeforeSignal)
+      .filter(t => !synchronizedClosureIds.has(t.tradeId));
     for (const t of signalClosures) {
-      safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl, signalContext), undefined, cycle);
+      safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl, signalContext), undefined, cycle, {
+        critical: true,
+        failureCode: 'RISK_STATE_SYNC_FAILURE',
+      });
       console.log(`  Trade Closed (signal): ${t.tradeId} | ${t.exitReason} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
+    }
+    if (cycle.criticalFailure) {
+      failClosed(cycle.criticalFailure.code, 'execution');
+      return;
     }
     if (trade) {
       lastSignalTime = now;
@@ -414,6 +593,10 @@ function createExecutionPipeline({
     run,
     getLastDecision: () => lastDecision,
     getPipelineHealth: () => ({ pipelineCycleCount, pipelineErrors, lastPipelineError, lastSuccessfulCycle }),
+    getLastRunStatus: () => lastRunStatus && {
+      status: lastRunStatus.status,
+      failure: lastRunStatus.failure && { ...lastRunStatus.failure },
+    },
   };
 }
 

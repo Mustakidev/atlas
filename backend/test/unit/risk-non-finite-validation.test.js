@@ -65,6 +65,59 @@ test('AdvanceRiskEngine rejects malformed entry prices and ATR values', () => {
   }
 });
 
+test('AdvanceRiskEngine rejects unknown and unsupported regimes', () => {
+  for (const regime of [undefined, null, 'UNKNOWN', 'UNSUPPORTED']) {
+    const result = makeAdvanceRisk().evaluate(riskInput({ regime }));
+    assert.equal(result.tradeAllowed, false, `regime=${String(regime)}`);
+    assert.match(result.rejectionReason, /^REGIME_/);
+  }
+});
+
+test('AdvanceRiskEngine rejects non-positive generated risk levels', () => {
+  const zeroStop = makeAdvanceRisk().evaluate(riskInput({
+    entryPrice: 1,
+    atr: { ready: true, atr: 0.5, atrPercentage: 1 },
+    regime: 'TRENDING_BULL',
+  }));
+  assert.equal(zeroStop.tradeAllowed, false);
+  assert.equal(zeroStop.rejectionReason, 'Risk levels must be finite and greater than zero');
+
+  const negativeTakeProfit = makeAdvanceRisk().evaluate(riskInput({
+    entryPrice: 1,
+    atr: { ready: true, atr: 2, atrPercentage: 1 },
+    direction: 'SELL',
+    regime: 'TRENDING_BEAR',
+  }));
+  assert.equal(negativeTakeProfit.tradeAllowed, false);
+  assert.equal(negativeTakeProfit.rejectionReason, 'Risk levels must be finite and greater than zero');
+});
+
+test('AdvanceRiskEngine latches an onTradeClosed failure across later evaluations', () => {
+  const throwingLogger = { info() { throw new Error('risk notification failed'); }, warn() {}, error() {} };
+  const engine = new AdvanceRiskEngine({ logger: throwingLogger, symbol: 'TEST', paperTradeEngine: null, config: {} });
+  engine.setMaxConsecutiveLosses(1);
+
+  assert.throws(() => engine.onTradeClosed(-100), /risk notification failed/);
+  assert.equal(engine.isRiskStateHealthy(), false);
+
+  const result = engine.evaluate(riskInput({ regime: 'TRENDING_BULL' }));
+  assert.equal(result.tradeAllowed, false);
+  assert.equal(result.rejectionReason, 'RISK_STATE_UNHEALTHY');
+  assert.equal(engine.isRiskStateHealthy(), false);
+});
+
+test('fresh AdvanceRiskEngine instances begin trusted after another authority faults', () => {
+  const throwingLogger = { info() { throw new Error('risk notification failed'); }, warn() {}, error() {} };
+  const faulty = new AdvanceRiskEngine({ logger: throwingLogger, symbol: 'TEST', paperTradeEngine: null, config: {} });
+  faulty.setMaxConsecutiveLosses(1);
+  assert.throws(() => faulty.onTradeClosed(-100), /risk notification failed/);
+
+  const fresh = makeAdvanceRisk();
+  const result = fresh.evaluate(riskInput({ regime: 'TRENDING_BULL' }));
+  assert.equal(fresh.isRiskStateHealthy(), true);
+  assert.equal(result.tradeAllowed, true, result.rejectionReason);
+});
+
 for (const [name, Engine, extra] of [
   ['RiskEngine', RiskEngine, {}],
   ['AdvanceRiskEngine', AdvanceRiskEngine, { regime: 'TRENDING_BULL' }],
@@ -222,36 +275,31 @@ test('valid finite setter boundaries remain accepted', () => {
   assert.equal(boundaryPolicy.sessionMultipliers.ASIAN, 5);
 });
 
-test('AdvanceRiskEngine ignores invalid PnL without mutating state', () => {
-  const engine = makeAdvanceRisk();
-  engine.setMaxDailyLossPct(100);
-  engine.onTradeClosed(1000);
-  engine.onTradeClosed(-100);
-  const before = {
-    dailyPnL: engine._dailyPnL,
-    dailyHighWater: engine._dailyHighWater,
-    consecutiveLosses: engine._consecutiveLosses,
-    lossPauseUntil: engine._lossPauseUntil,
-    dailyLossLimitReached: engine._dailyLossLimitReached,
-    lastUpdated: engine.lastUpdated,
-  };
+test('AdvanceRiskEngine latches invalid PnL and rejects later evaluations', () => {
+  for (const value of [NaN, Infinity, -Infinity, undefined, null, '100']) {
+    const engine = makeAdvanceRisk();
 
-  for (const value of [NaN, Infinity, -Infinity, '100', null, undefined]) {
-    engine.onTradeClosed(value);
-    assert.deepEqual({
-      dailyPnL: engine._dailyPnL,
-      dailyHighWater: engine._dailyHighWater,
-      consecutiveLosses: engine._consecutiveLosses,
-      lossPauseUntil: engine._lossPauseUntil,
-      dailyLossLimitReached: engine._dailyLossLimitReached,
-      lastUpdated: engine.lastUpdated,
-    }, before, `pnl=${String(value)}`);
+    assert.throws(() => engine.onTradeClosed(value), error => (
+      error.code === 'RISK_STATE_SYNC_FAILURE'
+      && error.message === 'Invalid trade closure PnL'
+    ), `pnl=${String(value)}`);
+    assert.equal(engine.isRiskStateHealthy(), false);
+
+    const result = engine.evaluate(riskInput({ regime: 'TRENDING_BULL' }));
+    assert.equal(result.tradeAllowed, false);
+    assert.equal(result.rejectionReason, 'RISK_STATE_UNHEALTHY');
   }
+});
 
+test('AdvanceRiskEngine explicitly invalidates trust without a reset path', () => {
+  const engine = makeAdvanceRisk();
+
+  engine.markRiskStateUnhealthy();
+
+  assert.equal(engine.isRiskStateHealthy(), false);
   const result = engine.evaluate(riskInput({ regime: 'TRENDING_BULL' }));
-  assert.equal(result.tradeAllowed, true);
-  assert.equal(Number.isFinite(result.dailyPnL), true);
-  assert.equal(Number.isFinite(result.dailyDrawdownPct), true);
+  assert.equal(result.tradeAllowed, false);
+  assert.equal(result.rejectionReason, 'RISK_STATE_UNHEALTHY');
 });
 
 test('valid calculations and rejection precedence remain unchanged', () => {
