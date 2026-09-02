@@ -173,7 +173,8 @@ test('identical candle OHLC with different causal raw paths produces different A
   assert.notEqual(pipelineA.confluence.score, pipelineB.confluence.score);
   assert.notEqual(pipelineA.confluence.bias, pipelineB.confluence.bias);
   assert.equal(pipelineA.verdict.tradeOpened, pipelineB.verdict.tradeOpened);
-  assert.notEqual(pipelineA.verdict.rejectionReason, pipelineB.verdict.rejectionReason);
+  assert.equal(pipelineA.verdict.rejectionReason, 'REGIME_UNKNOWN');
+  assert.equal(pipelineB.verdict.rejectionReason, 'REGIME_UNKNOWN');
 });
 
 test('same candle and raw input produce deterministic Analyzer semantics across fresh graphs', () => {

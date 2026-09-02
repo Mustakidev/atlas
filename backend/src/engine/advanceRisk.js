@@ -13,6 +13,14 @@ const ENGINE_VERSION = '2.0.0';
 
 const isFiniteNumber = (value) => typeof value === 'number' && Number.isFinite(value);
 
+const EXECUTABLE_REGIMES = new Set([
+  REGIMES.TRENDING_BULL,
+  REGIMES.TRENDING_BEAR,
+  REGIMES.RANGING,
+  REGIMES.HIGH_VOLATILITY,
+  REGIMES.LOW_VOLATILITY,
+]);
+
 const DEFAULTS = {
   ACCOUNT_BALANCE: 10000,
   RISK_PER_TRADE_PCT: 1,
@@ -65,12 +73,19 @@ class AdvanceRiskEngine {
     this._dailyLossLimitReached = false;
     this._tradingEnabled = true;
     this._lastResetDay = this._dayKey(readNowMs(this.clock));
+    this._riskStateHealthy = true;
   }
 
   evaluate(params) {
     const nowMs = resolveCycleNowMs(this.clock, params?.nowMs);
     const start = readMonotonicMs(this.clock);
     const { symbol, timeframe, entryPrice, atr, direction, trend, structure, confluence, regime } = params || {};
+
+    if (!this._riskStateHealthy) {
+      this.calculationTime = elapsedMs(this.clock, start);
+      this.lastUpdated = formatTimestamp(nowMs);
+      return this._rejected(symbol || this.symbol, timeframe, entryPrice, direction, 'RISK_STATE_UNHEALTHY', nowMs);
+    }
 
     const inputError = this._validateInputs(params, nowMs);
     if (inputError) {
@@ -182,6 +197,11 @@ class AdvanceRiskEngine {
         'Risk distance must be finite and greater than zero', nowMs);
     }
 
+    if (!(stopLoss > 0) || !(takeProfit > 0)) {
+      return this._calculationRejected(start, symbol, timeframe, entryPrice, direction,
+        'Risk levels must be finite and greater than zero', nowMs);
+    }
+
     this.calculationTime = elapsedMs(this.clock, start);
     this.lastUpdated = formatTimestamp(nowMs);
 
@@ -218,7 +238,26 @@ class AdvanceRiskEngine {
   }
 
   onTradeClosed(pnl, context = {}) {
-    if (!isFiniteNumber(pnl)) return;
+    if (!this._riskStateHealthy) throw new Error('RISK_STATE_UNHEALTHY');
+
+    try {
+      return this._recordTradeClosed(pnl, context);
+    } catch (error) {
+      this._riskStateHealthy = false;
+      throw error;
+    }
+  }
+
+  markRiskStateUnhealthy() {
+    this._riskStateHealthy = false;
+  }
+
+  _recordTradeClosed(pnl, context = {}) {
+    if (!isFiniteNumber(pnl)) {
+      const error = new TypeError('Invalid trade closure PnL');
+      error.code = 'RISK_STATE_SYNC_FAILURE';
+      throw error;
+    }
 
     const nowMs = resolveCycleNowMs(this.clock, context?.nowMs);
     this._resetDailyIfNeeded(nowMs);
@@ -254,6 +293,8 @@ class AdvanceRiskEngine {
     }
     this.lastUpdated = formatTimestamp(nowMs);
   }
+
+  isRiskStateHealthy() { return this._riskStateHealthy; }
 
   getDailyPnL() { return this._round(this._dailyPnL); }
   getDailyDrawdownPct() {
@@ -377,6 +418,12 @@ class AdvanceRiskEngine {
 
   _validateInputs(params, nowMs) {
     if (!params) return this._rejected(this.symbol, null, null, null, 'No parameters provided', nowMs);
+    if (params.regime === REGIMES.UNKNOWN || params.regime == null) {
+      return this._rejected(params.symbol || this.symbol, params.timeframe, params.entryPrice, params.direction, 'REGIME_UNKNOWN', nowMs);
+    }
+    if (!EXECUTABLE_REGIMES.has(params.regime)) {
+      return this._rejected(params.symbol || this.symbol, params.timeframe, params.entryPrice, params.direction, 'REGIME_INVALID', nowMs);
+    }
     if (!isFiniteNumber(params.entryPrice) || params.entryPrice <= 0) {
       return this._rejected(params.symbol || this.symbol, params.timeframe, null, params.direction, 'Invalid entry price', nowMs);
     }

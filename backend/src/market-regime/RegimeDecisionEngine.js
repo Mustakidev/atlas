@@ -2,6 +2,14 @@ const { REGIMES } = require('./RegimeTypes');
 
 const ENGINE_VERSION = '1.0.0';
 
+const EXECUTABLE_REGIMES = new Set([
+  REGIMES.TRENDING_BULL,
+  REGIMES.TRENDING_BEAR,
+  REGIMES.RANGING,
+  REGIMES.HIGH_VOLATILITY,
+  REGIMES.LOW_VOLATILITY,
+]);
+
 const PENALTIES = {
   NONE: 0,
   MINOR: 5,
@@ -19,17 +27,29 @@ class RegimeDecisionEngine {
     this.calculationTime = 0;
   }
 
-  evaluate({ regime, confidence, direction, confluenceScore }) {
+  evaluate({ regime, confidence, direction, confluenceScore } = {}) {
     const start = Date.now();
 
     if (!regime || regime === REGIMES.UNKNOWN) {
+      this._recordCalculation(start);
       return this._unknownDecision(direction, confluenceScore);
+    }
+
+    if (!EXECUTABLE_REGIMES.has(regime)) {
+      this._recordCalculation(start);
+      return this._invalidDecision('REGIME_INVALID');
+    }
+
+    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 100
+      || !Number.isFinite(confluenceScore) || confluenceScore < 0 || confluenceScore > 100
+      || (direction !== null && direction !== undefined && !['BUY', 'SELL'].includes(direction))) {
+      this._recordCalculation(start);
+      return this._invalidDecision('REGIME_INVALID');
     }
 
     const decision = this._applyRules(regime, confidence, direction, confluenceScore);
 
-    this.calculationTime = Date.now() - start;
-    this.lastUpdated = new Date().toISOString();
+    this._recordCalculation(start);
 
     return decision;
   }
@@ -179,11 +199,25 @@ class RegimeDecisionEngine {
 
   _unknownDecision(direction, confluenceScore) {
     return {
-      allowTrade: true,
-      reason: 'Unknown regime — allowing trade with no regime adjustment',
-      penalty: PENALTIES.NONE,
+      allowTrade: false,
+      reason: 'REGIME_UNKNOWN',
+      penalty: PENALTIES.REJECT,
       preferredDirection: direction || 'NEUTRAL',
     };
+  }
+
+  _invalidDecision(reason) {
+    return {
+      allowTrade: false,
+      reason,
+      penalty: PENALTIES.REJECT,
+      preferredDirection: 'NEUTRAL',
+    };
+  }
+
+  _recordCalculation(start) {
+    this.calculationTime = Date.now() - start;
+    this.lastUpdated = new Date().toISOString();
   }
 
   getInfo() {

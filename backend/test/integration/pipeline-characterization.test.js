@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 const { createExecutionPipeline } = require('../../src/core/executionPipeline');
 const { ConfluenceEngine } = require('../../src/engine/confluence');
+const { AdvanceRiskEngine } = require('../../src/engine/advanceRisk');
 const { bullishCandles } = require('../fixtures/market');
 const { fresh } = require('../helpers/fixtures');
 
@@ -50,7 +51,14 @@ function createHarness(overrides = {}) {
     regimeDecisionEngine: { evaluate: () => ({ allowTrade: true, preferredDirection: 'BUY', penalty: 0, reason: 'Allowed' }) },
     mtfConfirmationEngine: { evaluate: () => ({ mtfAllowed: true, rejectionReason: null, confidence: 80, alignmentScore: 100 }) },
     advanceRiskEngine: {
-      evaluate: () => ({ tradeAllowed: true, positionSize: 1, stopLoss: 96, takeProfit: 112, riskReward: 3, session: 'ASIAN' }),
+      evaluate: ({ direction }) => ({
+        tradeAllowed: true,
+        positionSize: 1,
+        stopLoss: direction === 'BUY' ? 96 : 104,
+        takeProfit: direction === 'BUY' ? 112 : 88,
+        riskReward: 3,
+        session: 'ASIAN',
+      }),
       onTradeClosed: pnl => state.closedPnLs.push(pnl),
     },
     mtfEngine: { calculate: () => ({ overallBias: 'Bullish' }) },
@@ -229,4 +237,167 @@ test('preserves successful-cycle state, close notifications, and active-candle h
   assert.equal(harness.state.evaluations, 1);
   assert.equal(harness.state.candleClosures, 1);
   assert.deepEqual(harness.state.closedPnLs, [12, -4]);
+});
+
+test('blocks unknown regime output without opening a trade', () => {
+  for (const regime of ['UNKNOWN', '', 'UNSUPPORTED']) {
+    const harness = createHarness({
+      regimeEngine: { calculate: () => ({ regime, confidence: 0 }) },
+    });
+
+    const decision = run(harness);
+
+    assert.equal(decision.verdict.tradeOpened, false);
+    assert.equal(decision.verdict.rejectionReason, regime === 'UNKNOWN' ? 'REGIME_UNKNOWN' : 'REGIME_INVALID');
+    assert.equal(harness.state.signals.length, 0);
+  }
+});
+
+test('turns regime engine exceptions into a terminal fail-closed cycle', () => {
+  const harness = createHarness({
+    regimeEngine: { calculate: () => { throw new Error('regime unavailable'); } },
+  });
+
+  const decision = run(harness);
+
+  assert.equal(decision.verdict.tradeOpened, false);
+  assert.equal(decision.verdict.rejectionReason, 'REGIME_ENGINE_FAILURE');
+  assert.equal(harness.pipeline.getLastRunStatus().status, 'FAILED');
+  assert.equal(harness.state.signals.length, 0);
+});
+
+test('rejects malformed approved risk plans before PaperTrading admission', () => {
+  const harness = createHarness({
+    advanceRiskEngine: {
+      evaluate: () => ({ tradeAllowed: true, positionSize: 1, stopLoss: 101, takeProfit: 102, riskReward: 3 }),
+      onTradeClosed() {},
+    },
+  });
+
+  const decision = run(harness);
+
+  assert.equal(decision.verdict.tradeOpened, false);
+  assert.equal(decision.verdict.rejectionReason, 'RISK_INVALID');
+  assert.equal(harness.state.signals.length, 0);
+});
+
+test('rejects missing and non-finite approved risk outputs before admission', () => {
+  const plans = [
+    undefined,
+    { tradeAllowed: true, positionSize: 1, stopLoss: NaN, takeProfit: 102, riskReward: 3 },
+    { tradeAllowed: true, positionSize: 1, stopLoss: 99, takeProfit: Infinity, riskReward: 3 },
+    { tradeAllowed: true, positionSize: 1, stopLoss: 99, takeProfit: 102, riskReward: -Infinity },
+  ];
+
+  for (const plan of plans) {
+    const harness = createHarness({
+      advanceRiskEngine: { evaluate: () => plan, onTradeClosed() {} },
+    });
+    const decision = run(harness);
+
+    assert.equal(decision.verdict.rejectionReason, 'RISK_INVALID');
+    assert.equal(harness.state.signals.length, 0);
+  }
+});
+
+test('turns an AdvanceRisk exception into a terminal no-trade cycle', () => {
+  const harness = createHarness({
+    advanceRiskEngine: {
+      evaluate: () => { throw new Error('risk unavailable'); },
+      onTradeClosed() {},
+    },
+  });
+
+  const decision = run(harness);
+
+  assert.equal(decision.verdict.rejectionReason, 'RISK_ENGINE_FAILURE');
+  assert.equal(harness.pipeline.getLastRunStatus().status, 'FAILED');
+  assert.equal(harness.state.signals.length, 0);
+});
+
+test('blocks signal creation when risk state synchronization fails', () => {
+  const harness = createHarness({
+    closedTrades: [{ tradeId: 'closed-1', pnl: 12, exitReason: 'Take Profit' }],
+    advanceRiskEngine: {
+      evaluate: () => ({ tradeAllowed: true, positionSize: 1, stopLoss: 96, takeProfit: 112, riskReward: 3 }),
+      onTradeClosed: () => { throw new Error('risk state unavailable'); },
+    },
+  });
+
+  const decision = run(harness);
+
+  assert.equal(decision.verdict.tradeOpened, false);
+  assert.equal(decision.verdict.rejectionReason, 'RISK_STATE_SYNC_FAILURE');
+  assert.equal(harness.pipeline.getLastRunStatus().status, 'FAILED');
+  assert.equal(harness.state.signals.length, 0);
+});
+
+test('malformed lifecycle closure PnL fails closed and blocks later cycles', () => {
+  const authority = new AdvanceRiskEngine({
+    logger: logger(),
+    symbol: 'BTCUSDT',
+    paperTradeEngine: null,
+    config: {},
+    clock: { now: () => FIXED_NOW },
+  });
+  const harness = createHarness({
+    closedTrades: [{ tradeId: 'PT-X', pnl: NaN }],
+    advanceRiskEngine: authority,
+  });
+
+  const firstDecision = run(harness);
+  const laterDecision = run(harness, 101);
+
+  assert.equal(firstDecision.verdict.tradeOpened, false);
+  assert.equal(firstDecision.verdict.rejectionReason, 'RISK_STATE_SYNC_FAILURE');
+  assert.equal(harness.pipeline.getLastRunStatus().status, 'FAILED');
+  assert.equal(authority.isRiskStateHealthy(), false);
+  assert.equal(harness.state.signals.length, 0);
+  assert.equal(laterDecision.verdict.rejectionReason, 'RISK_STATE_SYNC_FAILURE');
+  assert.equal(harness.state.signals.length, 0);
+});
+
+test('fails closed when lifecycle processing throws before signal evaluation', () => {
+  const harness = createHarness({
+    activeCandle: true,
+    paperTradeEngine: {
+      evaluateTrades: () => { throw new Error('lifecycle unavailable'); },
+      onCandle: () => ({ closed: [] }),
+      signal: () => { throw new Error('signal must not be called'); },
+      open: () => [],
+      closed: () => [],
+      getBalance: () => 10000,
+    },
+  });
+
+  const decision = run(harness);
+
+  assert.equal(decision.verdict.tradeOpened, false);
+  assert.equal(decision.verdict.rejectionReason, 'LIFECYCLE_ENGINE_FAILURE');
+  assert.equal(harness.pipeline.getLastRunStatus().status, 'FAILED');
+});
+
+test('pipeline rejects admission when it reuses an untrusted AdvanceRisk authority', () => {
+  const authority = new AdvanceRiskEngine({
+    logger: { info() { throw new Error('risk notification failed'); }, warn() {}, error() {} },
+    symbol: 'BTCUSDT',
+    paperTradeEngine: null,
+    config: {},
+    clock: { nowMs: () => FIXED_NOW, monotonicMs: () => 0 },
+  });
+  authority.setMaxConsecutiveLosses(1);
+  assert.throws(() => authority.onTradeClosed(-100), /risk notification failed/);
+
+  const harness = createHarness({
+    advanceRiskEngine: {
+      evaluate: params => authority.evaluate(params),
+      onTradeClosed: (pnl, context) => authority.onTradeClosed(pnl, context),
+    },
+  });
+
+  const decision = run(harness);
+
+  assert.equal(decision.verdict.tradeOpened, false);
+  assert.equal(decision.verdict.rejectionReason, 'RISK_STATE_UNHEALTHY');
+  assert.equal(harness.state.signals.length, 0);
 });

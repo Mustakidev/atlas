@@ -269,8 +269,7 @@ test('validates injected dependencies before provider construction', () => {
   assertInvalidDependency({ sleep: null }, /sleep/);
   assertInvalidDependency({ riskPolicySource: {} }, /riskPolicySource\.getPolicy/);
 
-  const { composition } = compose({ riskPolicySource: null });
-  assert.deepEqual(Object.keys(composition), ['application']);
+  assertInvalidDependency({ riskPolicySource: null }, /riskPolicySource/);
 });
 
 test('constructs the real provider and APP-1 graph without network activity', () => {

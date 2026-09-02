@@ -232,10 +232,9 @@ function assertApplicationDependencies({ logger, config, clock, riskPolicySource
     || typeof clock.monotonicMs !== 'function') {
     throw new TypeError('clock must expose nowMs() and monotonicMs()');
   }
-  if (riskPolicySource !== undefined && riskPolicySource !== null
-    && (typeof riskPolicySource !== 'object'
-      || Array.isArray(riskPolicySource)
-      || typeof riskPolicySource.getPolicy !== 'function')) {
+  if (!riskPolicySource || typeof riskPolicySource !== 'object'
+    || Array.isArray(riskPolicySource)
+    || typeof riskPolicySource.getPolicy !== 'function') {
     throw new TypeError('riskPolicySource.getPolicy must be a function');
   }
 }

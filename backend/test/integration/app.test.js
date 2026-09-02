@@ -705,6 +705,7 @@ test('repeated manual close notifies risk only for the first closure', async () 
     assert.equal(state.riskClosures.length, 1);
     assert.equal(state.advanceRiskEngine.getDailyPnL(), -25);
     assert.equal(state.advanceRiskEngine.getConsecutiveLosses(), 1);
+    assert.equal(state.advanceRiskEngine.isRiskStateHealthy(), true);
     assert.deepEqual(state.riskClosures[0], {
       pnl: -25,
       context: { nowMs: Date.parse('2024-01-01T00:00:00.000Z') },
@@ -714,11 +715,12 @@ test('repeated manual close notifies risk only for the first closure', async () 
   }
 });
 
-test('malformed manual close snapshots fail without notifying risk', async () => {
+test('malformed manual close snapshots fail and latch risk for invalid synchronization fields', async () => {
   for (const closeResult of [
     { tradeId: 'T-1', status: 'OPEN', pnl: 25, exitTime: '2024-01-01T00:00:00.000Z' },
     { tradeId: 'T-1', status: 'CLOSED', pnl: NaN, exitTime: '2024-01-01T00:00:00.000Z' },
     { tradeId: 'T-1', status: 'CLOSED', pnl: 25, exitTime: 'not-a-date' },
+    { tradeId: 'T-1', status: 'OPEN', pnl: NaN, exitTime: 'not-a-date' },
   ]) {
     const state = { closeResult };
     const server = await startApp(state);
@@ -733,6 +735,20 @@ test('malformed manual close snapshots fail without notifying risk', async () =>
       assert.equal(result.statusCode, 500);
       assert.deepEqual(result.json(), { error: 'Internal server error' });
       assert.equal(state.riskClosures?.length || 0, 0);
+      assert.equal(state.advanceRiskEngine.isRiskStateHealthy(), false);
+      const riskResult = state.advanceRiskEngine.evaluate({
+        symbol: 'BTCUSDT',
+        timeframe: '1h',
+        entryPrice: 100,
+        atr: { ready: true, atr: 2, atrPercentage: 1 },
+        direction: 'BUY',
+        trend: null,
+        structure: null,
+        confluence: { confidence: 80 },
+        regime: 'TRENDING_BULL',
+      });
+      assert.equal(riskResult.tradeAllowed, false);
+      assert.equal(riskResult.rejectionReason, 'RISK_STATE_UNHEALTHY');
       assert.equal(state.paperClosed, true);
     } finally {
       await stopApp(server);

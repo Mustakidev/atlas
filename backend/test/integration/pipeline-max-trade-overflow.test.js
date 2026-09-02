@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { createExecutionPipeline } = require('../../src/core/executionPipeline');
+const { AdvanceRiskEngine } = require('../../src/engine/advanceRisk');
 const { PaperTradingEngine } = require('../../src/engine/paperTrading');
 
 const logger = { info() {}, warn() {}, error() {} };
@@ -14,10 +15,13 @@ const candles = Array.from({ length: 20 }, (_, index) => ({
   volume: 1,
 }));
 
-function makeHarness() {
+function makeHarness({ onTradeClosed, onEvaluate, riskAuthority } = {}) {
   let nowMs = 60000;
   let monotonicMs = 0;
   const riskClosures = [];
+  let riskEvaluateCalls = 0;
+  let signalCalls = 0;
+  const riskNotifier = onTradeClosed || ((pnl, context) => riskClosures.push({ pnl, context }));
   const paperTradeEngine = new PaperTradingEngine({
     logger,
     symbol: 'BTCUSDT',
@@ -27,6 +31,11 @@ function makeHarness() {
     },
   });
   paperTradeEngine._maxTrades = 1;
+  const originalSignal = paperTradeEngine.signal.bind(paperTradeEngine);
+  paperTradeEngine.signal = (...args) => {
+    signalCalls++;
+    return originalSignal(...args);
+  };
 
   const pipeline = createExecutionPipeline({
     config: {
@@ -80,9 +89,12 @@ function makeHarness() {
     mtfConfirmationEngine: {
       evaluate: () => ({ mtfAllowed: true, rejectionReason: null, confidence: 80, alignmentScore: 100 }),
     },
-    advanceRiskEngine: {
-      evaluate: () => ({ tradeAllowed: true, positionSize: 1, stopLoss: 90, takeProfit: 200, riskReward: 4.4, session: 'ASIAN' }),
-      onTradeClosed: (pnl, context) => riskClosures.push({ pnl, context }),
+    advanceRiskEngine: riskAuthority || {
+      evaluate: (...args) => {
+        riskEvaluateCalls++;
+        return onEvaluate ? onEvaluate(...args) : { tradeAllowed: true, positionSize: 1, stopLoss: 90, takeProfit: 200, riskReward: 4.4, session: 'ASIAN' };
+      },
+      onTradeClosed: riskNotifier,
     },
     mtfEngine: {
       calculate: () => ({ overallBias: 'Bullish', timeframeAgreement: 100 }),
@@ -94,6 +106,8 @@ function makeHarness() {
     pipeline,
     paperTradeEngine,
     riskClosures,
+    getRiskEvaluateCalls() { return riskEvaluateCalls; },
+    getSignalCalls() { return signalCalls; },
     setNow(value) { nowMs = value; },
   };
 }
@@ -135,4 +149,85 @@ test('pipeline observes signal-time overflow and notifies canonical risk once pe
   assert.equal(harness.paperTradeEngine.getBalance(), 10002);
   assert.equal(harness.paperTradeEngine.stats().closedTrades, 2);
   assert.equal(harness.paperTradeEngine.stats().openTrades, 1);
+});
+
+test('pre-open risk synchronization failure prevents replacement exposure', () => {
+  let syncCalls = 0;
+  const harness = makeHarness({
+    onTradeClosed: () => {
+      syncCalls++;
+      throw new Error('risk synchronization unavailable');
+    },
+  });
+
+  const firstDecision = runQuietly(harness, 100, 60000);
+  const secondDecision = runQuietly(harness, 101, 120000);
+
+  assert.equal(firstDecision.verdict.tradeOpened, true);
+  assert.equal(secondDecision.verdict.tradeOpened, false);
+  assert.equal(secondDecision.verdict.rejectionReason, 'RISK_STATE_SYNC_FAILURE');
+  assert.equal(harness.pipeline.getLastRunStatus().status, 'FAILED');
+  assert.equal(syncCalls, 1);
+  assert.deepEqual(harness.paperTradeEngine.open(), []);
+  assert.deepEqual(harness.paperTradeEngine.history().map(trade => trade.tradeId), ['PT-1']);
+  assert.equal(harness.paperTradeEngine.stats().closedTrades, 1);
+});
+
+test('risk synchronization failure remains fail-closed across later cycles', () => {
+  const harness = makeHarness({
+    onTradeClosed: () => { throw new Error('risk synchronization unavailable'); },
+  });
+
+  runQuietly(harness, 100, 60000);
+  const failedDecision = runQuietly(harness, 101, 120000);
+  const laterDecision = runQuietly(harness, 102, 180000);
+
+  assert.equal(failedDecision.verdict.rejectionReason, 'RISK_STATE_SYNC_FAILURE');
+  assert.equal(laterDecision.verdict.rejectionReason, 'RISK_STATE_SYNC_FAILURE');
+  assert.equal(harness.pipeline.getLastRunStatus().status, 'FAILED');
+  assert.equal(harness.getRiskEvaluateCalls(), 2);
+  assert.equal(harness.getSignalCalls(), 2);
+  assert.deepEqual(harness.paperTradeEngine.open(), []);
+  assert.equal(harness.paperTradeEngine.history().length, 1);
+});
+
+test('malformed pre-open closure PnL blocks replacement and later cycles', () => {
+  const authority = new AdvanceRiskEngine({
+    logger,
+    symbol: 'BTCUSDT',
+    paperTradeEngine: null,
+    config: {},
+    clock: { nowMs: () => 60000, monotonicMs: () => 0 },
+  });
+  const harness = makeHarness({ riskAuthority: authority });
+
+  const firstDecision = runQuietly(harness, 100, 60000);
+  harness.paperTradeEngine._trades[0].positionSize = NaN;
+  const failedDecision = runQuietly(harness, 101, 120000);
+  const laterDecision = runQuietly(harness, 102, 180000);
+
+  assert.equal(firstDecision.verdict.tradeOpened, true);
+  assert.equal(failedDecision.verdict.tradeOpened, false);
+  assert.equal(failedDecision.verdict.rejectionReason, 'RISK_STATE_SYNC_FAILURE');
+  assert.equal(authority.isRiskStateHealthy(), false);
+  assert.deepEqual(harness.paperTradeEngine.open(), []);
+  assert.deepEqual(harness.paperTradeEngine.history().map(trade => trade.tradeId), ['PT-1']);
+  assert.equal(laterDecision.verdict.rejectionReason, 'RISK_STATE_SYNC_FAILURE');
+  assert.equal(harness.paperTradeEngine.history().length, 1);
+});
+
+test('fresh execution graph restores valid admission after a failed graph', () => {
+  const failedHarness = makeHarness({
+    onTradeClosed: () => { throw new Error('risk synchronization unavailable'); },
+  });
+  runQuietly(failedHarness, 100, 60000);
+  runQuietly(failedHarness, 101, 120000);
+
+  const freshHarness = makeHarness();
+  const decision = runQuietly(freshHarness, 102, 180000);
+
+  assert.equal(decision.verdict.tradeOpened, true);
+  assert.equal(freshHarness.getRiskEvaluateCalls(), 1);
+  assert.equal(freshHarness.getSignalCalls(), 1);
+  assert.deepEqual(freshHarness.paperTradeEngine.open().map(trade => trade.tradeId), ['PT-1']);
 });

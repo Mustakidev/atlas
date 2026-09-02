@@ -689,10 +689,12 @@ function createRouter(deps) {
     }
 
     const nowMs = typeof closed.exitTime === 'string' ? Date.parse(closed.exitTime) : NaN;
-    if (closed.status !== 'CLOSED'
-      || typeof closed.pnl !== 'number'
-      || !Number.isFinite(closed.pnl)
-      || !Number.isFinite(nowMs)) {
+    const validPnl = typeof closed.pnl === 'number' && Number.isFinite(closed.pnl);
+    if (closed.status !== 'CLOSED' || !validPnl || !Number.isFinite(nowMs)) {
+      if (typeof advanceRiskEngine.markRiskStateUnhealthy !== 'function') {
+        throw new TypeError('Paper trade close returned an invalid closed trade');
+      }
+      advanceRiskEngine.markRiskStateUnhealthy();
       throw new TypeError('Paper trade close returned an invalid closed trade');
     }
 

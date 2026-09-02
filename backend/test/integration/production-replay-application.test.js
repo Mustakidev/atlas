@@ -170,6 +170,26 @@ const config = {
   },
 };
 
+function makeRiskPolicySource() {
+  return {
+    getPolicy() {
+      return {
+        accountBalance: 10000,
+        riskPerTradePct: 1,
+        atrMultTrending: 2,
+        atrMultRanging: 1.5,
+        rrTrending: 3,
+        rrRanging: 1.8,
+        maxDailyLossPct: 5,
+        maxDailyDrawdownPct: 10,
+        maxConsecutiveLosses: 3,
+        cooldownMs: 3600000,
+        sessionMultipliers: { ASIAN: 1, LONDON: 1, NEW_YORK: 1 },
+      };
+    },
+  };
+}
+
 function makeClock() {
   let monotonic = 0;
   return {
@@ -316,6 +336,7 @@ function makeApplication(options = {}) {
       logger,
       config,
       clock: makeClock(),
+      riskPolicySource: options.riskPolicySource || makeRiskPolicySource(),
     }),
   };
 }
@@ -440,6 +461,7 @@ test('validates factory dependencies against the existing canonical interfaces',
     ['config', { config: {} }],
     ['clock', { clock: {} }],
     ['riskPolicySource', { riskPolicySource: {} }],
+    ['riskPolicySource', { riskPolicySource: undefined }],
   ];
 
   for (const [label, overrides] of cases) {
@@ -449,6 +471,7 @@ test('validates factory dependencies against the existing canonical interfaces',
       logger,
       config,
       clock: makeClock(),
+      riskPolicySource: makeRiskPolicySource(),
     }[key];
     assert.throws(() => createProductionReplayApplication({
       mtfSource: value('mtfSource'),
@@ -586,6 +609,7 @@ test('preserves semantic trade timestamps in APP-owned projections', async () =>
       logger,
       config,
       clock: makeClock(),
+      riskPolicySource: makeRiskPolicySource(),
     });
     const result = await runQuietly(() => application.run(request()));
     assert.equal(result.replay.trades[0].timestamp, trade.timestamp);
@@ -702,6 +726,7 @@ test('accepts the exact maximum application horizon and rejects only the next ho
     logger,
     config,
     clock: makeClock(),
+    riskPolicySource: makeRiskPolicySource(),
   });
   const maxRequest = request(BASE_TIME, BASE_TIME + MAX_HORIZON_MS);
   await assertAppRejects(() => application.run(maxRequest), 'MTF_SOURCE_FAILURE');
@@ -722,6 +747,7 @@ test('preserves the locked failure order and exact source error identity', async
     logger,
     config,
     clock: makeClock(),
+    riskPolicySource: makeRiskPolicySource(),
   });
   await assertAppRejects(() => mtfFailure.run(request()), 'MTF_SOURCE_FAILURE', {
     source: 'mtf',
@@ -746,6 +772,7 @@ test('preserves the locked failure order and exact source error identity', async
     logger,
     config,
     clock: makeClock(),
+    riskPolicySource: makeRiskPolicySource(),
   });
   await assertAppRejects(() => shortMtf.run(request()), 'MTF_SOURCE_FAILURE', {
     source: 'mtf',
@@ -771,6 +798,7 @@ test('preserves the locked failure order and exact source error identity', async
     logger,
     config,
     clock: makeClock(),
+    riskPolicySource: makeRiskPolicySource(),
   });
   await assert.rejects(uncodedFailure.run(request()), error => {
     assertAppError(error, 'MTF_SOURCE_FAILURE', { source: 'mtf', phase: 'acquisition', cause: uncoded });
@@ -859,6 +887,7 @@ test('maps dependency construction failures and leaves no partial application re
     logger,
     config: failingConfig,
     clock: makeClock(),
+    riskPolicySource: makeRiskPolicySource(),
   });
 
   await assertAppRejects(() => application.run(request()), 'DEPENDENCY_FAILURE', {
@@ -879,6 +908,7 @@ test('maps runner construction and execution failures to REPLAY_FAILURE without 
       logger,
       config,
       clock: makeClock(),
+      riskPolicySource: makeRiskPolicySource(),
     });
     await assert.rejects(application.run(request()), error => {
       assert.equal(error.name, 'ProductionReplayApplicationError');
@@ -904,6 +934,7 @@ test('maps runner construction and execution failures to REPLAY_FAILURE without 
       logger,
       config,
       clock: makeClock(),
+      riskPolicySource: makeRiskPolicySource(),
     });
     await assert.rejects(application.run(request()), error => {
       assert.equal(error.name, 'ProductionReplayApplicationError');

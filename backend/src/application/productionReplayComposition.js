@@ -49,7 +49,6 @@ function assertClock(clock) {
 }
 
 function assertRiskPolicySource(riskPolicySource) {
-  if (riskPolicySource === undefined || riskPolicySource === null) return;
   assertObject(riskPolicySource, 'riskPolicySource');
   assertFunction(riskPolicySource.getPolicy, 'riskPolicySource.getPolicy');
 }
