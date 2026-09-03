@@ -386,3 +386,35 @@ test('repeated acquisition with identical results is deterministic', async () =>
 
   assert.deepEqual(second, first);
 });
+
+test('forwards signal to every Binance timeframe and preserves cancellation', async () => {
+  const controller = new AbortController();
+  const results = makeResults();
+  const calls = [];
+  const source = new ProductionReplayMtfSource({
+    client: {
+      async fetchCandles(requestValue, options) {
+        calls.push({ request: requestValue, options });
+        return results[requestValue.timeframe];
+      },
+    },
+  });
+
+  await source.fetch(request(), { signal: controller.signal });
+  assert.equal(calls.length, PRODUCTION_REPLAY_MTF_TIMEFRAMES.length);
+  assert.ok(calls.every(call => call.options.signal === controller.signal));
+
+  const cancelling = new AbortController();
+  const cancellingSource = new ProductionReplayMtfSource({
+    client: {
+      async fetchCandles() {
+        cancelling.abort();
+        throw new Error('provider completion raced shutdown');
+      },
+    },
+  });
+  await assert.rejects(
+    cancellingSource.fetch(request(), { signal: cancelling.signal }),
+    { message: 'provider completion raced shutdown' },
+  );
+});

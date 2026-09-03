@@ -508,3 +508,56 @@ test('repeated acquisition with identical responses is deterministic', async () 
   });
   assert.deepEqual(second, first);
 });
+
+test('propagates signal to every pagination request', async () => {
+  const total = 1001;
+  const endTime = BASE_TIME + total * TIMEFRAME_DURATIONS_MS['1m'];
+  const controller = new AbortController();
+  const calls = [];
+  const { client } = createClient(async (url, options) => {
+    calls.push({ url, options });
+    const startTime = Number(new URL(url).searchParams.get('startTime'));
+    const remaining = (endTime - startTime) / TIMEFRAME_DURATIONS_MS['1m'];
+    const count = Math.min(1000, remaining);
+    return response(Array.from({ length: count }, (_, index) =>
+      row(startTime + index * TIMEFRAME_DURATIONS_MS['1m'], '1m')));
+  });
+
+  await client.fetchCandles({
+    symbol: 'BTCUSDT',
+    timeframe: '1m',
+    startTime: BASE_TIME,
+    endTime,
+  }, { signal: controller.signal });
+
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every(call => call.options.signal === controller.signal));
+});
+
+test('preserves cancellation without retrying or normalizing it as transport failure', async () => {
+  const controller = new AbortController();
+  const waits = [];
+  const calls = [];
+  const client = new BinanceKlineClient({
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      controller.abort();
+      throw Object.assign(new Error('aborted'), { name: 'AbortError', code: 'ABORT_ERR' });
+    },
+    logger: logger(),
+    sleep: async delay => waits.push(delay),
+    config: { maxAttempts: 3, initialBackoffMs: 10 },
+  });
+
+  await assert.rejects(
+    client.fetchCandles({
+      symbol: 'BTCUSDT',
+      timeframe: '1m',
+      startTime: BASE_TIME,
+      endTime: BASE_TIME + TIMEFRAME_DURATIONS_MS['1m'],
+    }, { signal: controller.signal }),
+    { name: 'AbortError', code: 'ABORT_ERR' },
+  );
+  assert.equal(calls.length, 1);
+  assert.deepEqual(waits, []);
+});

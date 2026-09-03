@@ -6,6 +6,7 @@ const DEFAULT_INITIAL_BACKOFF_MS = 1000;
 const MAX_FALLBACK_BACKOFF_MS = 30000;
 const MAX_PAGE_SIZE = 1000;
 const MAX_DATE_MS = 8640000000000000;
+const { throwIfAborted, isCancellation } = require('../core/cancellation');
 
 const TIMEFRAME_DURATIONS_MS = Object.freeze({
   '1m': 60 * 1000,
@@ -319,12 +320,16 @@ class BinanceKlineClient {
     return url;
   }
 
-  async requestPage(requestContext, cursor) {
+  async requestPage(requestContext, cursor, signal) {
     const url = this.buildPageUrl(requestContext, cursor);
     let response;
     try {
-      response = await this.fetch(url.toString(), { timeout: this.config.timeoutMs });
+      const fetchOptions = { timeout: this.config.timeoutMs };
+      if (signal !== undefined) fetchOptions.signal = signal;
+      response = await this.fetch(url.toString(), fetchOptions);
+      throwIfAborted(signal);
     } catch (error) {
+      if (isCancellation(error, signal)) throw error;
       throw toTransportError(error, { ...requestContext, cursor });
     }
 
@@ -345,12 +350,14 @@ class BinanceKlineClient {
     try {
       body = await response.json();
     } catch (error) {
+      if (isCancellation(error, signal)) throw error;
       throw new BinanceKlineClientError('PROVIDER_CONTRACT', 'Provider response was not valid JSON', {
         ...requestContext,
         cursor,
         cause: error,
       });
     }
+    throwIfAborted(signal);
     return body;
   }
 
@@ -364,20 +371,24 @@ class BinanceKlineClient {
     return Math.min(fallbackDelay, MAX_FALLBACK_BACKOFF_MS);
   }
 
-  async requestPageWithRetry(requestContext, cursor, attempts) {
+  async requestPageWithRetry(requestContext, cursor, attempts, signal) {
     let lastError;
     for (let attempt = 1; attempt <= this.config.maxAttempts; attempt++) {
+      throwIfAborted(signal);
       attempts.count += 1;
       try {
-        const body = await this.requestPage(requestContext, cursor);
+        const body = await this.requestPage(requestContext, cursor, signal);
+        throwIfAborted(signal);
         return body;
       } catch (error) {
+        if (isCancellation(error, signal)) throw error;
         lastError = error instanceof BinanceKlineClientError
           ? error
           : toTransportError(error, { ...requestContext, cursor });
 
         if (!lastError.retryable || attempt === this.config.maxAttempts) break;
 
+        throwIfAborted(signal);
         const delayMs = this.calculateRetryDelay(lastError, attempt - 1);
         this.logger.warn('BinanceKlineClient', 'Retrying historical kline request', {
           symbol: requestContext.symbol,
@@ -388,7 +399,8 @@ class BinanceKlineClient {
           maxAttempts: this.config.maxAttempts,
           delayMs,
         });
-        await this.sleep(delayMs);
+        await this.sleep(delayMs, signal);
+        throwIfAborted(signal);
       }
     }
 
@@ -471,8 +483,9 @@ class BinanceKlineClient {
     return pageCandles;
   }
 
-  async fetchCandles(request) {
+  async fetchCandles(request, { signal } = {}) {
     const requestContext = assertRequest(request);
+    throwIfAborted(signal);
     const candles = [];
     const seenOpenTimes = new Set();
     const attempts = { count: 0 };
@@ -480,8 +493,11 @@ class BinanceKlineClient {
     let cursor = requestContext.startTime;
 
     while (cursor < requestContext.endTime) {
-      const body = await this.requestPageWithRetry(requestContext, cursor, attempts);
+      throwIfAborted(signal);
+      const body = await this.requestPageWithRetry(requestContext, cursor, attempts, signal);
+      throwIfAborted(signal);
       const pageCandles = this.validatePage(body, requestContext, cursor, seenOpenTimes);
+      throwIfAborted(signal);
       candles.push(...pageCandles);
       pageCount += 1;
 
@@ -496,6 +512,7 @@ class BinanceKlineClient {
       cursor = nextCursor;
     }
 
+    throwIfAborted(signal);
     if (cursor !== requestContext.endTime) {
       fail('PAGINATION_ERROR', 'Provider pagination did not terminate at the requested end', {
         ...requestContext,

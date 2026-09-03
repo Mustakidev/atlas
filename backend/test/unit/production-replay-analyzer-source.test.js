@@ -566,3 +566,41 @@ test('production source has no forbidden runtime ownership or secret access', ()
     assert.equal(source.includes(forbidden), false, `source contains forbidden reference ${forbidden}`);
   }
 });
+
+test('forwards signal to the historical Analyzer client and preserves cancellation', async () => {
+  const controller = new AbortController();
+  const result = makeResult();
+  const calls = [];
+  const source = new ProductionReplayAnalyzerSource({
+    client: {
+      async fetchHistoricalAnalyzerData(requestValue, options) {
+        calls.push({ request: requestValue, options });
+        return result;
+      },
+    },
+    symbol: SYMBOL,
+    coinId: COIN_ID,
+    vsCurrency: VS_CURRENCY,
+  });
+
+  await source.fetch(request(), { signal: controller.signal });
+  assert.deepEqual(calls[0].request, { startTime: START_TIME, endTime: END_TIME });
+  assert.equal(calls[0].options.signal, controller.signal);
+
+  const cancelling = new AbortController();
+  const cancellingSource = new ProductionReplayAnalyzerSource({
+    client: {
+      async fetchHistoricalAnalyzerData() {
+        cancelling.abort();
+        throw new Error('analyzer completion raced shutdown');
+      },
+    },
+    symbol: SYMBOL,
+    coinId: COIN_ID,
+    vsCurrency: VS_CURRENCY,
+  });
+  await assert.rejects(
+    cancellingSource.fetch(request(), { signal: cancelling.signal }),
+    { message: 'analyzer completion raced shutdown' },
+  );
+});

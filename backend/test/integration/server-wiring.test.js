@@ -153,6 +153,7 @@ const counters = {
   simplePriceFetch: 0,
   marketSnapshotEmitCount: 0,
   marketDataCalls: 0,
+  bootstrapFetchOptions: [],
 };
 const pipelineCalls = [];
 const marketSnapshotEmits = [];
@@ -301,7 +302,7 @@ ApiManager.prototype.fetchMarketData = async function () {
 };
 
 saveProbe();
-const mockedFetch = async url => {
+const mockedFetch = async (url, options) => {
   const target = String(url);
   if (target.includes('/simple/price')) {
     counters.simplePriceFetch++;
@@ -315,9 +316,13 @@ const mockedFetch = async url => {
     };
   }
   if (target.includes('/coins/bitcoin/ohlc')) {
+    counters.bootstrapFetchOptions.push({ endpoint: 'ohlc', hasSignal: Boolean(options?.signal) });
+    saveProbe();
     return { ok: true, status: 200, async json() { return []; } };
   }
   if (target.includes('/market_chart')) {
+    counters.bootstrapFetchOptions.push({ endpoint: 'market_chart', hasSignal: Boolean(options?.signal) });
+    saveProbe();
     return { ok: true, status: 200, async json() { return { prices: [], total_volumes: [] }; } };
   }
   throw new Error('Unexpected mocked URL: ' + target);
@@ -398,6 +403,10 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     }]);
     assert.deepEqual(first.probe.order.slice(-3), ['analyzer', 'signalHistory', 'pipeline']);
     assert.equal(first.probe.simplePriceFetch, 1);
+    assert.deepEqual(first.probe.bootstrapFetchOptions, [
+      { endpoint: 'ohlc', hasSignal: true },
+      { endpoint: 'market_chart', hasSignal: true },
+    ]);
     assert.equal(first.probe.paperEvaluateTrades, 1);
     assert.equal(first.probe.paperOnCandle, 1);
     assert.equal(first.probe.paperSignal, 0);
@@ -478,6 +487,74 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     assert.equal(stable.probe.advanceRiskOnTradeClosed, 0);
     assert.deepEqual(stable.probe.order.slice(-3), ['analyzer', 'signalHistory', 'pipeline']);
     assert.equal(child.exitCode, null);
+  } finally {
+    await stopServer(child);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('cancelling bootstrap does not start the initial live cycle or scheduler', async () => {
+  const port = await reservePort();
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-bootstrap-cancellation-'));
+  const preloadPath = path.join(tempDir, 'mock-bootstrap.js');
+  const probePath = path.join(tempDir, 'bootstrap-probe.json');
+  const preload = `
+const fs = require('node:fs');
+const fetchPath = require.resolve(${JSON.stringify(NODE_FETCH_ENTRY)});
+const probePath = ${JSON.stringify(probePath)};
+const state = { bootstrapFetches: 0, bootstrapAborted: false, marketDataCalls: 0 };
+function save() { fs.writeFileSync(probePath, JSON.stringify(state)); }
+const mockedFetch = async (url, options) => {
+  const target = String(url);
+  if (target.includes('/coins/bitcoin/ohlc')) {
+    state.bootstrapFetches++;
+    save();
+    return new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => {
+        state.bootstrapAborted = true;
+        save();
+        reject(Object.assign(new Error('bootstrap aborted'), { name: 'AbortError', code: 'ABORT_ERR' }));
+      }, { once: true });
+    });
+  }
+  if (target.includes('/market_chart')) {
+    throw new Error('market chart should not start after cancellation');
+  }
+  if (target.includes('/simple/price')) {
+    state.marketDataCalls++;
+    save();
+    return { ok: true, status: 200, async json() { return { bitcoin: { usd: 100, usd_24h_vol: 1, usd_24h_change: 0 } }; } };
+  }
+  throw new Error('unexpected URL: ' + target);
+};
+save();
+require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, exports: mockedFetch };
+`;
+  fs.writeFileSync(preloadPath, preload);
+
+  const child = spawn(process.execPath, ['server.js'], {
+    cwd: BACKEND,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      API_KEY,
+      ATLAS_OPERATOR_PASSWORD_HASH: OPERATOR_HASH,
+      ATLAS_ORIGIN: `http://127.0.0.1:${port}`,
+      ATLAS_COOKIE_SECURE: 'false',
+      MIN_API_INTERVAL: '1',
+      NODE_OPTIONS: `--require=${preloadPath}`,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitForStartup(child);
+    await stopServer(child);
+    const probe = readProbe(probePath);
+    assert.equal(probe.bootstrapFetches, 1);
+    assert.equal(probe.bootstrapAborted, true);
+    assert.equal(probe.marketDataCalls, 0);
+    assert.equal(child.exitCode, 0);
   } finally {
     await stopServer(child);
     fs.rmSync(tempDir, { recursive: true, force: true });

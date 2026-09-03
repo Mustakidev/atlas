@@ -1,3 +1,9 @@
+const {
+  throwIfAborted,
+  isCancellation,
+  createAbortError,
+} = require('../core/cancellation');
+
 class RetryHandler {
   constructor(config, logger) {
     this.logger = logger;
@@ -5,17 +11,22 @@ class RetryHandler {
     this.initialBackoff = config.get('INITIAL_BACKOFF');
   }
 
-  async execute(fn) {
+  async execute(fn, { signal } = {}) {
     let lastError;
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      throwIfAborted(signal);
       try {
-        return await fn();
+        const result = await fn();
+        throwIfAborted(signal);
+        return result;
       } catch (err) {
         lastError = err;
 
+        if (isCancellation(err, signal)) throw err;
         if (attempt === this.maxRetries) break;
 
+        throwIfAborted(signal);
         const delay = this.calculateDelay(attempt, err);
         this.logger.warn('RetryHandler', `Attempt ${attempt + 1} failed, retrying`, {
           error: err.message,
@@ -25,7 +36,8 @@ class RetryHandler {
           maxRetries: this.maxRetries,
         });
 
-        await this.sleep(delay);
+        await this.sleep(delay, signal);
+        throwIfAborted(signal);
       }
     }
 
@@ -52,8 +64,31 @@ class RetryHandler {
     return Math.floor(base + jitter);
   }
 
-  sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  sleep(ms, signal) {
+    if (signal?.aborted) return Promise.reject(createAbortError(signal.reason));
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timer;
+
+      const cleanup = () => {
+        if (timer !== undefined) clearTimeout(timer);
+        signal?.removeEventListener?.('abort', onAbort);
+      };
+
+      const settle = (settler, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        settler(value);
+      };
+
+      const onAbort = () => settle(reject, createAbortError(signal.reason));
+
+      timer = setTimeout(() => settle(resolve), ms);
+      signal?.addEventListener?.('abort', onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    });
   }
 }
 

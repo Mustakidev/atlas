@@ -1,4 +1,5 @@
 const fetch = require('node-fetch');
+const { throwIfAborted, isCancellation } = require('../core/cancellation');
 
 const DEFAULT_MIN_INTERVAL = 5000;
 const DEFAULT_THROTTLE_TTL = 30000;
@@ -62,13 +63,15 @@ class ApiManager {
     this._lastExternalCall = 0;
   }
 
-  async fetchMarketData() {
+  async fetchMarketData({ signal } = {}) {
+    throwIfAborted(signal);
     const now = Date.now();
 
     // Proactive throttle: if cache is fresh enough, skip the external call
     const cacheAge = this.cache.getAge();
     if (cacheAge !== null && cacheAge < this._throttleTtl) {
       const cached = this.cache.getWithMetadata(now);
+      throwIfAborted(signal);
       if (this._isMatchingCache(cached)) {
         this.logger.info('ApiManager', 'Throttle: using cached data', {
           cacheAgeMs: cacheAge,
@@ -86,14 +89,21 @@ class ApiManager {
         waitMs,
         minInterval: this._minInterval,
       });
-      await this.retry.sleep(waitMs);
+      throwIfAborted(signal);
+      await this.retry.sleep(waitMs, signal);
+      throwIfAborted(signal);
     }
 
+    throwIfAborted(signal);
     this._lastExternalCall = Date.now();
 
     try {
       const result = await this.retry.execute(async () => {
-        const response = await this.fetch(this.url, { timeout: this.timeout });
+        throwIfAborted(signal);
+        const fetchOptions = { timeout: this.timeout };
+        if (signal !== undefined) fetchOptions.signal = signal;
+        const response = await this.fetch(this.url, fetchOptions);
+        throwIfAborted(signal);
 
         if (response.status === 429) {
           const err = new Error('Rate limited');
@@ -108,23 +118,29 @@ class ApiManager {
           throw err;
         }
 
-        return response.json();
-      });
+        const body = await response.json();
+        throwIfAborted(signal);
+        return body;
+      }, signal === undefined ? undefined : { signal });
 
+      throwIfAborted(signal);
       const observedAtMs = Date.now();
       let snapshot;
       try {
         snapshot = this.buildSnapshot(result, observedAtMs);
       } catch (err) {
+        if (isCancellation(err, signal)) throw err;
         this.fail();
         const fallbackNowMs = Date.now();
         const cached = this.cache.getWithMetadata(fallbackNowMs);
+        throwIfAborted(signal);
         if (this._isMatchingCache(cached)) {
           return this._cacheResult(cached, fallbackNowMs, ACQUISITION_STATUSES.INVALID_PROVIDER_DATA);
         }
         return this._unavailableResult(ACQUISITION_STATUSES.INVALID_PROVIDER_DATA);
       }
 
+      throwIfAborted(signal);
       this.connected = true;
       this.lastFetchTime = new Date(observedAtMs);
       this.consecutiveFailures = 0;
@@ -136,9 +152,11 @@ class ApiManager {
         provenance: this._provenance(snapshot.timestamp, observedAtMs, null, null, null),
       };
     } catch (err) {
+      if (isCancellation(err, signal)) throw err;
       this.fail();
       const fallbackNowMs = Date.now();
       const cached = this.cache.getWithMetadata(fallbackNowMs);
+      throwIfAborted(signal);
       if (this._isMatchingCache(cached)) {
         return this._cacheResult(cached, fallbackNowMs, ACQUISITION_STATUSES.PROVIDER_UNAVAILABLE);
       }

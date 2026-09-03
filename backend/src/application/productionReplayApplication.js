@@ -5,6 +5,10 @@ const {
 } = require('../engine/replayMultiTimeframeInput');
 const { createReplayDependencies } = require('../engine/replayDependencies');
 const { createReplayPipelineRunner } = require('../engine/replayPipelineRunner');
+const {
+  throwIfAborted,
+  isCancellation,
+} = require('../core/cancellation');
 
 const HOUR_MS = REPLAY_MTF_DURATIONS_MS['1h'];
 const DAY_MS = 86_400_000;
@@ -247,6 +251,37 @@ function sourceFailure(code, message, source, phase, error, details = {}) {
     ...(typeof error?.code === 'string' ? { originalCode: error.code } : {}),
     cause: error,
   });
+}
+
+function cancellationFailure(error) {
+  if (error instanceof ProductionReplayApplicationError && error.code === 'CANCELLED') {
+    return error;
+  }
+  return new ProductionReplayApplicationError('CANCELLED', 'Canonical replay cancelled', {
+    source: 'lifecycle',
+    phase: 'cancellation',
+    cause: error,
+  });
+}
+
+function throwCancellationIfNeeded(error, signal) {
+  if (error instanceof ProductionReplayApplicationError && error.code === 'CANCELLED') {
+    throw error;
+  }
+  if (!isCancellation(error, signal)) return;
+  throw cancellationFailure(error);
+}
+
+function throwIfReplayActive(signal) {
+  try {
+    throwIfAborted(signal);
+  } catch (error) {
+    throw cancellationFailure(error);
+  }
+}
+
+function yieldToEventLoop() {
+  return new Promise(resolve => setImmediate(resolve));
 }
 
 function compositionFailure(message, source, phase, details = {}) {
@@ -588,13 +623,18 @@ function createProductionReplayApplication(options = {}) {
     riskPolicySource,
   } = options;
 
-  async function run(request) {
+  async function run(request, { signal } = {}) {
+    throwIfReplayActive(signal);
     const normalizedRequest = normalizeRequest(request);
+    throwIfReplayActive(signal);
 
     let mtfResult;
     try {
-      mtfResult = await mtfSource.fetch(normalizedRequest);
+      mtfResult = signal === undefined
+        ? await mtfSource.fetch(normalizedRequest)
+        : await mtfSource.fetch(normalizedRequest, { signal });
     } catch (error) {
+      throwCancellationIfNeeded(error, signal);
       throw sourceFailure(
         'MTF_SOURCE_FAILURE',
         'Production MTF source acquisition failed',
@@ -604,15 +644,18 @@ function createProductionReplayApplication(options = {}) {
       );
     }
 
+    throwIfReplayActive(signal);
     assertMtfResult(mtfResult, normalizedRequest);
 
     let normalizedMtfInput;
     let normalizedInput;
     try {
+      throwIfReplayActive(signal);
       normalizedMtfInput = normalizeReplayMultiTimeframeInput(mtfResult.rawInput);
       assertNormalizedMtfHorizon(normalizedMtfInput, normalizedRequest);
       normalizedInput = normalizeReplayInput(normalizedMtfInput.timeframes['1h'], '1h');
     } catch (error) {
+      throwCancellationIfNeeded(error, signal);
       if (error instanceof ProductionReplayApplicationError) throw error;
       throw sourceFailure(
         'MTF_SOURCE_FAILURE',
@@ -622,15 +665,20 @@ function createProductionReplayApplication(options = {}) {
         error,
       );
     }
+    throwIfReplayActive(signal);
 
     let analyzerResult;
     try {
-      analyzerResult = await analyzerSource.fetch({
+      const analyzerRequest = {
         symbol: normalizedRequest.symbol,
         startTime: normalizedRequest.startTime,
         endTime: normalizedRequest.endTime + HOUR_MS,
-      });
+      };
+      analyzerResult = signal === undefined
+        ? await analyzerSource.fetch(analyzerRequest)
+        : await analyzerSource.fetch(analyzerRequest, { signal });
     } catch (error) {
+      throwCancellationIfNeeded(error, signal);
       throw sourceFailure(
         'ANALYZER_SOURCE_FAILURE',
         'Production Analyzer source acquisition failed',
@@ -640,6 +688,7 @@ function createProductionReplayApplication(options = {}) {
       );
     }
 
+    throwIfReplayActive(signal);
     assertAnalyzerResult(analyzerResult, normalizedRequest);
     assertTemporalCoherence(
       normalizedMtfInput,
@@ -649,6 +698,7 @@ function createProductionReplayApplication(options = {}) {
 
     let dependencies;
     try {
+      throwIfReplayActive(signal);
       dependencies = createReplayDependencies({
         logger,
         symbol: normalizedRequest.symbol,
@@ -661,6 +711,7 @@ function createProductionReplayApplication(options = {}) {
       });
       assertProjectionOwners(dependencies);
     } catch (error) {
+      throwCancellationIfNeeded(error, signal);
       throw sourceFailure(
         'DEPENDENCY_FAILURE',
         'Canonical replay dependency construction failed',
@@ -672,8 +723,10 @@ function createProductionReplayApplication(options = {}) {
 
     let runner;
     try {
+      throwIfReplayActive(signal);
       runner = createReplayPipelineRunner({ dependencies, normalizedInput });
     } catch (error) {
+      throwCancellationIfNeeded(error, signal);
       throw sourceFailure(
         'REPLAY_FAILURE',
         'Canonical replay runner construction failed',
@@ -686,9 +739,21 @@ function createProductionReplayApplication(options = {}) {
     const rawCycles = [];
     let runnerState;
     try {
-      while (runner.hasNext()) rawCycles.push(runner.runNextCycle());
+      let cycleIndex = 0;
+      while (runner.hasNext()) {
+        throwIfReplayActive(signal);
+        if (cycleIndex === 0 || cycleIndex % 64 === 0) {
+          await yieldToEventLoop();
+          throwIfReplayActive(signal);
+        }
+        rawCycles.push(runner.runNextCycle());
+        cycleIndex++;
+      }
+      await yieldToEventLoop();
+      throwIfReplayActive(signal);
       runnerState = runner.getState();
     } catch (error) {
+      throwCancellationIfNeeded(error, signal);
       throw sourceFailure(
         'REPLAY_FAILURE',
         'Canonical replay execution failed',
@@ -721,6 +786,7 @@ function createProductionReplayApplication(options = {}) {
     let replay;
     let provenance;
     try {
+      throwIfReplayActive(signal);
       replay = {
         cycles: rawCycles.map(projectCycle),
         runnerState: projectRunnerState(runnerState),
@@ -735,6 +801,7 @@ function createProductionReplayApplication(options = {}) {
         analyzerResult.provenance,
       );
     } catch (error) {
+      throwCancellationIfNeeded(error, signal);
       throw sourceFailure(
         'REPLAY_FAILURE',
         'Canonical replay projection failed',
@@ -744,7 +811,11 @@ function createProductionReplayApplication(options = {}) {
       );
     }
 
-    return deepFreeze({ replay, provenance });
+    const result = deepFreeze({ replay, provenance });
+    throwIfReplayActive(signal);
+    await yieldToEventLoop();
+    throwIfReplayActive(signal);
+    return result;
   }
 
   return Object.freeze({ run });

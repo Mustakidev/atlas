@@ -687,3 +687,18 @@ test('production router has no forbidden source or legacy ownership imports', ()
     assert.equal(source.includes(forbidden), false, forbidden);
   }
 });
+
+test('maps internal cancellation to the existing shutdown response', async () => {
+  const application = {
+    async run() {
+      throw new ProductionReplayApplicationError('CANCELLED', 'Canonical replay cancelled');
+    },
+  };
+
+  await withRequest({ application }, async (server, state) => {
+    const result = await request(server, { path: requestPath(validQuery()) });
+    assert.equal(result.statusCode, 503);
+    assert.deepEqual(result.body, { error: 'Server shutting down' });
+    assert.deepEqual(state.logger.errors, []);
+  });
+});

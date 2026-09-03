@@ -481,3 +481,19 @@ test('validates constructor configuration without revealing credential values', 
   assert.throws(() => createClient(async () => response(makePayload()), { vsCurrency: 'USD' }), /vsCurrency/);
   assert.equal(TEST_API_KEY.length > 0, true);
 });
+
+test('propagates signal and preserves abort instead of provider-unavailable conversion', async () => {
+  const controller = new AbortController();
+  let fetchOptions;
+  const client = createClient(async (url, options) => {
+    fetchOptions = options;
+    controller.abort();
+    throw Object.assign(new Error('aborted'), { name: 'AbortError', code: 'ABORT_ERR' });
+  });
+
+  await assert.rejects(
+    client.fetchHistoricalAnalyzerData(request(), { signal: controller.signal }),
+    { name: 'AbortError', code: 'ABORT_ERR' },
+  );
+  assert.equal(fetchOptions.signal, controller.signal);
+});

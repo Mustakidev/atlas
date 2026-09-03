@@ -19,6 +19,7 @@ const {
 } = require('../../src/engine/replayMultiTimeframeInput');
 const { createReplayDependencies } = require('../../src/engine/replayDependencies');
 const { createReplayPipelineRunner } = require('../../src/engine/replayPipelineRunner');
+const { createAbortError } = require('../../src/core/cancellation');
 
 const HOUR_MS = REPLAY_MTF_DURATIONS_MS['1h'];
 const DAY_MS = 86_400_000;
@@ -200,8 +201,10 @@ function makeClock() {
 
 function makeBinanceClient({ shortPrimary = false, error, calls }) {
   return {
-    async fetchCandles(request) {
-      calls.push({ ...request });
+    async fetchCandles(request, options) {
+      const call = { ...request };
+      if (options !== undefined) call.options = options;
+      calls.push(call);
       if (error) throw error;
       const duration = REPLAY_MTF_DURATIONS_MS[request.timeframe];
       const requestedCount = (request.endTime - request.startTime) / duration;
@@ -298,18 +301,24 @@ function makeProductionSources({
   });
 
   const mtfSource = {
-    async fetch(request) {
+    async fetch(request, options) {
       order.push('mtf');
-      const result = await realMtfSource.fetch(request);
+      const result = options === undefined
+        ? await realMtfSource.fetch(request)
+        : await realMtfSource.fetch(request, options);
       observed.mtfResult = result;
       return mutateMtfResult ? mutateMtfResult(result) : result;
     },
   };
   const analyzerSource = {
-    async fetch(request) {
+    async fetch(request, options) {
       order.push('analyzer');
-      analyzerSourceCalls.push({ ...request });
-      const result = await realAnalyzerSource.fetch(request);
+      const call = { ...request };
+      if (options !== undefined) call.options = options;
+      analyzerSourceCalls.push(call);
+      const result = options === undefined
+        ? await realAnalyzerSource.fetch(request)
+        : await realAnalyzerSource.fetch(request, options);
       observed.analyzerResult = result;
       return mutateAnalyzerResult ? mutateAnalyzerResult(result) : result;
     },
@@ -958,4 +967,158 @@ test('repeated production-shaped runs are semantically deterministic with fresh 
   assert.notStrictEqual(firstResult, secondResult);
   assert.notStrictEqual(firstResult.replay, secondResult.replay);
   assert.notStrictEqual(firstResult.replay.cycles, secondResult.replay.cycles);
+});
+
+test('classifies source cancellation as internal CANCELLED without partial output', async () => {
+  const controller = new AbortController();
+  const cause = createAbortError();
+  const setup = makeApplication();
+  setup.mtfSource.fetch = async () => {
+    controller.abort();
+    throw cause;
+  };
+
+  await assert.rejects(
+    setup.application.run(request(), { signal: controller.signal }),
+    error => {
+      assert.equal(error.name, 'ProductionReplayApplicationError');
+      assert.equal(error.code, 'CANCELLED');
+      assert.equal(error.cause, cause);
+      assert.equal(error.source, 'lifecycle');
+      return true;
+    },
+  );
+});
+
+test('forwards one lifecycle signal through both Replay source boundaries', async () => {
+  const controller = new AbortController();
+  const setup = makeApplication();
+
+  await runQuietly(() => setup.application.run(request(), { signal: controller.signal }));
+
+  assert.ok(setup.mtfCalls.every(call => call.options?.signal === controller.signal));
+  assert.equal(setup.analyzerSourceCalls[0].options.signal, controller.signal);
+  assert.equal(setup.analyzerClientCalls[0].options.signal, controller.signal);
+});
+
+test('cooperatively cancels a synchronous Replay run at a macrotask checkpoint', async () => {
+  const cycleCount = 128;
+  const endTime = BASE_TIME + cycleCount * HOUR_MS;
+  const mtfTimeframes = Object.fromEntries(Object.entries(REPLAY_MTF_DURATIONS_MS).map(([timeframe, duration]) => [
+    timeframe,
+    Array.from({ length: (endTime - BASE_TIME) / duration }, (_, index) => ({
+      openTime: BASE_TIME + index * duration,
+      timestamp: new Date(BASE_TIME + index * duration).toISOString(),
+      open: 100 + index,
+      high: 101 + index,
+      low: 99 + index,
+      close: 100 + index,
+      volume: 1,
+    })),
+  ]));
+  const snapshots = Array.from({ length: cycleCount + 1 }, (_, index) => ({
+    timestamp: new Date(BASE_TIME + index * HOUR_MS).toISOString(),
+    price: 100 + index,
+    volume: 1,
+    change24h: 0,
+  }));
+  const mtfResult = {
+    rawInput: {
+      schemaVersion: 2,
+      primaryTimeframe: '1h',
+      sourcePolicy: 'independent',
+      timeframes: mtfTimeframes,
+    },
+    provenance: {
+      provider: 'binance-spot-klines',
+      symbol: SYMBOL,
+      requestedStartTime: BASE_TIME,
+      requestedEndTime: endTime,
+    },
+  };
+  const analyzerResult = {
+    analyzerInput: normalizeReplayAnalyzerInput({
+      schemaVersion: 1,
+      symbol: SYMBOL,
+      snapshots,
+    }),
+    provenance: {
+      sourceType: 'production-replay-analyzer',
+      semanticMode: 'historical-equivalent',
+      provider: 'coingecko',
+      symbol: SYMBOL,
+      requestedStartTime: BASE_TIME,
+      requestedEndTime: endTime + HOUR_MS,
+    },
+  };
+  const controller = new AbortController();
+  const originalSetImmediate = setImmediate;
+  let yieldCount = 0;
+
+  await withRunnerFactoryStub(() => {
+    let index = 0;
+    return {
+      hasNext() { return index < cycleCount; },
+      runNextCycle() {
+        const cycle = {
+          index,
+          openTime: BASE_TIME + index * HOUR_MS,
+          timestamp: new Date(BASE_TIME + (index + 1) * HOUR_MS).toISOString(),
+          price: 100 + index,
+          decision: {},
+        };
+        index++;
+        return cycle;
+      },
+      getState() {
+        return { status: 'EXHAUSTED', cycleCount: index, failure: null };
+      },
+    };
+  }, async freshModule => {
+    const application = freshModule.createProductionReplayApplication({
+      mtfSource: { fetch: async () => mtfResult },
+      analyzerSource: { fetch: async () => analyzerResult },
+      logger,
+      config,
+      clock: makeClock(),
+      riskPolicySource: makeRiskPolicySource(),
+    });
+    global.setImmediate = (callback, ...args) => {
+      yieldCount++;
+      if (yieldCount === 2) controller.abort();
+      return originalSetImmediate(callback, ...args);
+    };
+    try {
+      await assert.rejects(
+        application.run(request(BASE_TIME, endTime), { signal: controller.signal }),
+        error => error.name === 'ProductionReplayApplicationError' && error.code === 'CANCELLED',
+      );
+    } finally {
+      global.setImmediate = originalSetImmediate;
+    }
+  });
+
+  assert.equal(yieldCount, 2);
+});
+
+test('final post-projection checkpoint prevents a cancelled result from returning', async () => {
+  const controller = new AbortController();
+  const application = makeApplication().application;
+  const originalSetImmediate = setImmediate;
+  let yieldCount = 0;
+  global.setImmediate = (callback, ...args) => {
+    yieldCount++;
+    if (yieldCount === 3) controller.abort();
+    return originalSetImmediate(callback, ...args);
+  };
+
+  try {
+    await assert.rejects(
+      runQuietly(() => application.run(request(), { signal: controller.signal })),
+      error => assertAppError(error, 'CANCELLED'),
+    );
+  } finally {
+    global.setImmediate = originalSetImmediate;
+  }
+  assert.equal(yieldCount, 3);
 });
