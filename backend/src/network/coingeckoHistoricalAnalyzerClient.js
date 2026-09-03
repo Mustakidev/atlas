@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const { throwIfAborted, isCancellation } = require('../core/cancellation');
 
 const DEFAULT_BASE_URL = 'https://api.coingecko.com/api/v3';
 const DEFAULT_COIN_ID = 'bitcoin';
@@ -280,14 +281,19 @@ function createEvents(payload, request, priceTimestamps, volumeTimestamps) {
   return events;
 }
 
-async function readProviderResponse(fetch, url, config) {
+async function readProviderResponse(fetch, url, config, signal) {
+  throwIfAborted(signal);
   let response;
   try {
-    response = await fetch(url.toString(), {
+    const fetchOptions = {
       headers: { 'x-cg-demo-api-key': config.apiKey },
       timeout: config.timeout,
-    });
-  } catch {
+    };
+    if (signal !== undefined) fetchOptions.signal = signal;
+    response = await fetch(url.toString(), fetchOptions);
+    throwIfAborted(signal);
+  } catch (error) {
+    if (isCancellation(error, signal)) throw error;
     fail('PROVIDER_UNAVAILABLE', 'CoinGecko request failed');
   }
 
@@ -311,8 +317,11 @@ async function readProviderResponse(fetch, url, config) {
   }
 
   try {
-    return await response.json();
-  } catch {
+    const payload = await response.json();
+    throwIfAborted(signal);
+    return payload;
+  } catch (error) {
+    if (isCancellation(error, signal)) throw error;
     fail('PROVIDER_CONTRACT', 'CoinGecko response was not valid JSON');
   }
 }
@@ -331,10 +340,12 @@ class CoinGeckoHistoricalAnalyzerClient {
     this.#config = normalizeConfig(config);
   }
 
-  async fetchHistoricalAnalyzerData(request) {
+  async fetchHistoricalAnalyzerData(request, { signal } = {}) {
     const normalizedRequest = assertRequest(request);
+    throwIfAborted(signal);
     const url = buildUrl(this.#config, normalizedRequest);
-    const payload = await readProviderResponse(this.#fetch, url, this.#config);
+    const payload = await readProviderResponse(this.#fetch, url, this.#config, signal);
+    throwIfAborted(signal);
     validateRoot(payload);
     const rawPayloadSha256 = hashRawPayload(payload);
     const priceTimestamps = validateSeries(payload.prices, 'prices');
@@ -346,6 +357,7 @@ class CoinGeckoHistoricalAnalyzerClient {
     validateCoverage(priceTimestamps, 'prices', normalizedRequest, payload.prices.length);
     validateCoverage(volumeTimestamps, 'total_volumes', normalizedRequest, payload.total_volumes.length);
     const events = createEvents(payload, normalizedRequest, priceTimestamps, volumeTimestamps);
+    throwIfAborted(signal);
 
     return {
       events,

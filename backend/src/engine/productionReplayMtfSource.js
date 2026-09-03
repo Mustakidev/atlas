@@ -2,6 +2,7 @@ const {
   SUPPORTED_TIMEFRAMES,
   TIMEFRAME_DURATIONS_MS,
 } = require('../network/binanceKlineClient');
+const { throwIfAborted, isCancellation } = require('../core/cancellation');
 
 const MAX_DATE_MS = 8640000000000000;
 const PRIMARY_TIMEFRAME = '1h';
@@ -219,25 +220,32 @@ class ProductionReplayMtfSource {
     this.client = client;
   }
 
-  async fetch(request) {
+  async fetch(request, { signal } = {}) {
     const context = assertRequest(request);
+    throwIfAborted(signal);
     const streams = {};
     const seenArrays = new Map();
     const seenCandles = new WeakMap();
 
     for (const timeframe of SUPPORTED_TIMEFRAMES) {
+      throwIfAborted(signal);
       let result;
       try {
-        result = await this.client.fetchCandles({
+        const clientRequest = {
           symbol: context.symbol,
           timeframe,
           startTime: context.startTime,
           endTime: context.endTime,
-        });
+        };
+        result = signal === undefined
+          ? await this.client.fetchCandles(clientRequest)
+          : await this.client.fetchCandles(clientRequest, { signal });
       } catch (error) {
+        if (isCancellation(error, signal)) throw error;
         throw streamFailure(error, context, timeframe);
       }
 
+      throwIfAborted(signal);
       streams[timeframe] = validateStreamResult(
         result,
         context,

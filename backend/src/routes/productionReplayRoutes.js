@@ -2,6 +2,7 @@ const express = require('express');
 const {
   ProductionReplayApplicationError,
 } = require('../application/productionReplayApplication');
+const { isCancellation } = require('../core/cancellation');
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
@@ -53,6 +54,10 @@ const APP_ERROR_RESPONSES = new Map([
       error: 'Canonical replay failed',
       code: 'REPLAY_FAILURE',
     }),
+  }],
+  ['CANCELLED', {
+    status: 503,
+    body: Object.freeze({ error: 'Server shutting down' }),
   }],
 ]);
 
@@ -144,17 +149,29 @@ function createProductionReplayRouter({ application, logger, lifecycle } = {}) {
     }
 
     try {
+      let replaySignal;
       const result = lifecycle
-        ? await lifecycle.startReplay(() => application.run(request))
+        ? await lifecycle.startReplay(({ signal }) => {
+          replaySignal = signal;
+          return application.run(request, { signal });
+        })
         : await application.run(request);
-      if (result === null) return res.status(503).json({ error: 'Server shutting down' });
+      if (res.destroyed || res.writableEnded) return undefined;
+      if (result === null
+        || replaySignal?.aborted
+        || lifecycle?.isShuttingDown?.()) {
+        return res.status(503).json({ error: 'Server shutting down' });
+      }
       return res.json(result);
     } catch (error) {
+      if (res.destroyed || res.writableEnded) return undefined;
+      if (isCancellation(error)) return res.status(503).json({ error: 'Server shutting down' });
       if (!(error instanceof ProductionReplayApplicationError)) return next(error);
 
       const response = APP_ERROR_RESPONSES.get(error.code);
       if (!response) return next(error);
 
+      if (error.code === 'CANCELLED') return res.status(response.status).json(response.body);
       logKnownApplicationError(logger, error);
       return res.status(response.status).json(response.body);
     }

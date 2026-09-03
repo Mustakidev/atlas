@@ -1,4 +1,5 @@
 const { normalizeReplayAnalyzerInput } = require('./replayAnalyzerInput');
+const { throwIfAborted, isCancellation } = require('../core/cancellation');
 
 const MAX_DATE_MS = 8_640_000_000_000_000;
 const DAY_MS = 86_400_000;
@@ -267,17 +268,23 @@ class ProductionReplayAnalyzerSource {
     Object.freeze(this);
   }
 
-  async fetch(request) {
+  async fetch(request, { signal } = {}) {
     const context = assertRequest(request, this.symbol);
+    throwIfAborted(signal);
     let result;
     try {
-      result = await this.client.fetchHistoricalAnalyzerData({
+      const clientRequest = {
         startTime: context.startTime,
         endTime: context.endTime,
-      });
+      };
+      result = signal === undefined
+        ? await this.client.fetchHistoricalAnalyzerData(clientRequest)
+        : await this.client.fetchHistoricalAnalyzerData(clientRequest, { signal });
     } catch (error) {
+      if (isCancellation(error, signal)) throw error;
       throw wrapSourceFailure(error);
     }
+    throwIfAborted(signal);
 
     const validated = validateDependencyResult(result, {
       ...context,

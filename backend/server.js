@@ -30,6 +30,11 @@ const { createExecutionPipeline } = require('./src/core/executionPipeline');
 const { createSystemClock } = require('./src/core/clock');
 const { registerLiveSnapshotHandler } = require('./src/core/liveSnapshot');
 const { createLifecycleController } = require('./src/core/lifecycleController');
+const {
+  throwIfAborted,
+  isCancellation,
+  createAbortError,
+} = require('./src/core/cancellation');
 
 const fetch = require('node-fetch');
 
@@ -173,9 +178,8 @@ registerLiveSnapshotHandler({
 });
 
 function ensureBootstrapActive(signal) {
-  if (signal?.aborted || lifecycle.isShuttingDown()) {
-    throw new Error('Bootstrap stopped by lifecycle shutdown');
-  }
+  throwIfAborted(signal);
+  if (lifecycle.isShuttingDown()) throw createAbortError('Bootstrap stopped by lifecycle shutdown');
 }
 
 async function seedHistoricalCandles({ signal } = {}) {
@@ -188,7 +192,10 @@ async function seedHistoricalCandles({ signal } = {}) {
     ensureBootstrapActive(signal);
     logger.system('Server', 'Seeding historical candles from CoinGecko...');
 
-    const ohlcRes = await fetch(`${baseUrl}/coins/${coinId}/ohlc?vs_currency=${vsCurrency}&days=30`);
+    const ohlcUrl = `${baseUrl}/coins/${coinId}/ohlc?vs_currency=${vsCurrency}&days=30`;
+    const ohlcRes = signal === undefined
+      ? await fetch(ohlcUrl)
+      : await fetch(ohlcUrl, { signal });
     ensureBootstrapActive(signal);
     if (ohlcRes.ok) {
       const ohlcData = await ohlcRes.json();
@@ -198,6 +205,7 @@ async function seedHistoricalCandles({ signal } = {}) {
       }
       const sortedOhlcData = sortHistoricalOhlcRows(ohlcData);
       for (const [ts, open, high, low, close] of sortedOhlcData) {
+        ensureBootstrapActive(signal);
         candleEngine.ingestHistoricalCandle('4h', {
           open: open,
           high: high,
@@ -213,10 +221,13 @@ async function seedHistoricalCandles({ signal } = {}) {
       logger.warn('Server', `OHLC endpoint returned ${ohlcRes.status}`);
     }
 
-    await new Promise(r => setTimeout(r, 1500));
+    await retry.sleep(1500, signal);
     ensureBootstrapActive(signal);
 
-    const mcRes = await fetch(`${baseUrl}/coins/${coinId}/market_chart?vs_currency=${vsCurrency}&days=2`);
+    const marketChartUrl = `${baseUrl}/coins/${coinId}/market_chart?vs_currency=${vsCurrency}&days=2`;
+    const mcRes = signal === undefined
+      ? await fetch(marketChartUrl)
+      : await fetch(marketChartUrl, { signal });
     ensureBootstrapActive(signal);
     if (mcRes.ok) {
       const mcData = await mcRes.json();
@@ -224,6 +235,7 @@ async function seedHistoricalCandles({ signal } = {}) {
       const prices = mcData.prices || [];
       const volumes = mcData.total_volumes || [];
       for (let i = 0; i < prices.length; i++) {
+        ensureBootstrapActive(signal);
         const [ts, price] = prices[i];
         const vol = volumes[i] ? volumes[i][1] : 0;
         candleEngine.ingest({
@@ -246,6 +258,7 @@ async function seedHistoricalCandles({ signal } = {}) {
     }
     logger.system('Server', `Historical seed complete: ${seeded} snapshots → candles per timeframe`, totalPerTf);
   } catch (err) {
+    if (isCancellation(err, signal) || lifecycle.isShuttingDown()) throw err;
     logger.warn('Server', `Historical seed failed: ${err.message} — proceeding without history`);
   }
 }
@@ -253,7 +266,7 @@ async function seedHistoricalCandles({ signal } = {}) {
 async function fetchCycle({ signal } = {}) {
   if (signal?.aborted || lifecycle.isShuttingDown()) return;
   try {
-    const result = await apiManager.fetchMarketData();
+    const result = await apiManager.fetchMarketData({ signal });
     if (signal?.aborted || lifecycle.isShuttingDown()) return;
     if (!result || result.status !== 'FRESH' || !result.snapshot) {
       logger.warn('Server', 'Live cycle skipped — market data is not fresh', {
@@ -269,7 +282,7 @@ async function fetchCycle({ signal } = {}) {
     const transition = candleEngine.ingest(snapshot);
     eventBus.emit('market:snapshot', snapshot, transition);
   } catch (err) {
-    if (signal?.aborted || lifecycle.isShuttingDown()) return;
+    if (isCancellation(err, signal) || lifecycle.isShuttingDown()) return;
     apiManager.fail();
     logger.error('Server', 'Market-data acquisition failed before live-cycle admission', {
       error: err.message,
@@ -281,7 +294,11 @@ const port = config.get('PORT');
 const interval = config.get('REFRESH_INTERVAL');
 
 const server = app.listen(port, async () => {
-  const bootstrap = lifecycle.startBootstrap(({ signal }) => seedHistoricalCandles({ signal }));
+  let bootstrapSignal;
+  const bootstrap = lifecycle.startBootstrap(({ signal }) => {
+    bootstrapSignal = signal;
+    return seedHistoricalCandles({ signal });
+  });
   lifecycle.markRunning();
 
   logger.system('Server', `Atlas v1.0 running on port ${port}`);
@@ -294,12 +311,13 @@ const server = app.listen(port, async () => {
 
   try {
     if (bootstrap) await bootstrap;
-    if (lifecycle.isShuttingDown() || lifecycle.getState() !== 'RUNNING') return;
+    if (bootstrapSignal?.aborted || lifecycle.isShuttingDown() || lifecycle.getState() !== 'RUNNING') return;
 
     const initialCycle = lifecycle.startLiveCycle(({ signal }) => fetchCycle({ signal }));
     if (initialCycle) initialCycle.catch(error => logger.error('Server', 'Initial live cycle failed', { error: error.message }));
     lifecycle.startLiveScheduler(interval, ({ signal }) => fetchCycle({ signal }));
   } catch (error) {
+    if (isCancellation(error, bootstrapSignal) || lifecycle.isShuttingDown()) return;
     lifecycle.fatal(`startup: ${error.message}`);
   }
 });
