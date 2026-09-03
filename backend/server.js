@@ -29,6 +29,7 @@ const { createProductionReplayComposition } = require('./src/application/product
 const { createExecutionPipeline } = require('./src/core/executionPipeline');
 const { createSystemClock } = require('./src/core/clock');
 const { registerLiveSnapshotHandler } = require('./src/core/liveSnapshot');
+const { createLifecycleController } = require('./src/core/lifecycleController');
 
 const fetch = require('node-fetch');
 
@@ -47,6 +48,9 @@ if (!configValidation.valid) {
   process.exit(1);
 }
 logger.system('Config', 'Startup configuration validated successfully');
+
+const lifecycle = createLifecycleController({ logger });
+lifecycle.installSignalHandlers();
 
 const eventBus = new EventBus();
 const symbol = config.get('SYMBOL');
@@ -157,6 +161,7 @@ const app = createApp({
   },
   getLastDecision: executionPipeline.getLastDecision,
   getPipelineHealth: executionPipeline.getPipelineHealth,
+  lifecycle,
 });
 
 registerLiveSnapshotHandler({
@@ -167,20 +172,27 @@ registerLiveSnapshotHandler({
   executionPipeline,
 });
 
-let fetchInProgress = false;
+function ensureBootstrapActive(signal) {
+  if (signal?.aborted || lifecycle.isShuttingDown()) {
+    throw new Error('Bootstrap stopped by lifecycle shutdown');
+  }
+}
 
-async function seedHistoricalCandles() {
+async function seedHistoricalCandles({ signal } = {}) {
   const baseUrl = 'https://api.coingecko.com/api/v3';
   const coinId = 'bitcoin';
   const vsCurrency = 'usd';
   let seeded = 0;
 
   try {
+    ensureBootstrapActive(signal);
     logger.system('Server', 'Seeding historical candles from CoinGecko...');
 
     const ohlcRes = await fetch(`${baseUrl}/coins/${coinId}/ohlc?vs_currency=${vsCurrency}&days=30`);
+    ensureBootstrapActive(signal);
     if (ohlcRes.ok) {
       const ohlcData = await ohlcRes.json();
+      ensureBootstrapActive(signal);
       if (!Array.isArray(ohlcData)) {
         throw new TypeError('Historical OHLC response must be an array');
       }
@@ -202,10 +214,13 @@ async function seedHistoricalCandles() {
     }
 
     await new Promise(r => setTimeout(r, 1500));
+    ensureBootstrapActive(signal);
 
     const mcRes = await fetch(`${baseUrl}/coins/${coinId}/market_chart?vs_currency=${vsCurrency}&days=2`);
+    ensureBootstrapActive(signal);
     if (mcRes.ok) {
       const mcData = await mcRes.json();
+      ensureBootstrapActive(signal);
       const prices = mcData.prices || [];
       const volumes = mcData.total_volumes || [];
       for (let i = 0; i < prices.length; i++) {
@@ -235,15 +250,11 @@ async function seedHistoricalCandles() {
   }
 }
 
-async function fetchCycle() {
-  if (fetchInProgress) {
-    logger.warn('Server', 'Fetch cycle skipped — previous cycle still running');
-    return;
-  }
-
-  fetchInProgress = true;
+async function fetchCycle({ signal } = {}) {
+  if (signal?.aborted || lifecycle.isShuttingDown()) return;
   try {
     const result = await apiManager.fetchMarketData();
+    if (signal?.aborted || lifecycle.isShuttingDown()) return;
     if (!result || result.status !== 'FRESH' || !result.snapshot) {
       logger.warn('Server', 'Live cycle skipped — market data is not fresh', {
         status: result?.status || 'INVALID_ACQUISITION_RESULT',
@@ -258,19 +269,21 @@ async function fetchCycle() {
     const transition = candleEngine.ingest(snapshot);
     eventBus.emit('market:snapshot', snapshot, transition);
   } catch (err) {
+    if (signal?.aborted || lifecycle.isShuttingDown()) return;
     apiManager.fail();
     logger.error('Server', 'Market-data acquisition failed before live-cycle admission', {
       error: err.message,
     });
-  } finally {
-    fetchInProgress = false;
   }
 }
 
 const port = config.get('PORT');
 const interval = config.get('REFRESH_INTERVAL');
 
-app.listen(port, async () => {
+const server = app.listen(port, async () => {
+  const bootstrap = lifecycle.startBootstrap(({ signal }) => seedHistoricalCandles({ signal }));
+  lifecycle.markRunning();
+
   logger.system('Server', `Atlas v1.0 running on port ${port}`);
   logger.system('Server', `Config loaded`, {
     refreshInterval: interval,
@@ -279,8 +292,17 @@ app.listen(port, async () => {
     logLevel: config.get('LOG_LEVEL'),
   });
 
-  await seedHistoricalCandles();
+  try {
+    if (bootstrap) await bootstrap;
+    if (lifecycle.isShuttingDown() || lifecycle.getState() !== 'RUNNING') return;
 
-  fetchCycle();
-  setInterval(fetchCycle, interval);
+    const initialCycle = lifecycle.startLiveCycle(({ signal }) => fetchCycle({ signal }));
+    if (initialCycle) initialCycle.catch(error => logger.error('Server', 'Initial live cycle failed', { error: error.message }));
+    lifecycle.startLiveScheduler(interval, ({ signal }) => fetchCycle({ signal }));
+  } catch (error) {
+    lifecycle.fatal(`startup: ${error.message}`);
+  }
 });
+
+lifecycle.attachServer(server);
+server.on('error', error => lifecycle.fatal(`http-server: ${error.message}`));

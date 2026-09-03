@@ -121,7 +121,7 @@ function logKnownApplicationError(logger, error) {
   }
 }
 
-function createProductionReplayRouter({ application, logger } = {}) {
+function createProductionReplayRouter({ application, logger, lifecycle } = {}) {
   if (application !== null && application !== undefined
     && typeof application.run !== 'function') {
     throw new TypeError('application.run must be a function when application is provided');
@@ -144,7 +144,10 @@ function createProductionReplayRouter({ application, logger } = {}) {
     }
 
     try {
-      const result = await application.run(request);
+      const result = lifecycle
+        ? await lifecycle.startReplay(() => application.run(request))
+        : await application.run(request);
+      if (result === null) return res.status(503).json({ error: 'Server shutting down' });
       return res.json(result);
     } catch (error) {
       if (!(error instanceof ProductionReplayApplicationError)) return next(error);
