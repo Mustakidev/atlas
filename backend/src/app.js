@@ -37,7 +37,19 @@ function createErrorHandler(logger) {
   };
 }
 
-function createApp({ config, logger, routes, getLastDecision, getPipelineHealth }) {
+function classifyLifecycleRequest(req) {
+  if (req.path === '/healthz') return 'health';
+  if (req.path === '/api/status') return 'status';
+  if (req.path === '/api/signal/inspector') return 'inspector';
+  if (req.method === 'GET' && !req.path.startsWith('/api')) return 'static';
+  return 'unsafe';
+}
+
+function shuttingDownResponse(res) {
+  return res.status(503).json({ error: 'Server shutting down' });
+}
+
+function createApp({ config, logger, routes, getLastDecision, getPipelineHealth, lifecycle }) {
   const app = express();
   const sessionStore = new SingleOperatorSessionStore();
   const auth = createAuth(config, logger, { sessionStore });
@@ -47,6 +59,17 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth 
   const loginLimiter = createLoginLimiter(config, logger);
   const authRouter = createAuthRouter({ config, sessionStore, loginLimiter });
   const allowedOrigins = config.get('CORS_ORIGIN').split(',').map(s => s.trim());
+
+  if (lifecycle) {
+    app.use((req, res, next) => {
+      const admission = lifecycle.trackRequest(req, res, classifyLifecycleRequest(req));
+      if (!admission.allowed) {
+        admission.release();
+        return shuttingDownResponse(res);
+      }
+      next();
+    });
+  }
 
   app.use('/api/auth', (req, res, next) => {
     res.set('Cache-Control', 'no-store');
@@ -67,6 +90,13 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth 
   app.use(globalLimiter);
 
   app.get('/healthz', (req, res) => {
+    if (lifecycle && lifecycle.getState() !== 'RUNNING') {
+      const state = lifecycle.getState();
+      return res.status(503).json({
+        status: state.toLowerCase(),
+        lifecycle: state,
+      });
+    }
     res.status(200).json({ status: 'ok' });
   });
 
@@ -86,6 +116,7 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth 
   const canonicalRouter = createProductionReplayRouter({
     application: routes.productionReplayApplication,
     logger,
+    lifecycle,
   });
   app.use('/api/auth', authRouter);
   app.use('/api', auth, sessionOriginGuard, expensiveLimiter, canonicalRouter, router);

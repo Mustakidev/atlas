@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const express = require('express');
 
 const { createApp, createErrorHandler } = require('../../src/app');
+const { createLifecycleController } = require('../../src/core/lifecycleController');
 const { AdvanceRiskEngine } = require('../../src/engine/advanceRisk');
 const { cloneFixture, validMarketSnapshot } = require('../fixtures/market');
 
@@ -158,6 +159,7 @@ function createTestApp(state) {
     routes: deps,
     getLastDecision: () => null,
     getPipelineHealth: () => ({ pipelineCycleCount: 0, pipelineErrors: 0 }),
+    lifecycle: state.lifecycle,
   });
 }
 
@@ -219,6 +221,36 @@ test('real Express app serves the public health endpoint without authentication'
 
     assert.equal(result.statusCode, 200);
     assert.deepEqual(result.json(), { status: 'ok' });
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('lifecycle gate rejects new unsafe work after shutdown while exposing health state', async () => {
+  const exits = [];
+  const lifecycle = createLifecycleController({
+    logger: { info() {}, warn() {}, error() {}, system() {} },
+    forceExit: code => exits.push(code),
+  });
+  lifecycle.markRunning();
+  const server = await startApp({ lifecycle });
+
+  try {
+    await lifecycle.shutdown('test');
+
+    const close = await request(server, {
+      method: 'POST',
+      path: '/api/paper-trades/close',
+      headers: { 'x-api-key': API_KEY },
+      body: { tradeId: 'PT-1' },
+    });
+    assert.equal(close.statusCode, 503);
+    assert.deepEqual(close.json(), { error: 'Server shutting down' });
+
+    const health = await request(server, { path: '/healthz' });
+    assert.equal(health.statusCode, 503);
+    assert.deepEqual(health.json(), { status: 'stopped', lifecycle: 'STOPPED' });
+    assert.deepEqual(exits, []);
   } finally {
     await stopApp(server);
   }
