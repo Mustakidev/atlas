@@ -20,3 +20,6 @@ Thumbs.db
 
 # Verification reports (generated)
 verification-reports/*.json
+
+# Runtime durable state (generated)
+backend/runtime-data/
