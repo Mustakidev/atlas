@@ -481,6 +481,48 @@ class PaperTradingEngine {
     return this._copyAnalysis(this._lastAnalysis || null);
   }
 
+  exportDurableState() {
+    return {
+      tradeCounter: this._tradeCounter,
+      lastPrice: this._lastPrice,
+      balance: this._balance,
+      initialBalance: this._initialBalance,
+      peakEquity: this._peakEquity,
+      trades: this._copyTrades(this._trades),
+      closedTrades: this._copyTrades(this._closedTrades),
+    };
+  }
+
+  prepareDurableState(state) {
+    const trades = this._copyTrades(state.trades);
+    const closedTrades = this._copyTrades(state.closedTrades);
+    return {
+      tradeCounter: state.tradeCounter,
+      lastPrice: state.lastPrice,
+      balance: state.balance,
+      initialBalance: state.initialBalance,
+      peakEquity: state.peakEquity,
+      trades,
+      closedTrades,
+      closedIds: new Set(closedTrades.map(trade => trade.tradeId)),
+    };
+  }
+
+  applyDurableState(prepared) {
+    this._tradeCounter = prepared.tradeCounter;
+    this._lastPrice = prepared.lastPrice;
+    this._balance = prepared.balance;
+    this._initialBalance = prepared.initialBalance;
+    this._peakEquity = prepared.peakEquity;
+    this._trades = prepared.trades;
+    this._closedTrades = prepared.closedTrades;
+    this._closedIds = prepared.closedIds;
+  }
+
+  restoreDurableState(state) {
+    this.applyDurableState(this.prepareDurableState(state));
+  }
+
   // ---------------------------------------------------------------------------
   // Engine Analysis (determines trade direction + confidence)
   // ---------------------------------------------------------------------------

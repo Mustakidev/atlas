@@ -589,8 +589,37 @@ function createExecutionPipeline({
     console.log(divider);
   }
 
+  function exportDurableState() {
+    return {
+      lastSignalTime,
+      riskSyncFailure: Boolean(riskSyncFailure),
+    };
+  }
+
+  function prepareDurableState(state) {
+    return {
+      lastSignalTime: state.lastSignalTime,
+      riskSyncFailure: state.riskSyncFailure,
+    };
+  }
+
+  function applyDurableState(prepared) {
+    lastSignalTime = prepared.lastSignalTime;
+    riskSyncFailure = prepared.riskSyncFailure
+      ? { engine: 'restored', error: 'Durable risk synchronization failure' }
+      : null;
+  }
+
+  function restoreDurableState(state) {
+    applyDurableState(prepareDurableState(state));
+  }
+
   return {
     run,
+    exportDurableState,
+    prepareDurableState,
+    applyDurableState,
+    restoreDurableState,
     getLastDecision: () => lastDecision,
     getPipelineHealth: () => ({ pipelineCycleCount, pipelineErrors, lastPipelineError, lastSuccessfulCycle }),
     getLastRunStatus: () => lastRunStatus && {
