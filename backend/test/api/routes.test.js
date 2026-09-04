@@ -149,6 +149,42 @@ test('GET /api/status returns health and pipeline fields', async () => {
   assert.ok(Object.hasOwn(result.body, 'pipeline'));
 });
 
+test('live routes reject access before runtime readiness', async () => {
+  const result = await dispatch('/paper-trades', {}, {
+    liveRuntime: {
+      getEffectiveState: () => 'UNINITIALIZED',
+      getStatus: () => ({ effectiveState: 'UNINITIALIZED' }),
+    },
+  });
+
+  assert.equal(result.statusCode, 503);
+  assert.deepEqual(result.body, { error: 'Live state not ready' });
+});
+
+test('live-state initialization accepts an empty request and activates readiness', async () => {
+  let state = 'UNINITIALIZED';
+  const result = await dispatchRequest('POST', '/live-state/initialize', {}, {}, {
+    liveRuntime: {
+      getEffectiveState: () => state,
+      getMutationSequence: () => 0,
+    },
+    initializeLiveState: async () => { state = 'READY'; },
+  });
+
+  assert.equal(result.statusCode, 201);
+  assert.deepEqual(result.body, { status: 'READY', mutationSequence: 0 });
+});
+
+test('live-state initialization rejects caller-provided state fields', async () => {
+  const result = await dispatchRequest('POST', '/live-state/initialize', {}, { balance: 1 }, {
+    liveRuntime: { getEffectiveState: () => 'UNINITIALIZED' },
+    initializeLiveState: async () => {},
+  });
+
+  assert.equal(result.statusCode, 400);
+  assert.deepEqual(result.body, { error: 'Initialization request must not contain state fields' });
+});
+
 test('GET /api/signal/inspector returns the no-decision fallback', async () => {
   const result = await dispatch('/signal/inspector');
 

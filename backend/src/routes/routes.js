@@ -3,7 +3,7 @@ const { sanitizeQuery } = require('../middleware/validate');
 const { getFinalizedCandles } = require('../engine/candleUtils');
 
 function createRouter(deps) {
-  const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision, commitCoordinator } = deps;
+  const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision, commitCoordinator, liveRuntime, initializeLiveState, getCommitCoordinator } = deps;
   const router = express.Router();
 
   router.use(sanitizeQuery);
@@ -20,12 +20,64 @@ function createRouter(deps) {
     return next(error);
   }
 
+  function currentCoordinator() {
+    return typeof getCommitCoordinator === 'function'
+      ? getCommitCoordinator()
+      : commitCoordinator;
+  }
+
+  function runtimeStatus() {
+    return liveRuntime?.getStatus?.() || null;
+  }
+
+  function requireLiveReady(res) {
+    const status = runtimeStatus();
+    if (!status || status.effectiveState === 'READY') return true;
+    if (status.effectiveState === 'UNSAFE') return respondDurabilityUnavailable(res);
+    return res.status(503).json({ error: 'Live state not ready' });
+  }
+
   function committedRead(res, next, read, respond) {
-    if (!commitCoordinator) return respond(read());
-    return commitCoordinator.readCommitted(read)
+    const coordinator = currentCoordinator();
+    if (!coordinator) return respond(read());
+    return coordinator.readCommitted(read)
       .then(respond)
       .catch(error => handleCoordinatorError(error, res, next));
   }
+
+  router.post('/live-state/initialize', async (req, res) => {
+    if (!liveRuntime || typeof initializeLiveState !== 'function') {
+      return res.status(503).json({ error: 'Live state unavailable' });
+    }
+    if (req.body !== undefined && req.body !== null
+      && (typeof req.body !== 'object' || Array.isArray(req.body) || Object.keys(req.body).length > 0)) {
+      return res.status(400).json({ error: 'Initialization request must not contain state fields' });
+    }
+
+    const state = liveRuntime.getEffectiveState();
+    if (state === 'INITIALIZING') {
+      return res.status(409).json({ error: 'Initialization already in progress' });
+    }
+    if (state === 'READY') {
+      return res.status(409).json({ error: 'Live state already initialized' });
+    }
+    if (state === 'UNSAFE') return respondDurabilityUnavailable(res);
+    if (state === 'FAILED') return res.status(503).json({ error: 'Live state unavailable' });
+    if (state !== 'UNINITIALIZED') return res.status(503).json({ error: 'Live state not ready' });
+
+    try {
+      await initializeLiveState();
+      return res.status(201).json({
+        status: 'READY',
+        mutationSequence: liveRuntime.getMutationSequence(),
+      });
+    } catch (error) {
+      const finalState = liveRuntime.getEffectiveState();
+      if (finalState === 'UNSAFE') return respondDurabilityUnavailable(res);
+      if (finalState === 'FAILED') return res.status(503).json({ error: 'Live state unavailable' });
+      return res.status(503).json({ error: 'Live state initialization failed' });
+    }
+  });
 
   router.get('/market', (req, res) => {
     const snapshot = history.latest();
@@ -63,9 +115,10 @@ function createRouter(deps) {
     });
   });
 
-  router.get('/status', (req, res, next) => committedRead(res, next, () => {
+  const readStatus = () => {
     const health = apiManager.getHealth();
     const pipelineHealth = deps.getPipelineHealth ? deps.getPipelineHealth() : null;
+    const runtime = runtimeStatus();
     return {
       version: '1.0.0',
       uptime: process.uptime(),
@@ -73,8 +126,18 @@ function createRouter(deps) {
       cacheAge: deps.cache.getAge(),
       ...health,
       ...(pipelineHealth ? { pipeline: pipelineHealth } : {}),
+      ...(runtime ? {
+        liveStateReadiness: runtime.effectiveState,
+        durabilityHealthy: runtime.durabilityHealthy,
+        mutationSequence: runtime.mutationSequence,
+      } : {}),
     };
-  }, result => res.json(result)));
+  };
+
+  router.get('/status', (req, res, next) => {
+    if (liveRuntime && liveRuntime.getEffectiveState() !== 'READY') return res.json(readStatus());
+    return committedRead(res, next, readStatus, result => res.json(result));
+  });
 
   router.get('/config', (req, res) => {
     const cfg = config.getAll();
@@ -648,6 +711,8 @@ function createRouter(deps) {
   // ---------------------------------------------------------------------------
 
   router.get('/paper-trades', (req, res, next) => {
+    const ready = requireLiveReady(res);
+    if (ready !== true) return ready;
     if (!paperTradeEngine) {
       return res.status(503).json({ error: 'Paper trading engine not available' });
     }
@@ -665,6 +730,8 @@ function createRouter(deps) {
   });
 
   router.get('/paper-trades/open', (req, res, next) => {
+    const ready = requireLiveReady(res);
+    if (ready !== true) return ready;
     if (!paperTradeEngine) {
       return res.status(503).json({ error: 'Paper trading engine not available' });
     }
@@ -672,6 +739,8 @@ function createRouter(deps) {
   });
 
   router.get('/paper-trades/history', (req, res, next) => {
+    const ready = requireLiveReady(res);
+    if (ready !== true) return ready;
     if (!paperTradeEngine) {
       return res.status(503).json({ error: 'Paper trading engine not available' });
     }
@@ -680,6 +749,8 @@ function createRouter(deps) {
   });
 
   router.get('/paper-trades/stats', (req, res, next) => {
+    const ready = requireLiveReady(res);
+    if (ready !== true) return ready;
     if (!paperTradeEngine) {
       return res.status(503).json({ error: 'Paper trading engine not available' });
     }
@@ -687,6 +758,8 @@ function createRouter(deps) {
   });
 
   router.get('/paper-trades/performance', (req, res, next) => {
+    const ready = requireLiveReady(res);
+    if (ready !== true) return ready;
     if (!paperTradeEngine) {
       return res.status(503).json({ error: 'Paper trading engine not available' });
     }
@@ -694,6 +767,8 @@ function createRouter(deps) {
   });
 
   router.post('/paper-trades/close', (req, res, next) => {
+    const ready = requireLiveReady(res);
+    if (ready !== true) return ready;
     const { tradeId, reason } = req.body || {};
     if (!tradeId) {
       return res.status(400).json({ error: 'tradeId is required' });
@@ -706,6 +781,7 @@ function createRouter(deps) {
       return res.status(503).json({ error: 'Advance Risk engine not available' });
     }
 
+    const coordinator = currentCoordinator();
     const normalizedReason = reason || 'Manual';
     const closeMutation = () => {
       const closed = paperTradeEngine.close(tradeId, normalizedReason);
@@ -719,14 +795,14 @@ function createRouter(deps) {
         }
         advanceRiskEngine.markRiskStateUnhealthy();
         const error = new TypeError('Paper trade close returned an invalid closed trade');
-        if (!commitCoordinator) throw error;
+        if (!coordinator) throw error;
         return { closed, error };
       }
 
       try {
         advanceRiskEngine.onTradeClosed(closed.pnl, { nowMs });
       } catch (error) {
-        if (!commitCoordinator) throw error;
+        if (!coordinator) throw error;
         return { closed, error };
       }
       return { closed, error: null };
@@ -739,8 +815,8 @@ function createRouter(deps) {
       return res.json(outcome.closed);
     };
 
-    if (!commitCoordinator) return publish(closeMutation());
-    return commitCoordinator.runMutation({ name: 'manual-close', mutate: closeMutation })
+    if (!coordinator) return publish(closeMutation());
+    return coordinator.runMutation({ name: 'manual-close', mutate: closeMutation })
       .then(publish)
       .catch(error => handleCoordinatorError(error, res, next));
   });
@@ -750,6 +826,8 @@ function createRouter(deps) {
   // ---------------------------------------------------------------------------
 
   router.get('/advance-risk', (req, res, next) => {
+    const ready = requireLiveReady(res);
+    if (ready !== true) return ready;
     if (!advanceRiskEngine) {
       return res.status(503).json({ error: 'Advance Risk engine not available' });
     }
@@ -795,8 +873,9 @@ function createRouter(deps) {
       return res.json(result);
     };
 
-    if (!commitCoordinator) return publish(evaluate());
-    return commitCoordinator.runMutation({ name: 'advance-risk-evaluate', mutate: evaluate })
+    const coordinator = currentCoordinator();
+    if (!coordinator) return publish(evaluate());
+    return coordinator.runMutation({ name: 'advance-risk-evaluate', mutate: evaluate })
       .then(publish)
       .catch(error => handleCoordinatorError(error, res, next));
   });
@@ -806,12 +885,15 @@ function createRouter(deps) {
   // ---------------------------------------------------------------------------
 
   router.get('/advance-risk/state', (req, res, next) => {
+    const ready = requireLiveReady(res);
+    if (ready !== true) return ready;
     if (!advanceRiskEngine) {
       return res.status(503).json({ error: 'Advance Risk engine not available' });
     }
     const readState = () => ({ available: true, ...advanceRiskEngine.getState() });
-    if (!commitCoordinator) return res.json(readState());
-    return commitCoordinator.runMutation({ name: 'advance-risk-state', mutate: readState })
+    const coordinator = currentCoordinator();
+    if (!coordinator) return res.json(readState());
+    return coordinator.runMutation({ name: 'advance-risk-state', mutate: readState })
       .then(result => res.json(result))
       .catch(error => handleCoordinatorError(error, res, next));
   });
@@ -857,6 +939,8 @@ function createRouter(deps) {
   // ---------------------------------------------------------------------------
 
   router.get('/signal/inspector', (req, res, next) => {
+    const ready = requireLiveReady(res);
+    if (ready !== true) return ready;
     const read = () => {
       const decision = getLastDecision ? getLastDecision() : null;
       if (!decision) {
@@ -868,6 +952,8 @@ function createRouter(deps) {
   });
 
   router.get('/regime-decision/inspector', (req, res, next) => {
+    const ready = requireLiveReady(res);
+    if (ready !== true) return ready;
     const read = () => {
       const decision = getLastDecision ? getLastDecision() : null;
       if (!decision) {

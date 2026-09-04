@@ -41,6 +41,31 @@ function request(port, requestPath, headers = { 'x-api-key': API_KEY }) {
   });
 }
 
+function postJson(port, requestPath, body = {}, headers = { 'x-api-key': API_KEY }) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = http.request({
+      host: '127.0.0.1',
+      port,
+      path: requestPath,
+      method: 'POST',
+      headers: {
+        ...headers,
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(payload),
+      },
+    }, res => {
+      let responseBody = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => { responseBody += chunk; });
+      res.on('end', () => resolve({ statusCode: res.statusCode, body: JSON.parse(responseBody) }));
+    });
+    req.once('error', reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
 function readProbe(probePath) {
   return JSON.parse(fs.readFileSync(probePath, 'utf8'));
 }
@@ -75,6 +100,16 @@ async function waitForPipelineCycle(port, probePath, expectedCycle) {
   throw new Error(`Expected pipeline cycle ${expectedCycle}`);
 }
 
+async function waitForResponse(port, requestPath, expectedStatus) {
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    const response = await request(port, requestPath, {});
+    if (response.statusCode === expectedStatus) return response;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for ${requestPath} to return ${expectedStatus}`);
+}
+
 function stopServer(child) {
   if (child.exitCode !== null) return Promise.resolve();
 
@@ -93,6 +128,8 @@ function stopServer(child) {
 test('only FRESH acquisitions advance the complete live cycle', async () => {
   const port = await reservePort();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-freshness-'));
+  const statePath = path.join(BACKEND, 'runtime-data', 'live-execution-state.json');
+  fs.rmSync(statePath, { force: true });
   const preloadPath = path.join(tempDir, 'freshness-probe.js');
   const probePath = path.join(tempDir, 'freshness-probe.json');
   const preload = `
@@ -137,13 +174,13 @@ CandleEngine.prototype.ingest = function (...args) {
 
 const eventBusPath = require.resolve(${JSON.stringify(path.join(BACKEND, 'src/core/eventBus.js'))});
 const { EventBus } = require(eventBusPath);
-const originalEmit = EventBus.prototype.emit;
-EventBus.prototype.emit = function (event, ...args) {
+const originalEmitAsync = EventBus.prototype.emitAsync;
+EventBus.prototype.emitAsync = async function (event, ...args) {
   if (event === 'market:snapshot') {
     emittedSnapshots.push({ ...args[0] });
     count('marketSnapshotEmit');
   }
-  return originalEmit.apply(this, [event, ...args]);
+  return originalEmitAsync.apply(this, [event, ...args]);
 };
 
 const analyzerPath = require.resolve(${JSON.stringify(path.join(BACKEND, 'src/engine/analyzer.js'))});
@@ -243,6 +280,9 @@ saveProbe();
 
   try {
     await waitForStartup(child);
+    await waitForResponse(port, '/healthz', 200);
+    const initialize = await postJson(port, '/api/live-state/initialize');
+    assert.equal(initialize.statusCode, 201);
     const result = await waitForPipelineCycle(port, probePath, 2);
     assert.deepEqual(result.probe.statuses.slice(0, 6), [
       'FRESH',
@@ -274,5 +314,6 @@ saveProbe();
   } finally {
     await stopServer(child);
     fs.rmSync(tempDir, { recursive: true, force: true });
+    fs.rmSync(statePath, { force: true });
   }
 });

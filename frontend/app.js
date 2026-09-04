@@ -20,6 +20,7 @@ var authState = {
   pollingTimer: null,
   candleTimer: null,
 };
+var liveReadiness = 'STARTING';
 
 // Request deduplication: track in-flight fetches to prevent duplicates
 var inflight = {};
@@ -144,8 +145,29 @@ function emaClass(v) {
 function setConnected(ok) {
   var dot = $('statusDot');
   var txt = $('statusText');
-  dot.className = 'status-dot ' + (ok ? 'connected' : 'disconnected');
-  txt.textContent = ok ? 'Connected' : 'Disconnected';
+  var ready = liveReadiness === 'READY';
+  dot.className = 'status-dot ' + (ok && ready ? 'connected' : 'disconnected');
+  txt.textContent = ready ? (ok ? 'Connected' : 'Disconnected') : readinessLabel(liveReadiness);
+}
+
+function readinessLabel(state) {
+  if (state === 'UNINITIALIZED') return 'Live state not initialized';
+  if (state === 'FAILED' || state === 'UNSAFE') return 'Live state unavailable';
+  if (state === 'RESTORING') return 'Restoring live state';
+  return 'Starting live state';
+}
+
+async function fetchReadiness() {
+  try {
+    var response = await fetch(API + '/readyz', { credentials: 'same-origin' });
+    var data = await response.json();
+    liveReadiness = data && typeof data.liveState === 'string'
+      ? data.liveState
+      : response.status === 200 ? 'READY' : 'FAILED';
+  } catch (error) {
+    liveReadiness = 'FAILED';
+  }
+  setConnected(liveReadiness === 'READY');
 }
 
 // ---------------------------------------------------------------------------
@@ -674,6 +696,7 @@ function startPolling() {
   if (authState.polling) return;
   authState.authenticated = true;
   authState.polling = true;
+  fetchReadiness();
   fetchMarket();
   fetchAnalysis();
   fetchStructure();
@@ -688,6 +711,7 @@ function startPolling() {
   updatePipelineDirection();
 
   authState.pollingTimer = setInterval(function() {
+    fetchReadiness();
     fetchMarket();
     fetchAnalysis();
     fetchStructure();
@@ -790,6 +814,7 @@ function setupAuthUi() {
   var logoutButton = $('logoutBtn');
   if (form) form.addEventListener('submit', submitLogin);
   if (logoutButton) logoutButton.addEventListener('click', logout);
+  fetchReadiness();
   bootstrapAuth();
 }
 

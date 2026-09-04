@@ -44,6 +44,40 @@ function request(port, requestPath, headers = { 'x-api-key': API_KEY }) {
   });
 }
 
+function postJson(port, requestPath, body = {}, headers = { 'x-api-key': API_KEY }) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = http.request({
+      host: '127.0.0.1',
+      port,
+      path: requestPath,
+      method: 'POST',
+      headers: {
+        ...headers,
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(payload),
+      },
+    }, res => {
+      let responseBody = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => { responseBody += chunk; });
+      res.on('end', () => {
+        let json;
+        try {
+          json = JSON.parse(responseBody);
+        } catch (error) {
+          reject(new Error(`Expected JSON from ${requestPath}: ${error.message}; body=${responseBody}`));
+          return;
+        }
+        resolve({ statusCode: res.statusCode, headers: res.headers, body: json });
+      });
+    });
+    req.once('error', reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
 function readProbe(probePath) {
   return JSON.parse(fs.readFileSync(probePath, 'utf8'));
 }
@@ -91,6 +125,16 @@ async function waitForProbeCondition(port, probePath, condition) {
   throw new Error('Timed out waiting for probe condition');
 }
 
+async function waitForResponse(port, requestPath, expectedStatus) {
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    const response = await request(port, requestPath, {});
+    if (response.statusCode === expectedStatus) return response;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for ${requestPath} to return ${expectedStatus}`);
+}
+
 function waitForStartup(child) {
   return new Promise((resolve, reject) => {
     let output = '';
@@ -129,6 +173,8 @@ function stopServer(child) {
 test('production server wires config into route dependencies', async () => {
   const port = await reservePort();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-server-wiring-'));
+  const statePath = path.join(BACKEND, 'runtime-data', 'live-execution-state.json');
+  fs.rmSync(statePath, { force: true });
   const preloadPath = path.join(tempDir, 'mock-fetch.js');
   const probePath = path.join(tempDir, 'pipeline-probe.json');
   const executionPipelineEntry = path.join(BACKEND, 'src/core/executionPipeline.js');
@@ -169,8 +215,8 @@ function count(name) {
 
 const eventBusPath = require.resolve(${JSON.stringify(eventBusEntry)});
 const { EventBus } = require(eventBusPath);
-const originalEmit = EventBus.prototype.emit;
-EventBus.prototype.emit = function (event, ...args) {
+const originalEmitAsync = EventBus.prototype.emitAsync;
+EventBus.prototype.emitAsync = async function (event, ...args) {
   if (event === 'market:snapshot') {
     counters.marketSnapshotEmitCount++;
     lastMarketSnapshotEvent = { snapshot: args[0], transition: args[1] };
@@ -182,7 +228,7 @@ EventBus.prototype.emit = function (event, ...args) {
     });
     saveProbe();
   }
-  return originalEmit.apply(this, [event, ...args]);
+  return originalEmitAsync.apply(this, [event, ...args]);
 };
 
 const { MarketAnalyzer } = require(${JSON.stringify(analyzerEntry)});
@@ -354,9 +400,29 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
   try {
     await waitForStartup(child);
 
-    const healthResponse = await request(port, '/healthz', {});
-    assert.equal(healthResponse.statusCode, 200);
+    const healthResponse = await waitForResponse(port, '/healthz', 200);
     assert.deepEqual(healthResponse.body, { status: 'ok' });
+
+    const readinessBeforeInitialization = await request(port, '/readyz', {});
+    assert.equal(readinessBeforeInitialization.statusCode, 503);
+    assert.deepEqual(readinessBeforeInitialization.body, {
+      status: 'not_ready',
+      liveState: 'UNINITIALIZED',
+    });
+    assert.equal(fs.existsSync(statePath), false);
+
+    const initializeResponse = await postJson(port, '/api/live-state/initialize');
+    assert.equal(initializeResponse.statusCode, 201);
+    assert.deepEqual(initializeResponse.body, { status: 'READY', mutationSequence: 0 });
+    assert.equal(fs.existsSync(statePath), true);
+
+    const readinessAfterInitialization = await request(port, '/readyz', {});
+    assert.equal(readinessAfterInitialization.statusCode, 200);
+    assert.deepEqual(readinessAfterInitialization.body, {
+      status: 'ok',
+      liveState: 'READY',
+      durabilityHealthy: true,
+    });
 
     const configResponse = await request(port, '/api/config');
     assert.equal(configResponse.statusCode, 200);
@@ -490,6 +556,7 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
   } finally {
     await stopServer(child);
     fs.rmSync(tempDir, { recursive: true, force: true });
+    fs.rmSync(statePath, { force: true });
   }
 });
 
@@ -549,6 +616,7 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
 
   try {
     await waitForStartup(child);
+    await waitForProbeCondition(port, probePath, probe => probe.bootstrapFetches >= 1);
     await stopServer(child);
     const probe = readProbe(probePath);
     assert.equal(probe.bootstrapFetches, 1);

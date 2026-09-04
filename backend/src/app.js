@@ -39,6 +39,7 @@ function createErrorHandler(logger) {
 
 function classifyLifecycleRequest(req) {
   if (req.path === '/healthz') return 'health';
+  if (req.path === '/readyz') return 'health';
   if (req.path === '/api/status') return 'status';
   if (req.path === '/api/signal/inspector') return 'inspector';
   if (req.method === 'GET' && !req.path.startsWith('/api')) return 'static';
@@ -49,7 +50,7 @@ function shuttingDownResponse(res) {
   return res.status(503).json({ error: 'Server shutting down' });
 }
 
-function createApp({ config, logger, routes, getLastDecision, getPipelineHealth, lifecycle }) {
+function createApp({ config, logger, routes, getLastDecision, getPipelineHealth, lifecycle, liveRuntime }) {
   const app = express();
   const sessionStore = new SingleOperatorSessionStore();
   const auth = createAuth(config, logger, { sessionStore });
@@ -98,6 +99,21 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth,
       });
     }
     res.status(200).json({ status: 'ok' });
+  });
+
+  app.get('/readyz', (req, res) => {
+    const status = liveRuntime?.getStatus?.();
+    if (status?.effectiveState === 'READY') {
+      return res.status(200).json({
+        status: 'ok',
+        liveState: 'READY',
+        durabilityHealthy: true,
+      });
+    }
+    return res.status(503).json({
+      status: 'not_ready',
+      liveState: status?.effectiveState || 'STARTING',
+    });
   });
 
   // Serve the frontend without interpolating server credentials.
