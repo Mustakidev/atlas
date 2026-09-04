@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 const { createRouter } = require('../../src/routes/routes');
 const { AdvanceRiskEngine } = require('../../src/engine/advanceRisk');
+const { createLiveStateCommitCoordinator } = require('../../src/state/liveStateCommitCoordinator');
 const { cloneFixture, validMarketSnapshot } = require('../fixtures/market');
 
 const riskLogger = { info() {}, warn() {}, error() {}, system() {} };
@@ -438,4 +439,46 @@ test('optional coordinator maps manual-close persistence failure to 503', async 
 
   assert.equal(result.statusCode, 503);
   assert.deepEqual(result.body, { error: 'Live state durability unavailable' });
+});
+
+test('coordinator-backed manual close failure does not persist a partial cross-domain mutation', async () => {
+  const domain = { paperTrading: { closed: false }, advanceRisk: { synchronized: false } };
+  let sequence = 0;
+  let writes = 0;
+  const aggregate = {
+    captureDurableDomainState: () => structuredClone(domain),
+    captureSnapshotForSequence: nextSequence => ({
+      symbol: 'BTCUSDT',
+      savedAt: '2024-01-01T00:00:00.000Z',
+      mutationSequence: nextSequence,
+      configFingerprint: 'sha256:' + 'a'.repeat(64),
+      paperTrading: {},
+      advanceRisk: {},
+      executionPipeline: {},
+    }),
+    getMutationSequence: () => sequence,
+    setMutationSequence: nextSequence => { sequence = nextSequence; },
+  };
+  const coordinator = createLiveStateCommitCoordinator({
+    aggregate,
+    stateStore: { write: async () => { writes++; return { status: 'WRITTEN' }; } },
+  });
+
+  const result = await dispatchRequest('POST', '/paper-trades/close', {}, { tradeId: 'PT-1' }, {
+    commitCoordinator: coordinator,
+    liveRuntime: { getEffectiveState: () => 'READY' },
+    paperTradeEngine: {
+      close: () => {
+        domain.paperTrading.closed = true;
+        return { tradeId: 'PT-1', status: 'CLOSED', pnl: 25, exitTime: '2024-01-01T00:00:00.000Z' };
+      },
+    },
+    advanceRiskEngine: { onTradeClosed: () => { throw new Error('risk synchronization failed'); } },
+  });
+
+  assert.equal(result.statusCode, 503);
+  assert.deepEqual(result.body, { error: 'Live state durability unavailable' });
+  assert.equal(writes, 0);
+  assert.equal(sequence, 0);
+  assert.equal(coordinator.isDurabilityHealthy(), false);
 });

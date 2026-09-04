@@ -3,7 +3,7 @@ const test = require('node:test');
 
 const { registerLiveSnapshotHandler } = require('../../src/core/liveSnapshot');
 
-function harness({ commitCoordinator } = {}) {
+function harness({ commitCoordinator, pipelineStatus = null } = {}) {
   const calls = [];
   let handler;
   const history = {};
@@ -27,6 +27,9 @@ function harness({ commitCoordinator } = {}) {
   const executionPipeline = {
     run(...args) {
       calls.push(['pipeline', args]);
+    },
+    getLastRunStatus() {
+      return pipelineStatus;
     },
   };
 
@@ -140,4 +143,38 @@ test('optional coordinator wraps the complete synchronous snapshot operation', a
     'pipeline',
   ]);
   assert.equal(await result, 'committed');
+});
+
+test('coordinator-backed coupled pipeline failure escapes the snapshot callback', async () => {
+  const commitCoordinator = {
+    runMutation({ mutate }) {
+      return Promise.resolve().then(mutate);
+    },
+  };
+  const state = harness({
+    commitCoordinator,
+    pipelineStatus: {
+      status: 'FAILED',
+      failure: { code: 'RISK_STATE_SYNC_FAILURE', engine: 'AdvanceRisk', error: 'sync failed' },
+    },
+  });
+
+  await assert.rejects(state.handler(state.snapshot), error => (
+    error.code === 'RISK_STATE_SYNC_FAILURE'
+    && error.cause.message === 'sync failed'
+  ));
+});
+
+test('a completed fail-closed safety latch is not reclassified as an exception', async () => {
+  const commitCoordinator = {
+    runMutation({ mutate }) {
+      return Promise.resolve().then(mutate);
+    },
+  };
+  const state = harness({
+    commitCoordinator,
+    pipelineStatus: { status: 'FAILED', failure: { code: 'RISK_STATE_SYNC_FAILURE' } },
+  });
+
+  await state.handler(state.snapshot);
 });

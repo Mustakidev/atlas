@@ -173,7 +173,7 @@ function stopServer(child) {
 test('production server wires config into route dependencies', async () => {
   const port = await reservePort();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-server-wiring-'));
-  const statePath = path.join(BACKEND, 'runtime-data', 'live-execution-state.json');
+  const statePath = path.join(tempDir, 'live-execution-state.json');
   fs.rmSync(statePath, { force: true });
   const preloadPath = path.join(tempDir, 'mock-fetch.js');
   const probePath = path.join(tempDir, 'pipeline-probe.json');
@@ -386,6 +386,7 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
       ATLAS_OPERATOR_PASSWORD_HASH: OPERATOR_HASH,
       ATLAS_ORIGIN: `http://127.0.0.1:${port}`,
       ATLAS_COOKIE_SECURE: 'false',
+      ATLAS_LIVE_STATE_FILE_PATH: statePath,
       REFRESH_INTERVAL: '1500',
       MIN_API_INTERVAL: '1',
       API_THROTTLE_TTL: '1',

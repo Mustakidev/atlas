@@ -128,7 +128,7 @@ function stopServer(child) {
 test('only FRESH acquisitions advance the complete live cycle', async () => {
   const port = await reservePort();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-freshness-'));
-  const statePath = path.join(BACKEND, 'runtime-data', 'live-execution-state.json');
+  const statePath = path.join(tempDir, 'live-execution-state.json');
   fs.rmSync(statePath, { force: true });
   const preloadPath = path.join(tempDir, 'freshness-probe.js');
   const probePath = path.join(tempDir, 'freshness-probe.json');
@@ -267,6 +267,7 @@ saveProbe();
       ATLAS_OPERATOR_PASSWORD_HASH: OPERATOR_HASH,
       ATLAS_ORIGIN: `http://127.0.0.1:${port}`,
       ATLAS_COOKIE_SECURE: 'false',
+      ATLAS_LIVE_STATE_FILE_PATH: statePath,
       REFRESH_INTERVAL: '100',
       MIN_API_INTERVAL: '1',
       API_THROTTLE_TTL: '1',

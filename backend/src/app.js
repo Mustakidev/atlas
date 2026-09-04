@@ -103,7 +103,8 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth,
 
   app.get('/readyz', (req, res) => {
     const status = liveRuntime?.getStatus?.();
-    if (status?.effectiveState === 'READY') {
+    const lifecycleRunning = lifecycle?.getState?.() === 'RUNNING';
+    if (lifecycleRunning && status?.effectiveState === 'READY' && status.durabilityHealthy === true) {
       return res.status(200).json({
         status: 'ok',
         liveState: 'READY',
