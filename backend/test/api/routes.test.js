@@ -52,8 +52,8 @@ function responseHarness(resolve, reject) {
   };
 }
 
-function request(method, path, query = {}) {
-  return { method, url: path, originalUrl: path, path, query, body: {}, headers: {}, ip: '127.0.0.1' };
+function request(method, path, query = {}, body = {}) {
+  return { method, url: path, originalUrl: path, path, query, body, headers: {}, ip: '127.0.0.1' };
 }
 
 function baseDeps(overrides = {}) {
@@ -115,10 +115,14 @@ function baseDeps(overrides = {}) {
 }
 
 async function dispatch(path, query, overrides = {}) {
+  return dispatchRequest('GET', path, query, {}, overrides);
+}
+
+async function dispatchRequest(method, path, query = {}, body = {}, overrides = {}) {
   const router = createRouter(baseDeps(overrides));
   return new Promise((resolve, reject) => {
     const res = responseHarness(resolve, reject);
-    router.handle(request('GET', path, query), res, reject);
+    router.handle(request(method, path, query, body), res, reject);
   });
 }
 
@@ -297,4 +301,105 @@ test('GET /api/validation returns 503 when the engine is unavailable', async () 
 
   assert.equal(result.statusCode, 503);
   assert.equal(result.body.error, 'Validation engine not available');
+});
+
+test('optional coordinator delays committed paper reads until the write settles', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const commitCoordinator = {
+    readCommitted(read) {
+      return gate.then(read);
+    },
+  };
+
+  let settled = false;
+  const pending = dispatch('/paper-trades', {}, { commitCoordinator }).then(result => {
+    settled = true;
+    return result;
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  release();
+  assert.equal((await pending).statusCode, 200);
+});
+
+test('optional coordinator maps unsafe committed reads to durability unavailable', async () => {
+  const commitCoordinator = {
+    readCommitted() {
+      const error = new Error('unsafe');
+      error.code = 'LIVE_STATE_DURABILITY_UNAVAILABLE';
+      return Promise.reject(error);
+    },
+  };
+
+  const result = await dispatch('/paper-trades', {}, { commitCoordinator });
+  assert.equal(result.statusCode, 503);
+  assert.deepEqual(result.body, { error: 'Live state durability unavailable' });
+});
+
+test('optional coordinator wraps AdvanceRisk lazy-reset reads as mutations', async () => {
+  const calls = [];
+  const commitCoordinator = {
+    runMutation({ name, mutate }) {
+      calls.push(name);
+      return Promise.resolve(mutate());
+    },
+  };
+
+  const result = await dispatch('/advance-risk/state', {}, {
+    ...riskApiDependencies(),
+    commitCoordinator,
+  });
+  assert.equal(result.statusCode, 200);
+  assert.deepEqual(calls, ['advance-risk-state']);
+});
+
+test('optional coordinator makes manual close wait and includes risk synchronization', async () => {
+  const calls = [];
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const closed = { tradeId: 'PT-1', status: 'CLOSED', pnl: 25, exitTime: '2024-01-01T00:00:00.000Z' };
+  const commitCoordinator = {
+    runMutation({ name, mutate }) {
+      calls.push(name);
+      const result = mutate();
+      return gate.then(() => result);
+    },
+  };
+  const result = await new Promise((resolve, reject) => {
+    const router = createRouter(baseDeps({
+      commitCoordinator,
+      paperTradeEngine: { close: () => closed },
+      advanceRiskEngine: { onTradeClosed: (pnl, context) => calls.push(['risk', pnl, context]) },
+    }));
+    const res = responseHarness(resolve, reject);
+    router.handle(request('POST', '/paper-trades/close', {}, { tradeId: 'PT-1' }), res, reject);
+    setImmediate(() => {
+      assert.deepEqual(calls[0], 'manual-close');
+      assert.deepEqual(calls[1][0], 'risk');
+      release();
+    });
+  });
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.tradeId, 'PT-1');
+});
+
+test('optional coordinator maps manual-close persistence failure to 503', async () => {
+  const commitCoordinator = {
+    runMutation({ mutate }) {
+      mutate();
+      const error = new Error('write failed');
+      error.code = 'LIVE_STATE_DURABILITY_UNAVAILABLE';
+      return Promise.reject(error);
+    },
+  };
+  const result = await dispatchRequest('POST', '/paper-trades/close', {}, { tradeId: 'PT-1' }, {
+    commitCoordinator,
+    paperTradeEngine: { close: () => ({ tradeId: 'PT-1', status: 'CLOSED', pnl: 25, exitTime: '2024-01-01T00:00:00.000Z' }) },
+    advanceRiskEngine: { onTradeClosed() {} },
+  });
+
+  assert.equal(result.statusCode, 503);
+  assert.deepEqual(result.body, { error: 'Live state durability unavailable' });
 });

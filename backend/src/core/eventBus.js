@@ -23,6 +23,13 @@ class EventBus {
       }
     }
   }
+
+  async emitAsync(event, ...args) {
+    if (!this.listeners[event]) return;
+    for (const cb of this.listeners[event]) {
+      await cb(...args);
+    }
+  }
 }
 
 module.exports = { EventBus };

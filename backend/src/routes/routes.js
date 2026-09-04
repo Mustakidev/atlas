@@ -3,10 +3,29 @@ const { sanitizeQuery } = require('../middleware/validate');
 const { getFinalizedCandles } = require('../engine/candleUtils');
 
 function createRouter(deps) {
-  const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision } = deps;
+  const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision, commitCoordinator } = deps;
   const router = express.Router();
 
   router.use(sanitizeQuery);
+
+  const isDurabilityError = error => error?.code === 'LIVE_STATE_DURABILITY_UNAVAILABLE'
+    || error?.code === 'LIVE_STATE_MUTATION_UNCERTIFIED';
+
+  const respondDurabilityUnavailable = res => res.status(503).json({
+    error: 'Live state durability unavailable',
+  });
+
+  function handleCoordinatorError(error, res, next) {
+    if (isDurabilityError(error)) return respondDurabilityUnavailable(res);
+    return next(error);
+  }
+
+  function committedRead(res, next, read, respond) {
+    if (!commitCoordinator) return respond(read());
+    return commitCoordinator.readCommitted(read)
+      .then(respond)
+      .catch(error => handleCoordinatorError(error, res, next));
+  }
 
   router.get('/market', (req, res) => {
     const snapshot = history.latest();
@@ -36,25 +55,26 @@ function createRouter(deps) {
     res.json({ count: snapshots.length, history: snapshots });
   });
 
-  router.get('/logs', (req, res) => {
+  router.get('/logs', (req, res, next) => {
     const limit = parseInt(req.query.limit) || 50;
     const level = req.query.level || null;
-    const logs = logger.getLogs(limit, level);
-    res.json({ count: logs.length, logs });
+    return committedRead(res, next, () => logger.getLogs(limit, level), logs => {
+      res.json({ count: logs.length, logs });
+    });
   });
 
-  router.get('/status', (req, res) => {
+  router.get('/status', (req, res, next) => committedRead(res, next, () => {
     const health = apiManager.getHealth();
     const pipelineHealth = deps.getPipelineHealth ? deps.getPipelineHealth() : null;
-    res.json({
+    return {
       version: '1.0.0',
       uptime: process.uptime(),
       historySize: history.size(),
       cacheAge: deps.cache.getAge(),
       ...health,
       ...(pipelineHealth ? { pipeline: pipelineHealth } : {}),
-    });
-  });
+    };
+  }, result => res.json(result)));
 
   router.get('/config', (req, res) => {
     const cfg = config.getAll();
@@ -627,49 +647,53 @@ function createRouter(deps) {
   // Paper Trading — virtual trade management
   // ---------------------------------------------------------------------------
 
-  router.get('/paper-trades', (req, res) => {
+  router.get('/paper-trades', (req, res, next) => {
     if (!paperTradeEngine) {
       return res.status(503).json({ error: 'Paper trading engine not available' });
     }
-    const open = paperTradeEngine.open();
-    const closed = paperTradeEngine.history(50);
-    const stats = paperTradeEngine.stats();
-    const performance = paperTradeEngine.performance();
-    const balance = paperTradeEngine.getBalance();
-    logger.info('PaperTrades', `GET /paper-trades | open=${open.length} | closed=${closed.length} | balance=${balance}`);
-    res.json({ open, closed, stats, performance, balance });
+    return committedRead(res, next, () => {
+      const open = paperTradeEngine.open();
+      const closed = paperTradeEngine.history(50);
+      const stats = paperTradeEngine.stats();
+      const performance = paperTradeEngine.performance();
+      const balance = paperTradeEngine.getBalance();
+      return { open, closed, stats, performance, balance };
+    }, result => {
+      logger.info('PaperTrades', `GET /paper-trades | open=${result.open.length} | closed=${result.closed.length} | balance=${result.balance}`);
+      res.json(result);
+    });
   });
 
-  router.get('/paper-trades/open', (req, res) => {
+  router.get('/paper-trades/open', (req, res, next) => {
     if (!paperTradeEngine) {
       return res.status(503).json({ error: 'Paper trading engine not available' });
     }
-    res.json(paperTradeEngine.open());
+    return committedRead(res, next, () => paperTradeEngine.open(), result => res.json(result));
   });
 
-  router.get('/paper-trades/history', (req, res) => {
+  router.get('/paper-trades/history', (req, res, next) => {
     if (!paperTradeEngine) {
       return res.status(503).json({ error: 'Paper trading engine not available' });
     }
     const limit = parseInt(req.query.limit) || 100;
-    res.json(paperTradeEngine.history(limit));
+    return committedRead(res, next, () => paperTradeEngine.history(limit), result => res.json(result));
   });
 
-  router.get('/paper-trades/stats', (req, res) => {
+  router.get('/paper-trades/stats', (req, res, next) => {
     if (!paperTradeEngine) {
       return res.status(503).json({ error: 'Paper trading engine not available' });
     }
-    res.json(paperTradeEngine.stats());
+    return committedRead(res, next, () => paperTradeEngine.stats(), result => res.json(result));
   });
 
-  router.get('/paper-trades/performance', (req, res) => {
+  router.get('/paper-trades/performance', (req, res, next) => {
     if (!paperTradeEngine) {
       return res.status(503).json({ error: 'Paper trading engine not available' });
     }
-    res.json(paperTradeEngine.performance());
+    return committedRead(res, next, () => paperTradeEngine.performance(), result => res.json(result));
   });
 
-  router.post('/paper-trades/close', (req, res) => {
+  router.post('/paper-trades/close', (req, res, next) => {
     const { tradeId, reason } = req.body || {};
     if (!tradeId) {
       return res.status(400).json({ error: 'tradeId is required' });
@@ -683,31 +707,49 @@ function createRouter(deps) {
     }
 
     const normalizedReason = reason || 'Manual';
-    const closed = paperTradeEngine.close(tradeId, normalizedReason);
-    if (!closed) {
-      return res.status(404).json({ error: 'Trade not found or already closed' });
-    }
+    const closeMutation = () => {
+      const closed = paperTradeEngine.close(tradeId, normalizedReason);
+      if (!closed) return { closed: null, error: null };
 
-    const nowMs = typeof closed.exitTime === 'string' ? Date.parse(closed.exitTime) : NaN;
-    const validPnl = typeof closed.pnl === 'number' && Number.isFinite(closed.pnl);
-    if (closed.status !== 'CLOSED' || !validPnl || !Number.isFinite(nowMs)) {
-      if (typeof advanceRiskEngine.markRiskStateUnhealthy !== 'function') {
-        throw new TypeError('Paper trade close returned an invalid closed trade');
+      const nowMs = typeof closed.exitTime === 'string' ? Date.parse(closed.exitTime) : NaN;
+      const validPnl = typeof closed.pnl === 'number' && Number.isFinite(closed.pnl);
+      if (closed.status !== 'CLOSED' || !validPnl || !Number.isFinite(nowMs)) {
+        if (typeof advanceRiskEngine.markRiskStateUnhealthy !== 'function') {
+          throw new TypeError('Paper trade close returned an invalid closed trade');
+        }
+        advanceRiskEngine.markRiskStateUnhealthy();
+        const error = new TypeError('Paper trade close returned an invalid closed trade');
+        if (!commitCoordinator) throw error;
+        return { closed, error };
       }
-      advanceRiskEngine.markRiskStateUnhealthy();
-      throw new TypeError('Paper trade close returned an invalid closed trade');
-    }
 
-    advanceRiskEngine.onTradeClosed(closed.pnl, { nowMs });
-    logger.info('PaperTrades', `POST /paper-trades/close | ${tradeId} | reason=${normalizedReason} | pnl=${closed.pnl}`);
-    res.json(closed);
+      try {
+        advanceRiskEngine.onTradeClosed(closed.pnl, { nowMs });
+      } catch (error) {
+        if (!commitCoordinator) throw error;
+        return { closed, error };
+      }
+      return { closed, error: null };
+    };
+
+    const publish = outcome => {
+      if (!outcome.closed) return res.status(404).json({ error: 'Trade not found or already closed' });
+      if (outcome.error) throw outcome.error;
+      logger.info('PaperTrades', `POST /paper-trades/close | ${tradeId} | reason=${normalizedReason} | pnl=${outcome.closed.pnl}`);
+      return res.json(outcome.closed);
+    };
+
+    if (!commitCoordinator) return publish(closeMutation());
+    return commitCoordinator.runMutation({ name: 'manual-close', mutate: closeMutation })
+      .then(publish)
+      .catch(error => handleCoordinatorError(error, res, next));
   });
 
   // ---------------------------------------------------------------------------
   // Canonical Live Risk API — execution-plan sizing, ATR SL/TP, daily limits, session risk
   // ---------------------------------------------------------------------------
 
-  router.get('/advance-risk', (req, res) => {
+  router.get('/advance-risk', (req, res, next) => {
     if (!advanceRiskEngine) {
       return res.status(503).json({ error: 'Advance Risk engine not available' });
     }
@@ -743,25 +785,35 @@ function createRouter(deps) {
       }
     }
 
-    const result = advanceRiskEngine.evaluate({
+    const evaluate = () => advanceRiskEngine.evaluate({
       symbol, timeframe: tf, entryPrice,
       atr: atr || { ready: false, atr: null, atrPercentage: 0 },
       direction, trend, structure, confluence, regime,
     });
+    const publish = result => {
+      logger.info('AdvanceRisk', `GET /advance-risk | ${tf} | ${direction} @ ${entryPrice} | allowed=${result.tradeAllowed} | pos=${result.positionSize} | ${result.calculationTime}ms`);
+      return res.json(result);
+    };
 
-    logger.info('AdvanceRisk', `GET /advance-risk | ${tf} | ${direction} @ ${entryPrice} | allowed=${result.tradeAllowed} | pos=${result.positionSize} | ${result.calculationTime}ms`);
-    res.json(result);
+    if (!commitCoordinator) return publish(evaluate());
+    return commitCoordinator.runMutation({ name: 'advance-risk-evaluate', mutate: evaluate })
+      .then(publish)
+      .catch(error => handleCoordinatorError(error, res, next));
   });
 
   // ---------------------------------------------------------------------------
   // Canonical Live Risk State — daily limits, losses, and session state
   // ---------------------------------------------------------------------------
 
-  router.get('/advance-risk/state', (req, res) => {
+  router.get('/advance-risk/state', (req, res, next) => {
     if (!advanceRiskEngine) {
       return res.status(503).json({ error: 'Advance Risk engine not available' });
     }
-    res.json({ available: true, ...advanceRiskEngine.getState() });
+    const readState = () => ({ available: true, ...advanceRiskEngine.getState() });
+    if (!commitCoordinator) return res.json(readState());
+    return commitCoordinator.runMutation({ name: 'advance-risk-state', mutate: readState })
+      .then(result => res.json(result))
+      .catch(error => handleCoordinatorError(error, res, next));
   });
 
   // ---------------------------------------------------------------------------
@@ -804,12 +856,32 @@ function createRouter(deps) {
   // Signal Inspector — real-time decision breakdown for debugging
   // ---------------------------------------------------------------------------
 
-  router.get('/signal/inspector', (req, res) => {
-    const decision = getLastDecision ? getLastDecision() : null;
-    if (!decision) {
-      return res.json({ available: false, message: 'No decision data yet — waiting for first pipeline cycle' });
-    }
-    res.json({ available: true, ...decision });
+  router.get('/signal/inspector', (req, res, next) => {
+    const read = () => {
+      const decision = getLastDecision ? getLastDecision() : null;
+      if (!decision) {
+        return { available: false, message: 'No decision data yet — waiting for first pipeline cycle' };
+      }
+      return { available: true, ...decision };
+    };
+    return committedRead(res, next, read, result => res.json(result));
+  });
+
+  router.get('/regime-decision/inspector', (req, res, next) => {
+    const read = () => {
+      const decision = getLastDecision ? getLastDecision() : null;
+      if (!decision) {
+        return { available: false, message: 'No decision data yet' };
+      }
+      return {
+        available: true,
+        regime: decision.marketRegime || null,
+        regimeDecision: decision.regimeDecision || null,
+        confluence: decision.confluence || null,
+        verdict: decision.verdict || null,
+      };
+    };
+    return committedRead(res, next, read, result => res.json(result));
   });
 
   // ---------------------------------------------------------------------------
@@ -889,24 +961,6 @@ function createRouter(deps) {
       available: true,
       input: { regime, confidence, direction, confluenceScore },
       decision,
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // Regime Decision Inspector — real-time regime decision breakdown
-  // ---------------------------------------------------------------------------
-
-  router.get('/regime-decision/inspector', (req, res) => {
-    const decision = getLastDecision ? getLastDecision() : null;
-    if (!decision) {
-      return res.json({ available: false, message: 'No decision data yet' });
-    }
-    res.json({
-      available: true,
-      regime: decision.marketRegime || null,
-      regimeDecision: decision.regimeDecision || null,
-      confluence: decision.confluence || null,
-      verdict: decision.verdict || null,
     });
   });
 
