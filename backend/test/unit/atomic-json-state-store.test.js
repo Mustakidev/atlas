@@ -133,7 +133,7 @@ test('classifies parse, schema, and context failures', async () => {
     const store = createAtomicJsonStateStore({ filePath, fsAdapter: injectedFs(), now: () => NOW });
     await fs.promises.writeFile(filePath, '');
     await assert.rejects(store.read(context), error => error.code === 'STATE_PARSE_FAILED');
-    await fs.promises.writeFile(filePath, JSON.stringify({ ...state(), schemaVersion: 2 }));
+    await fs.promises.writeFile(filePath, JSON.stringify({ ...state(), schemaVersion: 3 }));
     await assert.rejects(store.read(context), error => error.code === 'STATE_SCHEMA_UNSUPPORTED');
     await fs.promises.writeFile(filePath, JSON.stringify({ ...state(), configFingerprint: 'sha256:' + '0'.repeat(64) }));
     await assert.rejects(store.read(context), error => error.code === 'STATE_CONTEXT_MISMATCH');
