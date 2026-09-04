@@ -4,8 +4,9 @@ function registerLiveSnapshotHandler({
   analyzer,
   signalHistoryEngine,
   executionPipeline,
+  commitCoordinator,
 }) {
-  const handler = (snapshot, transition) => {
+  const processSnapshot = (snapshot, transition) => {
     analyzer.analyze(history);
     signalHistoryEngine.record();
 
@@ -15,6 +16,14 @@ function registerLiveSnapshotHandler({
     } else {
       executionPipeline.run(snapshot);
     }
+  };
+
+  const handler = (snapshot, transition) => {
+    if (!commitCoordinator) return processSnapshot(snapshot, transition);
+    return commitCoordinator.runMutation({
+      name: 'live-snapshot',
+      mutate: () => processSnapshot(snapshot, transition),
+    });
   };
 
   eventBus.on('market:snapshot', handler);

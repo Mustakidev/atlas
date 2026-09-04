@@ -259,6 +259,35 @@ test('EventBus isolates listener failures and continues delivery', () => {
   assert.equal(errors[0][1], 'listener failure');
 });
 
+test('EventBus emitAsync preserves order and awaits listeners', async () => {
+  const bus = new EventBus();
+  const calls = [];
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+
+  bus.on('market', async () => {
+    calls.push('first-start');
+    await gate;
+    calls.push('first-end');
+  });
+  bus.on('market', () => { calls.push('second'); });
+
+  const pending = bus.emitAsync('market', { price: 123 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, ['first-start']);
+  release();
+  await pending;
+  assert.deepEqual(calls, ['first-start', 'first-end', 'second']);
+});
+
+test('EventBus emitAsync propagates listener failures', async () => {
+  const bus = new EventBus();
+  const error = new Error('async listener failure');
+  bus.on('market', async () => { throw error; });
+
+  await assert.rejects(bus.emitAsync('market'), cause => cause === error);
+});
+
 test('CandleEngine aggregates active candles and exposes timeframe boundaries', () => {
   const candles = new CandleEngine(config({ MAX_HISTORY: 2 }), logger(), 'BTCUSDT');
   const firstTime = BASE_TIME + 5 * 60 * 1000;

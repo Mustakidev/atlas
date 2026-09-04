@@ -67,20 +67,42 @@ function createLiveExecutionStateAggregate({
     return { expectedFingerprint: configFingerprint, expectedSymbol: symbol, nowMs };
   }
 
-  function captureSnapshot() {
+  function captureDurableDomainState() {
+    return {
+      paperTrading: paperTrading.exportDurableState(),
+      advanceRisk: advanceRisk.exportDurableState(),
+      executionPipeline: executionPipeline.exportDurableState(),
+    };
+  }
+
+  function captureSnapshotAt(sequence) {
     const savedAt = readNow(now);
     const snapshot = {
       schemaVersion: SCHEMA_VERSION,
       stateType: STATE_TYPE,
       symbol,
       savedAt: savedAt.toISOString(),
-      mutationSequence,
+      mutationSequence: sequence,
       configFingerprint,
-      paperTrading: paperTrading.exportDurableState(),
-      advanceRisk: advanceRisk.exportDurableState(),
-      executionPipeline: executionPipeline.exportDurableState(),
+      ...captureDurableDomainState(),
     };
     return validateLiveExecutionState(snapshot, expectedContext(savedAt.getTime()));
+  }
+
+  function captureSnapshot() {
+    return captureSnapshotAt(mutationSequence);
+  }
+
+  function captureSnapshotForSequence(nextSequence) {
+    assertMutationSequence(nextSequence);
+    if (nextSequence !== mutationSequence + 1) {
+      throw new LiveStateError(
+        'STATE_SEQUENCE_INVALID',
+        'Candidate mutationSequence must advance exactly once',
+        { phase: 'sequence' },
+      );
+    }
+    return captureSnapshotAt(nextSequence);
   }
 
   function restoreSnapshot(snapshot) {
@@ -99,6 +121,8 @@ function createLiveExecutionStateAggregate({
 
   return Object.freeze({
     captureSnapshot,
+    captureDurableDomainState,
+    captureSnapshotForSequence,
     restoreSnapshot,
     getMutationSequence,
     setMutationSequence,

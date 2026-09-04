@@ -3,7 +3,7 @@ const test = require('node:test');
 
 const { registerLiveSnapshotHandler } = require('../../src/core/liveSnapshot');
 
-function harness() {
+function harness({ commitCoordinator } = {}) {
   const calls = [];
   let handler;
   const history = {};
@@ -36,6 +36,7 @@ function harness() {
     analyzer,
     signalHistoryEngine,
     executionPipeline,
+    commitCoordinator,
   });
 
   return { calls, handler, registered, history, snapshot };
@@ -115,4 +116,28 @@ test('malformed or missing transitions are treated as no completed lifecycle can
     const pipelineArgs = state.calls.find(([name]) => name === 'pipeline')[1];
     assert.deepEqual(pipelineArgs, [state.snapshot]);
   }
+});
+
+test('optional coordinator wraps the complete synchronous snapshot operation', async () => {
+  let callback;
+  const commitCoordinator = {
+    runMutation({ name, mutate }) {
+      assert.equal(name, 'live-snapshot');
+      callback = mutate;
+      const result = mutate();
+      assert.equal(result, undefined);
+      return Promise.resolve('committed');
+    },
+  };
+  const state = harness({ commitCoordinator });
+
+  const result = state.handler(state.snapshot);
+  assert.equal(typeof result.then, 'function');
+  assert.equal(callback !== undefined, true);
+  assert.deepEqual(state.calls.slice(1).map(([name]) => name), [
+    'analyzer',
+    'signalHistory',
+    'pipeline',
+  ]);
+  assert.equal(await result, 'committed');
 });
