@@ -138,7 +138,7 @@ test('validates the exact V1 root and returns a deeply frozen defensive clone', 
 
 test('rejects wrong root, version, state type, symbol, fingerprint, and mutation sequence', () => {
   assertCode(() => validateLiveExecutionState({ ...state(), extra: true }, context()), 'STATE_VALIDATION_FAILED');
-  assertCode(() => validateLiveExecutionState({ ...state(), schemaVersion: 2 }, context()), 'STATE_SCHEMA_UNSUPPORTED');
+  assertCode(() => validateLiveExecutionState({ ...state(), schemaVersion: 3 }, context()), 'STATE_SCHEMA_UNSUPPORTED');
   assertCode(() => validateLiveExecutionState({ ...state(), stateType: 'other' }, context()), 'STATE_VALIDATION_FAILED');
   assertCode(() => validateLiveExecutionState({ ...state(), symbol: 'ETHUSDT' }, context()), 'STATE_CONTEXT_MISMATCH');
   assertCode(() => validateLiveExecutionState({ ...state(), configFingerprint: 'sha256:' + '0'.repeat(64) }, context()), 'STATE_CONTEXT_MISMATCH');

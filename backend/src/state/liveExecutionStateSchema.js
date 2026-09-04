@@ -1,6 +1,11 @@
 const crypto = require('node:crypto');
+const {
+  DEFAULT_MAX_TRADES,
+  RECENT_CLOSED_TRADES_LIMIT,
+} = require('../engine/paperTrading');
 
-const SCHEMA_VERSION = 1;
+const LEGACY_SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const STATE_TYPE = 'live-execution-state';
 const MAX_DATE_MS = 8640000000000000;
 const FUTURE_SKEW_MS = 5 * 60 * 1000;
@@ -15,6 +20,20 @@ const PAPER_FIELDS = [
   'tradeCounter', 'lastPrice', 'balance', 'initialBalance', 'peakEquity',
   'trades', 'closedTrades',
 ];
+const V2_PAPER_FIELDS = [...PAPER_FIELDS, 'lifetimeSummary'];
+const SUMMARY_FIELDS = [
+  'totalClosedTrades', 'winningTrades', 'losingTrades', 'breakevenTrades',
+  'grossProfit', 'lossPnlSum', 'totalPnl', 'totalPnlPercent', 'totalDuration',
+  'maxPnl', 'minPnl', 'bestTrade', 'worstTrade', 'drawdownPeakEquity',
+  'maxDrawdown', 'maxDrawdownPct', 'maxConsecutiveWins', 'maxConsecutiveLosses',
+  'winningStreakCount', 'losingStreakCount', 'currentStreak', 'currentStreakType',
+  'returnMean', 'returnM2', 'downsideReturnCount', 'downsideReturnSumSquares',
+  'byDirection', 'byTimeframe', 'byExitReason',
+];
+const SUMMARY_TRADE_FIELDS = ['tradeId', 'pnlPercent'];
+const DIRECTION_SUMMARY_FIELDS = ['total', 'wins', 'losses', 'totalPnl'];
+const TIMEFRAME_SUMMARY_FIELDS = ['total', 'wins', 'losses', 'totalPnl'];
+const EXIT_SUMMARY_FIELDS = ['count', 'totalPnl'];
 const TRADE_FIELDS = [
   'tradeId', 'symbol', 'timeframe', 'direction', 'entryPrice', 'entryTime',
   'stopLoss', 'takeProfit', 'riskReward', 'positionSize', 'currentPrice',
@@ -151,10 +170,169 @@ function cloneValue(value) {
   if (Array.isArray(value)) return value.map(cloneValue);
   if (isPlainObject(value)) {
     const clone = {};
-    for (const key of Object.keys(value)) clone[key] = cloneValue(value[key]);
+    for (const key of Object.keys(value)) {
+      Object.defineProperty(clone, key, {
+        value: cloneValue(value[key]),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
     return clone;
   }
   return value;
+}
+
+function validateSummaryTrade(trade, tradeCounter, label) {
+  if (trade === null) return;
+  assertExactObject(trade, SUMMARY_TRADE_FIELDS, label);
+  if (typeof trade.tradeId !== 'string') invalid(`${label}.tradeId`);
+  const idMatch = /^PT-([1-9]\d*)$/.exec(trade.tradeId);
+  if (!idMatch || !Number.isSafeInteger(Number(idMatch[1])) || Number(idMatch[1]) > tradeCounter) {
+    invalid(`${label}.tradeId`);
+  }
+  assertFiniteNumber(trade.pnlPercent, `${label}.pnlPercent`);
+}
+
+function validateCountSummary(value, label) {
+  assertSafeCounter(value, label);
+}
+
+function validateDirectionSummary(summary, totalClosedTrades, winningTrades, losingTrades, label) {
+  assertExactObject(summary, ['BUY', 'SELL'], label);
+  let total = 0;
+  let wins = 0;
+  let losses = 0;
+  for (const direction of ['BUY', 'SELL']) {
+    const entry = summary[direction];
+    assertExactObject(entry, DIRECTION_SUMMARY_FIELDS, `${label}.${direction}`);
+    validateCountSummary(entry.total, `${label}.${direction}.total`);
+    validateCountSummary(entry.wins, `${label}.${direction}.wins`);
+    validateCountSummary(entry.losses, `${label}.${direction}.losses`);
+    assertFiniteNumber(entry.totalPnl, `${label}.${direction}.totalPnl`);
+    if (entry.wins + entry.losses > entry.total) invalid(`${label}.${direction}.counts`);
+    total += entry.total;
+    wins += entry.wins;
+    losses += entry.losses;
+  }
+  if (total !== totalClosedTrades || wins !== winningTrades || losses !== losingTrades) {
+    invalid(`${label}.counts`);
+  }
+}
+
+function validateTimeframeSummary(summary, totalClosedTrades, winningTrades, losingTrades, label) {
+  if (!isPlainObject(summary)) invalid(label);
+  let total = 0;
+  let wins = 0;
+  let losses = 0;
+  for (const [key, entry] of Object.entries(summary)) {
+    if (key.length === 0) invalid(`${label}.${key}`);
+    assertExactObject(entry, TIMEFRAME_SUMMARY_FIELDS, `${label}.${key}`);
+    validateCountSummary(entry.total, `${label}.${key}.total`);
+    validateCountSummary(entry.wins, `${label}.${key}.wins`);
+    validateCountSummary(entry.losses, `${label}.${key}.losses`);
+    assertFiniteNumber(entry.totalPnl, `${label}.${key}.totalPnl`);
+    if (entry.wins + entry.losses > entry.total) invalid(`${label}.${key}.counts`);
+    total += entry.total;
+    wins += entry.wins;
+    losses += entry.losses;
+  }
+  if (total !== totalClosedTrades || wins !== winningTrades || losses !== losingTrades) {
+    invalid(`${label}.counts`);
+  }
+}
+
+function validateExitSummary(summary, totalClosedTrades, label) {
+  if (!isPlainObject(summary)) invalid(label);
+  let total = 0;
+  for (const [key, entry] of Object.entries(summary)) {
+    if (key.length === 0) invalid(`${label}.${key}`);
+    assertExactObject(entry, EXIT_SUMMARY_FIELDS, `${label}.${key}`);
+    validateCountSummary(entry.count, `${label}.${key}.count`);
+    assertFiniteNumber(entry.totalPnl, `${label}.${key}.totalPnl`);
+    total += entry.count;
+  }
+  if (total !== totalClosedTrades) invalid(`${label}.count`);
+}
+
+function validateLifetimeSummary(summary, initialBalance, tradeCounter, label = 'lifetimeSummary') {
+  assertExactObject(summary, SUMMARY_FIELDS, label);
+
+  for (const field of [
+    'totalClosedTrades', 'winningTrades', 'losingTrades', 'breakevenTrades',
+    'maxConsecutiveWins', 'maxConsecutiveLosses', 'winningStreakCount',
+    'losingStreakCount', 'currentStreak', 'downsideReturnCount',
+  ]) {
+    validateCountSummary(summary[field], `${label}.${field}`);
+  }
+  if (summary.winningTrades + summary.losingTrades + summary.breakevenTrades
+    !== summary.totalClosedTrades) invalid(`${label}.outcomeCounts`);
+
+  for (const field of [
+    'grossProfit', 'totalPnl', 'totalPnlPercent', 'totalDuration', 'maxPnl', 'minPnl',
+    'drawdownPeakEquity', 'maxDrawdown', 'maxDrawdownPct', 'returnMean', 'returnM2',
+    'downsideReturnSumSquares',
+  ]) {
+    assertFiniteNumber(summary[field], `${label}.${field}`);
+  }
+  if (summary.grossProfit < 0 || summary.lossPnlSum > 0 || summary.totalDuration < 0
+    || summary.drawdownPeakEquity < initialBalance || summary.maxDrawdown < 0
+    || summary.maxDrawdownPct < 0 || summary.returnM2 < 0
+    || summary.downsideReturnSumSquares < 0
+    || summary.downsideReturnCount > summary.totalClosedTrades) {
+    invalid(`${label}.numericBounds`);
+  }
+  assertFiniteNumber(summary.lossPnlSum, `${label}.lossPnlSum`);
+
+  validateSummaryTrade(summary.bestTrade, tradeCounter, `${label}.bestTrade`);
+  validateSummaryTrade(summary.worstTrade, tradeCounter, `${label}.worstTrade`);
+  if (summary.totalClosedTrades === 0) {
+    if (summary.bestTrade !== null || summary.worstTrade !== null
+      || summary.currentStreak !== 0 || summary.currentStreakType !== 'None'
+      || summary.returnMean !== 0 || summary.returnM2 !== 0) {
+      invalid(`${label}.emptyState`);
+    }
+    if (summary.maxPnl !== 0 || summary.minPnl !== 0) invalid(`${label}.emptyExtrema`);
+  } else if (summary.bestTrade === null || summary.worstTrade === null
+    || !['Win', 'Loss', 'Breakeven'].includes(summary.currentStreakType)
+    || summary.currentStreak === 0) {
+    invalid(`${label}.closedState`);
+  }
+  if (!['None', 'Win', 'Loss', 'Breakeven'].includes(summary.currentStreakType)) {
+    invalid(`${label}.currentStreakType`);
+  }
+  if (summary.currentStreak > summary.totalClosedTrades) invalid(`${label}.currentStreak`);
+  if (summary.currentStreakType === 'Win' && summary.currentStreak > summary.winningTrades) invalid(`${label}.currentWinStreak`);
+  if (summary.currentStreakType === 'Loss' && summary.currentStreak > summary.losingTrades) invalid(`${label}.currentLossStreak`);
+  if (summary.currentStreakType === 'Breakeven' && summary.currentStreak > summary.breakevenTrades) invalid(`${label}.currentBreakevenStreak`);
+  if (summary.maxConsecutiveWins > summary.winningTrades || summary.maxConsecutiveLosses > summary.losingTrades) {
+    invalid(`${label}.maximumStreaks`);
+  }
+  if (summary.winningStreakCount > summary.winningTrades || summary.losingStreakCount > summary.losingTrades) {
+    invalid(`${label}.streakCounts`);
+  }
+  if ((summary.winningTrades === 0 && summary.winningStreakCount !== 0)
+    || (summary.winningTrades > 0 && summary.winningStreakCount === 0)
+    || (summary.losingTrades === 0 && summary.losingStreakCount !== 0)
+    || (summary.losingTrades > 0 && summary.losingStreakCount === 0)) {
+    invalid(`${label}.streakPresence`);
+  }
+
+  validateDirectionSummary(
+    summary.byDirection,
+    summary.totalClosedTrades,
+    summary.winningTrades,
+    summary.losingTrades,
+    `${label}.byDirection`,
+  );
+  validateTimeframeSummary(
+    summary.byTimeframe,
+    summary.totalClosedTrades,
+    summary.winningTrades,
+    summary.losingTrades,
+    `${label}.byTimeframe`,
+  );
+  validateExitSummary(summary.byExitReason, summary.totalClosedTrades, `${label}.byExitReason`);
 }
 
 function deepFreeze(value) {
@@ -188,7 +366,7 @@ function validateLiveExecutionState(snapshot, expectedContext = {}) {
   }
 
   assertExactObject(snapshot, ROOT_FIELDS, 'root');
-  if (snapshot.schemaVersion !== SCHEMA_VERSION) {
+  if (snapshot.schemaVersion !== LEGACY_SCHEMA_VERSION && snapshot.schemaVersion !== SCHEMA_VERSION) {
     throw new LiveStateError(
       'STATE_SCHEMA_UNSUPPORTED',
       'Unsupported live execution state schema version',
@@ -218,7 +396,8 @@ function validateLiveExecutionState(snapshot, expectedContext = {}) {
     );
   }
 
-  assertExactObject(snapshot.paperTrading, PAPER_FIELDS, 'paperTrading');
+  const isV2 = snapshot.schemaVersion === SCHEMA_VERSION;
+  assertExactObject(snapshot.paperTrading, isV2 ? V2_PAPER_FIELDS : PAPER_FIELDS, 'paperTrading');
   assertSafeCounter(snapshot.paperTrading.tradeCounter, 'paperTrading.tradeCounter');
   if (snapshot.paperTrading.lastPrice !== null) assertFinitePositive(snapshot.paperTrading.lastPrice, 'paperTrading.lastPrice');
   assertFiniteNumber(snapshot.paperTrading.balance, 'paperTrading.balance');
@@ -230,6 +409,17 @@ function validateLiveExecutionState(snapshot, expectedContext = {}) {
   }
   if (!Array.isArray(snapshot.paperTrading.trades)) invalid('paperTrading.trades');
   if (!Array.isArray(snapshot.paperTrading.closedTrades)) invalid('paperTrading.closedTrades');
+  if (isV2) {
+    if (snapshot.paperTrading.trades.length > DEFAULT_MAX_TRADES) invalid('paperTrading.trades length');
+    if (snapshot.paperTrading.closedTrades.length > RECENT_CLOSED_TRADES_LIMIT) {
+      invalid('paperTrading.closedTrades length');
+    }
+    validateLifetimeSummary(
+      snapshot.paperTrading.lifetimeSummary,
+      snapshot.paperTrading.initialBalance,
+      snapshot.paperTrading.tradeCounter,
+    );
+  }
 
   const tradesById = new Map();
   snapshot.paperTrading.trades.forEach((trade, index) => {
@@ -420,6 +610,7 @@ function deserializeLiveExecutionState(bytes, expectedContext) {
 module.exports = {
   FINGERPRINT_PATTERN,
   FUTURE_SKEW_MS,
+  LEGACY_SCHEMA_VERSION,
   LiveStateError,
   MAX_DATE_MS,
   SCHEMA_VERSION,

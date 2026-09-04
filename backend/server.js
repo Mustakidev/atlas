@@ -35,6 +35,8 @@ const { createLiveExecutionStateAggregate } = require('./src/state/liveExecution
 const { createLiveStateCommitCoordinator } = require('./src/state/liveStateCommitCoordinator');
 const { createLiveRuntimeState } = require('./src/state/liveRuntimeState');
 const { createCanonicalLiveStateFingerprint } = require('./src/state/liveStateFingerprint');
+const { migrateV1ToV2 } = require('./src/state/liveStateMigration');
+const { validateLiveExecutionState } = require('./src/state/liveExecutionStateSchema');
 const {
   throwIfAborted,
   isCancellation,
@@ -405,8 +407,29 @@ async function recoverLiveState({ signal } = {}) {
     return;
   }
 
+  let certifiedState = result.state;
+  if (result.state.schemaVersion === 1) {
+    try {
+      const migrated = migrateV1ToV2(result.state);
+      validateLiveExecutionState(migrated, expectedContext(Date.parse(migrated.savedAt)));
+      const writeResult = await stateStore.write(
+        migrated,
+        expectedContext(Date.parse(migrated.savedAt)),
+      );
+      if (!writeResult || writeResult.status !== 'WRITTEN') {
+        throw new Error('V2 migration write was not certified');
+      }
+      certifiedState = migrated;
+    } catch (error) {
+      liveRuntime.markFailed();
+      logger.error('Server', 'Live state migration failed', { code: error.code || 'STATE_MIGRATION_FAILED' });
+      lifecycle.markRunning();
+      return;
+    }
+  }
+
   try {
-    aggregate.restoreSnapshot(result.state);
+    aggregate.restoreSnapshot(certifiedState);
   } catch (error) {
     liveRuntime.markFailed();
     logger.error('Server', 'Live state restore failed', { code: error.code || 'STATE_RESTORE_FAILED' });

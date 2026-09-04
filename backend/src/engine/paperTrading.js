@@ -22,12 +22,51 @@ const {
   resolveCycleNowMs,
 } = require('../core/clock');
 const ENGINE_VERSION = '2.0.0';
+const PERFORMANCE_METRICS_VERSION = 2;
 const DEFAULT_SYMBOL = 'BTCUSDT';
 const DEFAULT_MAX_TRADES = 500;
+const RECENT_CLOSED_TRADES_LIMIT = 500;
 const INITIAL_BALANCE = 10000;
 const RISK_PER_TRADE_PCT = 1;
 
 const isFiniteNumber = (value) => typeof value === 'number' && Number.isFinite(value);
+
+function createLifetimeSummary(initialBalance) {
+  return {
+    totalClosedTrades: 0,
+    winningTrades: 0,
+    losingTrades: 0,
+    breakevenTrades: 0,
+    grossProfit: 0,
+    lossPnlSum: 0,
+    totalPnl: 0,
+    totalPnlPercent: 0,
+    totalDuration: 0,
+    maxPnl: 0,
+    minPnl: 0,
+    bestTrade: null,
+    worstTrade: null,
+    drawdownPeakEquity: initialBalance,
+    maxDrawdown: 0,
+    maxDrawdownPct: 0,
+    maxConsecutiveWins: 0,
+    maxConsecutiveLosses: 0,
+    winningStreakCount: 0,
+    losingStreakCount: 0,
+    currentStreak: 0,
+    currentStreakType: 'None',
+    returnMean: 0,
+    returnM2: 0,
+    downsideReturnCount: 0,
+    downsideReturnSumSquares: 0,
+    byDirection: {
+      BUY: { total: 0, wins: 0, losses: 0, totalPnl: 0 },
+      SELL: { total: 0, wins: 0, losses: 0, totalPnl: 0 },
+    },
+    byTimeframe: Object.create(null),
+    byExitReason: Object.create(null),
+  };
+}
 
 const TRADE_STATES = {
   PENDING: 'PENDING',
@@ -62,6 +101,7 @@ class PaperTradingEngine {
     this._initialBalance = INITIAL_BALANCE;
     this._peakEquity = INITIAL_BALANCE;
     this._closedIds = new Set();
+    this._lifetimeSummary = createLifetimeSummary(this._initialBalance);
   }
 
   // ---------------------------------------------------------------------------
@@ -275,7 +315,9 @@ class PaperTradingEngine {
   }
 
   history(limit) {
-    if (limit && limit > 0) return this._copyTrades(this._closedTrades.slice(-limit));
+    if (limit && limit > 0) {
+      return this._copyTrades(this._closedTrades.slice(-Math.min(limit, RECENT_CLOSED_TRADES_LIMIT)));
+    }
     return this._copyTrades(this._closedTrades);
   }
 
@@ -294,98 +336,69 @@ class PaperTradingEngine {
   stats() {
     const allTrades = this._trades;
     const open = this._trades.filter(t => t.status === TRADE_STATES.OPEN || t.status === TRADE_STATES.ACTIVE);
-    const closed = this._closedTrades;
+    const summary = this._lifetimeSummary;
+    const closedCount = summary.totalClosedTrades;
 
-    if (closed.length === 0) {
+    if (closedCount === 0) {
       return this._emptyStats(allTrades, open);
     }
 
-    const wins = closed.filter(t => t.pnl > 0);
-    const losses = closed.filter(t => t.pnl < 0);
-    const breakeven = closed.filter(t => t.pnl === 0);
-    const totalPnl = closed.reduce((s, t) => s + t.pnl, 0);
-    const totalPnlPercent = closed.reduce((s, t) => s + t.pnlPercent, 0);
-    const totalDuration = closed.reduce((s, t) => s + (t.duration || 0), 0);
-    const totalRisk = closed.reduce((s, t) => s + Math.abs(t.pnl), 0);
-    const grossProfit = wins.reduce((s, t) => s + t.pnl, 0);
-    const grossLoss = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
+    const grossLoss = Math.abs(summary.lossPnlSum);
+    const avgWin = summary.winningTrades > 0 ? summary.grossProfit / summary.winningTrades : 0;
+    const avgLoss = summary.losingTrades > 0 ? grossLoss / summary.losingTrades : 0;
 
-    let bestTrade = closed[0];
-    let worstTrade = closed[0];
-    for (const t of closed) {
-      if (t.pnlPercent > bestTrade.pnlPercent) bestTrade = t;
-      if (t.pnlPercent < worstTrade.pnlPercent) worstTrade = t;
-    }
-
-    const avgWin = wins.length > 0 ? grossProfit / wins.length : 0;
-    const avgLoss = losses.length > 0 ? grossLoss / losses.length : 0;
-
-    const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? Infinity : 0;
-    const expectancy = closed.length > 0 ? totalPnl / closed.length : 0;
-    const winRate = (wins.length / closed.length) * 100;
+    const profitFactor = grossLoss > 0 ? summary.grossProfit / grossLoss : summary.grossProfit > 0 ? Infinity : 0;
+    const expectancy = summary.totalPnl / closedCount;
+    const winRate = (summary.winningTrades / closedCount) * 100;
     const rewardRisk = avgLoss > 0 ? avgWin / avgLoss : 0;
     const expectancyRatio = rewardRisk > 0 ? (winRate / 100) * rewardRisk - (1 - winRate / 100) : 0;
 
-    const { maxDrawdown, maxDrawdownPct } = this._computeDrawdown(closed);
-    const { maxConsecutiveWins, maxConsecutiveLosses, currentStreak, currentStreakType } = this._computeStreaks(closed);
-
-    const avgDuration = totalDuration / closed.length;
-
     const byDirection = {};
     for (const dir of ['BUY', 'SELL']) {
-      const dirTrades = closed.filter(t => t.direction === dir);
-      const dirWins = dirTrades.filter(t => t.pnl > 0);
+      const direction = summary.byDirection[dir];
       byDirection[dir] = {
-        total: dirTrades.length,
-        wins: dirWins.length,
-        losses: dirTrades.filter(t => t.pnl < 0).length,
-        winRate: dirTrades.length > 0 ? this._round((dirWins.length / dirTrades.length) * 100) : 0,
-        totalPnl: this._round(dirTrades.reduce((s, t) => s + t.pnl, 0)),
+        total: direction.total,
+        wins: direction.wins,
+        losses: direction.losses,
+        winRate: direction.total > 0 ? this._round((direction.wins / direction.total) * 100) : 0,
+        totalPnl: this._round(direction.totalPnl),
       };
     }
 
     const byTimeframe = {};
-    for (const t of closed) {
-      if (!byTimeframe[t.timeframe]) {
-        byTimeframe[t.timeframe] = { total: 0, wins: 0, losses: 0, totalPnl: 0 };
-      }
-      byTimeframe[t.timeframe].total++;
-      if (t.pnl > 0) byTimeframe[t.timeframe].wins++;
-      if (t.pnl < 0) byTimeframe[t.timeframe].losses++;
-      byTimeframe[t.timeframe].totalPnl += t.pnl;
+    for (const [tf, timeframe] of Object.entries(summary.byTimeframe)) {
+      byTimeframe[tf] = {
+        total: timeframe.total,
+        wins: timeframe.wins,
+        losses: timeframe.losses,
+        totalPnl: this._round(timeframe.totalPnl),
+      };
     }
 
     const byExitReason = {};
-    for (const t of closed) {
-      const r = t.exitReason || 'Unknown';
-      if (!byExitReason[r]) byExitReason[r] = { count: 0, totalPnl: 0 };
-      byExitReason[r].count++;
-      byExitReason[r].totalPnl += t.pnl;
-    }
-
-    for (const tf of Object.keys(byTimeframe)) {
-      byTimeframe[tf].totalPnl = this._round(byTimeframe[tf].totalPnl);
-    }
-    for (const r of Object.keys(byExitReason)) {
-      byExitReason[r].totalPnl = this._round(byExitReason[r].totalPnl);
+    for (const [reason, exit] of Object.entries(summary.byExitReason)) {
+      byExitReason[reason] = {
+        count: exit.count,
+        totalPnl: this._round(exit.totalPnl),
+      };
     }
 
     return {
       totalTrades: allTrades.length,
       openTrades: open.length,
-      closedTrades: closed.length,
+      closedTrades: closedCount,
       pendingTrades: this._trades.filter(t => t.status === TRADE_STATES.PENDING).length,
 
       winRate: this._round(winRate),
-      lossRate: this._round((losses.length / closed.length) * 100),
-      breakevenRate: this._round((breakeven.length / closed.length) * 100),
+      lossRate: this._round((summary.losingTrades / closedCount) * 100),
+      breakevenRate: this._round((summary.breakevenTrades / closedCount) * 100),
 
-      totalPnl: this._round(totalPnl),
-      totalPnlPercent: this._round(totalPnlPercent),
-      averagePnl: this._round(totalPnl / closed.length),
-      averagePnlPercent: this._round(totalPnlPercent / closed.length),
+      totalPnl: this._round(summary.totalPnl),
+      totalPnlPercent: this._round(summary.totalPnlPercent),
+      averagePnl: this._round(summary.totalPnl / closedCount),
+      averagePnlPercent: this._round(summary.totalPnlPercent / closedCount),
 
-      grossProfit: this._round(grossProfit),
+      grossProfit: this._round(summary.grossProfit),
       grossLoss: this._round(grossLoss),
       profitFactor: profitFactor === Infinity ? 'Infinity' : this._round(profitFactor),
       netReturnPct: this._round(((this._balance - this._initialBalance) / this._initialBalance) * 100),
@@ -396,20 +409,20 @@ class PaperTradingEngine {
       averageWin: this._round(avgWin),
       averageLoss: this._round(avgLoss),
 
-      averageDuration: Math.round(avgDuration),
+      averageDuration: Math.round(summary.totalDuration / closedCount),
 
-      maxWin: this._round(Math.max(...closed.map(t => t.pnl))),
-      maxLoss: this._round(Math.min(...closed.map(t => t.pnl))),
-      largestWin: bestTrade ? bestTrade.tradeId : null,
-      largestLoss: worstTrade ? worstTrade.tradeId : null,
+      maxWin: this._round(summary.maxPnl),
+      maxLoss: this._round(summary.minPnl),
+      largestWin: summary.bestTrade.tradeId,
+      largestLoss: summary.worstTrade.tradeId,
 
-      maxDrawdown: this._round(maxDrawdown),
-      maxDrawdownPct: this._round(maxDrawdownPct),
+      maxDrawdown: this._round(summary.maxDrawdown),
+      maxDrawdownPct: this._round(summary.maxDrawdownPct),
 
-      maxConsecutiveWins,
-      maxConsecutiveLosses,
-      currentStreak,
-      currentStreakType,
+      maxConsecutiveWins: summary.maxConsecutiveWins,
+      maxConsecutiveLosses: summary.maxConsecutiveLosses,
+      currentStreak: summary.currentStreak,
+      currentStreakType: summary.currentStreakType,
 
       balance: this._round(this._balance),
       initialBalance: this._initialBalance,
@@ -421,9 +434,11 @@ class PaperTradingEngine {
   }
 
   performance() {
-    const closed = this._closedTrades;
-    if (closed.length === 0) {
+    const summary = this._lifetimeSummary;
+    const closedCount = summary.totalClosedTrades;
+    if (closedCount === 0) {
       return {
+        metricsVersion: PERFORMANCE_METRICS_VERSION,
         profitFactor: 0, expectancy: 0, expectancyRatio: 0,
         maxDrawdown: 0, maxDrawdownPct: 0,
         largestWin: 0, largestLoss: 0,
@@ -435,17 +450,22 @@ class PaperTradingEngine {
     }
 
     const stats = this.stats();
-    const pnlSeries = closed.map(t => t.pnlPercent);
-    const avgReturn = pnlSeries.reduce((a, b) => a + b, 0) / pnlSeries.length;
-    const variance = pnlSeries.reduce((s, r) => s + Math.pow(r - avgReturn, 2), 0) / pnlSeries.length;
+    const avgReturn = summary.returnMean;
+    const sortinoAverageReturn = summary.totalPnlPercent / closedCount;
+    const variance = summary.returnM2 / closedCount;
     const stdDev = Math.sqrt(variance);
-    const downsideVariance = pnlSeries.filter(r => r < 0).reduce((s, r) => s + r * r, 0) / Math.max(pnlSeries.filter(r => r < 0).length, 1);
+    const downsideVariance = summary.downsideReturnSumSquares / Math.max(summary.downsideReturnCount, 1);
     const downsideDev = Math.sqrt(downsideVariance);
 
-    const avgConsecWins = this._computeAvgConsecutive(closed, true);
-    const avgConsecLosses = this._computeAvgConsecutive(closed, false);
+    const avgConsecWins = summary.winningStreakCount > 0
+      ? summary.winningTrades / summary.winningStreakCount
+      : 0;
+    const avgConsecLosses = summary.losingStreakCount > 0
+      ? summary.losingTrades / summary.losingStreakCount
+      : 0;
 
     return {
+      metricsVersion: PERFORMANCE_METRICS_VERSION,
       profitFactor: stats.profitFactor,
       expectancy: stats.expectancy,
       expectancyRatio: stats.expectancyRatio,
@@ -460,7 +480,7 @@ class PaperTradingEngine {
       totalPnl: stats.totalPnl,
       netReturnPct: stats.netReturnPct,
       sharpeRatio: stdDev > 0 ? this._round(avgReturn / stdDev) : 0,
-      sortinoRatio: downsideDev > 0 ? this._round(avgReturn / downsideDev) : 0,
+      sortinoRatio: downsideDev > 0 ? this._round(sortinoAverageReturn / downsideDev) : 0,
     };
   }
 
@@ -490,6 +510,7 @@ class PaperTradingEngine {
       peakEquity: this._peakEquity,
       trades: this._copyTrades(this._trades),
       closedTrades: this._copyTrades(this._closedTrades),
+      lifetimeSummary: this._copyLifetimeSummary(this._lifetimeSummary),
     };
   }
 
@@ -504,7 +525,10 @@ class PaperTradingEngine {
       peakEquity: state.peakEquity,
       trades,
       closedTrades,
-      closedIds: new Set(closedTrades.map(trade => trade.tradeId)),
+      lifetimeSummary: this._copyLifetimeSummary(state.lifetimeSummary),
+      closedIds: new Set(trades
+        .filter(trade => trade.status === TRADE_STATES.CLOSED)
+        .map(trade => trade.tradeId)),
     };
   }
 
@@ -516,6 +540,7 @@ class PaperTradingEngine {
     this._peakEquity = prepared.peakEquity;
     this._trades = prepared.trades;
     this._closedTrades = prepared.closedTrades;
+    this._lifetimeSummary = prepared.lifetimeSummary;
     this._closedIds = prepared.closedIds;
   }
 
@@ -687,6 +712,9 @@ class PaperTradingEngine {
         }
       }
       this._trades.splice(0, overflow);
+      for (const t of toRemove) {
+        if (t.status === TRADE_STATES.CLOSED) this._closedIds.delete(t.tradeId);
+      }
       overflowPrepared = true;
       return closed;
     };
@@ -732,10 +760,112 @@ class PaperTradingEngine {
     this._balance += trade.pnl;
     if (this._balance > this._peakEquity) this._peakEquity = this._balance;
 
-    this._closedIds.add(trade.tradeId);
+    this._updateLifetimeSummary(trade);
     this._closedTrades.push({ ...trade });
+    while (this._closedTrades.length > RECENT_CLOSED_TRADES_LIMIT) this._closedTrades.shift();
+
+    this._closedIds.add(trade.tradeId);
 
     return trade;
+  }
+
+  _updateLifetimeSummary(trade) {
+    const summary = this._lifetimeSummary;
+    const { pnl, pnlPercent } = trade;
+    const wasEmpty = summary.totalClosedTrades === 0;
+
+    const nPrevious = summary.totalClosedTrades;
+    const nNew = nPrevious + 1;
+    const delta = pnlPercent - summary.returnMean;
+    summary.returnMean = summary.returnMean + (delta / nNew);
+    const delta2 = pnlPercent - summary.returnMean;
+    summary.returnM2 = summary.returnM2 + (delta * delta2);
+    summary.totalClosedTrades = nNew;
+    summary.totalPnl += pnl;
+    summary.totalPnlPercent += pnlPercent;
+    summary.totalDuration += trade.duration || 0;
+    if (pnlPercent < 0) {
+      summary.downsideReturnCount++;
+      summary.downsideReturnSumSquares += Math.pow(pnlPercent, 2);
+    }
+
+    if (pnl > 0) {
+      summary.winningTrades++;
+      summary.grossProfit += pnl;
+    } else if (pnl < 0) {
+      summary.losingTrades++;
+      summary.lossPnlSum += pnl;
+    } else {
+      summary.breakevenTrades++;
+    }
+
+    if (wasEmpty || pnl > summary.maxPnl) summary.maxPnl = pnl;
+    if (wasEmpty || pnl < summary.minPnl) summary.minPnl = pnl;
+    if (!summary.bestTrade || pnlPercent > summary.bestTrade.pnlPercent) {
+      summary.bestTrade = { tradeId: trade.tradeId, pnlPercent };
+    }
+    if (!summary.worstTrade || pnlPercent < summary.worstTrade.pnlPercent) {
+      summary.worstTrade = { tradeId: trade.tradeId, pnlPercent };
+    }
+
+    if (this._balance > summary.drawdownPeakEquity) summary.drawdownPeakEquity = this._balance;
+    const drawdown = summary.drawdownPeakEquity - this._balance;
+    const drawdownPct = summary.drawdownPeakEquity > 0
+      ? (drawdown / summary.drawdownPeakEquity) * 100
+      : 0;
+    if (drawdown > summary.maxDrawdown) summary.maxDrawdown = drawdown;
+    if (drawdownPct > summary.maxDrawdownPct) summary.maxDrawdownPct = drawdownPct;
+
+    if (pnl > 0) {
+      if (summary.currentStreakType === 'Win') summary.currentStreak++;
+      else {
+        summary.currentStreak = 1;
+        summary.currentStreakType = 'Win';
+        summary.winningStreakCount++;
+      }
+      if (summary.currentStreak > summary.maxConsecutiveWins) {
+        summary.maxConsecutiveWins = summary.currentStreak;
+      }
+    } else if (pnl < 0) {
+      if (summary.currentStreakType === 'Loss') summary.currentStreak++;
+      else {
+        summary.currentStreak = 1;
+        summary.currentStreakType = 'Loss';
+        summary.losingStreakCount++;
+      }
+      if (summary.currentStreak > summary.maxConsecutiveLosses) {
+        summary.maxConsecutiveLosses = summary.currentStreak;
+      }
+    } else {
+      if (summary.currentStreakType === 'Breakeven') summary.currentStreak++;
+      else {
+        summary.currentStreak = 1;
+        summary.currentStreakType = 'Breakeven';
+      }
+    }
+
+    const direction = summary.byDirection[trade.direction];
+    if (direction) {
+      direction.total++;
+      if (pnl > 0) direction.wins++;
+      if (pnl < 0) direction.losses++;
+      direction.totalPnl += pnl;
+    }
+
+    const timeframe = summary.byTimeframe[trade.timeframe] || {
+      total: 0, wins: 0, losses: 0, totalPnl: 0,
+    };
+    timeframe.total++;
+    if (pnl > 0) timeframe.wins++;
+    if (pnl < 0) timeframe.losses++;
+    timeframe.totalPnl += pnl;
+    summary.byTimeframe[trade.timeframe] = timeframe;
+
+    const reason = trade.exitReason || 'Unknown';
+    const exit = summary.byExitReason[reason] || { count: 0, totalPnl: 0 };
+    exit.count++;
+    exit.totalPnl += pnl;
+    summary.byExitReason[reason] = exit;
   }
 
   // ---------------------------------------------------------------------------
@@ -884,6 +1014,24 @@ class PaperTradingEngine {
     return trades.map(trade => this._copyTrade(trade));
   }
 
+  _copyLifetimeSummary(summary) {
+    return {
+      ...summary,
+      bestTrade: summary.bestTrade ? { ...summary.bestTrade } : null,
+      worstTrade: summary.worstTrade ? { ...summary.worstTrade } : null,
+      byDirection: {
+        BUY: { ...summary.byDirection.BUY },
+        SELL: { ...summary.byDirection.SELL },
+      },
+      byTimeframe: Object.fromEntries(
+        Object.entries(summary.byTimeframe).map(([key, value]) => [key, { ...value }]),
+      ),
+      byExitReason: Object.fromEntries(
+        Object.entries(summary.byExitReason).map(([key, value]) => [key, { ...value }]),
+      ),
+    };
+  }
+
   _copyAnalysis(analysis) {
     if (analysis == null) return analysis;
     return {
@@ -894,4 +1042,15 @@ class PaperTradingEngine {
   }
 }
 
-module.exports = { PaperTradingEngine, ENGINE_VERSION, DEFAULT_SYMBOL, DEFAULT_MAX_TRADES, INITIAL_BALANCE, RISK_PER_TRADE_PCT, TRADE_STATES, EXIT_REASONS };
+module.exports = {
+  PaperTradingEngine,
+  ENGINE_VERSION,
+  DEFAULT_SYMBOL,
+  DEFAULT_MAX_TRADES,
+  RECENT_CLOSED_TRADES_LIMIT,
+  PERFORMANCE_METRICS_VERSION,
+  INITIAL_BALANCE,
+  RISK_PER_TRADE_PCT,
+  TRADE_STATES,
+  EXIT_REASONS,
+};
