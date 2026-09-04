@@ -146,7 +146,11 @@ const configFingerprint = createCanonicalLiveStateFingerprint({
   executionPipeline,
   mtfConfirmation: mtfConfirmationEngine,
 });
-const stateStore = createAtomicJsonStateStore({ now: () => clock.nowMs() });
+const configuredStatePath = process.env.ATLAS_LIVE_STATE_FILE_PATH;
+const stateStore = createAtomicJsonStateStore({
+  ...(configuredStatePath === undefined ? {} : { filePath: configuredStatePath }),
+  now: () => clock.nowMs(),
+});
 const aggregate = createLiveExecutionStateAggregate({
   symbol,
   configFingerprint,

@@ -795,15 +795,13 @@ function createRouter(deps) {
         }
         advanceRiskEngine.markRiskStateUnhealthy();
         const error = new TypeError('Paper trade close returned an invalid closed trade');
-        if (!coordinator) throw error;
-        return { closed, error };
+        throw error;
       }
 
       try {
         advanceRiskEngine.onTradeClosed(closed.pnl, { nowMs });
       } catch (error) {
-        if (!coordinator) throw error;
-        return { closed, error };
+        throw error;
       }
       return { closed, error: null };
     };

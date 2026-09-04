@@ -160,6 +160,7 @@ function createTestApp(state) {
     getLastDecision: () => null,
     getPipelineHealth: () => ({ pipelineCycleCount: 0, pipelineErrors: 0 }),
     lifecycle: state.lifecycle,
+    liveRuntime: state.liveRuntime,
   });
 }
 
@@ -251,6 +252,27 @@ test('lifecycle gate rejects new unsafe work after shutdown while exposing healt
     assert.equal(health.statusCode, 503);
     assert.deepEqual(health.json(), { status: 'stopped', lifecycle: 'STOPPED' });
     assert.deepEqual(exits, []);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('/readyz becomes unavailable when lifecycle shutdown begins', async () => {
+  const lifecycle = createLifecycleController({
+    logger: { info() {}, warn() {}, error() {}, system() {} },
+  });
+  lifecycle.markRunning();
+  const liveRuntime = {
+    getStatus: () => ({ effectiveState: 'READY', durabilityHealthy: true }),
+  };
+  const server = await startApp({ lifecycle, liveRuntime });
+
+  try {
+    assert.equal((await request(server, { path: '/readyz' })).statusCode, 200);
+    await lifecycle.shutdown('test');
+    const ready = await request(server, { path: '/readyz' });
+    assert.equal(ready.statusCode, 503);
+    assert.deepEqual(ready.json(), { status: 'not_ready', liveState: 'READY' });
   } finally {
     await stopApp(server);
   }
