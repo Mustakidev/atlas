@@ -11,6 +11,8 @@ const EXECUTABLE_REGIMES = new Set([
   REGIMES.LOW_VOLATILITY,
 ]);
 
+const SIGNAL_COOLDOWN_MS = 60000;
+
 function regimeOutputFailure(result) {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return 'REGIME_INVALID';
   if (result.regime === REGIMES.UNKNOWN || result.regime == null) return 'REGIME_UNKNOWN';
@@ -515,8 +517,8 @@ function createExecutionPipeline({
     }
 
     const now = cycle.nowMs;
-    if (now - lastSignalTime < 60000) {
-      const waitSec = Math.ceil((60000 - (now - lastSignalTime)) / 1000);
+    if (now - lastSignalTime < SIGNAL_COOLDOWN_MS) {
+      const waitSec = Math.ceil((SIGNAL_COOLDOWN_MS - (now - lastSignalTime)) / 1000);
       decision.verdict.rejectionReason = `Cooldown active — ${waitSec}s remaining (min 60s between trades)`;
       lastDecision = decision;
       console.log(`  Execution Triggered: NO`);
@@ -610,6 +612,10 @@ function createExecutionPipeline({
       : null;
   }
 
+  function getPolicy() {
+    return { signalCooldownMs: SIGNAL_COOLDOWN_MS };
+  }
+
   function restoreDurableState(state) {
     applyDurableState(prepareDurableState(state));
   }
@@ -619,6 +625,7 @@ function createExecutionPipeline({
     exportDurableState,
     prepareDurableState,
     applyDurableState,
+    getPolicy,
     restoreDurableState,
     getLastDecision: () => lastDecision,
     getPipelineHealth: () => ({ pipelineCycleCount, pipelineErrors, lastPipelineError, lastSuccessfulCycle }),
@@ -629,4 +636,4 @@ function createExecutionPipeline({
   };
 }
 
-module.exports = { createExecutionPipeline };
+module.exports = { SIGNAL_COOLDOWN_MS, createExecutionPipeline };

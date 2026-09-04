@@ -30,6 +30,11 @@ const { createExecutionPipeline } = require('./src/core/executionPipeline');
 const { createSystemClock } = require('./src/core/clock');
 const { registerLiveSnapshotHandler } = require('./src/core/liveSnapshot');
 const { createLifecycleController } = require('./src/core/lifecycleController');
+const { createAtomicJsonStateStore } = require('./src/state/atomicJsonStateStore');
+const { createLiveExecutionStateAggregate } = require('./src/state/liveExecutionStateAggregate');
+const { createLiveStateCommitCoordinator } = require('./src/state/liveStateCommitCoordinator');
+const { createLiveRuntimeState } = require('./src/state/liveRuntimeState');
+const { createCanonicalLiveStateFingerprint } = require('./src/state/liveStateFingerprint');
 const {
   throwIfAborted,
   isCancellation,
@@ -133,6 +138,27 @@ const executionPipeline = createExecutionPipeline({
   clock,
 });
 
+const configFingerprint = createCanonicalLiveStateFingerprint({
+  config,
+  symbol,
+  paperTrading: paperTradeEngine,
+  advanceRisk: advanceRiskEngine,
+  executionPipeline,
+  mtfConfirmation: mtfConfirmationEngine,
+});
+const stateStore = createAtomicJsonStateStore({ now: () => clock.nowMs() });
+const aggregate = createLiveExecutionStateAggregate({
+  symbol,
+  configFingerprint,
+  paperTrading: paperTradeEngine,
+  advanceRisk: advanceRiskEngine,
+  executionPipeline,
+  now: () => new Date(clock.nowMs()),
+});
+const liveRuntime = createLiveRuntimeState({
+  sequenceProvider: aggregate.getMutationSequence,
+});
+
 const app = createApp({
   config,
   logger,
@@ -163,18 +189,14 @@ const app = createApp({
     mtfConfirmationEngine,
     productionReplayApplication,
     symbol,
+    liveRuntime,
+    initializeLiveState,
+    getCommitCoordinator: liveRuntime.getCommitCoordinator,
   },
   getLastDecision: executionPipeline.getLastDecision,
   getPipelineHealth: executionPipeline.getPipelineHealth,
   lifecycle,
-});
-
-registerLiveSnapshotHandler({
-  eventBus,
-  history,
-  analyzer,
-  signalHistoryEngine,
-  executionPipeline,
+  liveRuntime,
 });
 
 function ensureBootstrapActive(signal) {
@@ -263,10 +285,20 @@ async function seedHistoricalCandles({ signal } = {}) {
   }
 }
 
+function isDurabilityError(error) {
+  return error?.code === 'LIVE_STATE_DURABILITY_UNAVAILABLE'
+    || error?.code === 'LIVE_STATE_MUTATION_UNCERTIFIED';
+}
+
+function expectedContext(nowMs = clock.nowMs()) {
+  return { expectedFingerprint: configFingerprint, expectedSymbol: symbol, nowMs };
+}
+
 async function fetchCycle({ signal } = {}) {
-  if (signal?.aborted || lifecycle.isShuttingDown()) return;
+  if (signal?.aborted || lifecycle.isShuttingDown() || !liveRuntime.isReady()) return;
+  let result;
   try {
-    const result = await apiManager.fetchMarketData({ signal });
+    result = await apiManager.fetchMarketData({ signal });
     if (signal?.aborted || lifecycle.isShuttingDown()) return;
     if (!result || result.status !== 'FRESH' || !result.snapshot) {
       logger.warn('Server', 'Live cycle skipped — market data is not fresh', {
@@ -280,9 +312,13 @@ async function fetchCycle({ signal } = {}) {
     const snapshot = result.snapshot;
     history.add(snapshot);
     const transition = candleEngine.ingest(snapshot);
-    eventBus.emit('market:snapshot', snapshot, transition);
+    await eventBus.emitAsync('market:snapshot', snapshot, transition);
   } catch (err) {
     if (isCancellation(err, signal) || lifecycle.isShuttingDown()) return;
+    if (isDurabilityError(err)) {
+      logger.error('Server', 'Live state durability failure', { code: err.code });
+      throw err;
+    }
     apiManager.fail();
     logger.error('Server', 'Market-data acquisition failed before live-cycle admission', {
       error: err.message,
@@ -290,17 +326,161 @@ async function fetchCycle({ signal } = {}) {
   }
 }
 
+let liveHandler = null;
+let liveActivationPromise = null;
+let initialCycleStarted = false;
+let schedulerStarted = false;
+
+async function activateLivePath() {
+  if (liveActivationPromise) return liveActivationPromise;
+
+  liveActivationPromise = (async () => {
+    const coordinator = createLiveStateCommitCoordinator({ aggregate, stateStore });
+    await liveRuntime.activateCoordinator(coordinator, async () => {
+      if (liveHandler) throw new Error('Live snapshot handler is already registered');
+      liveHandler = registerLiveSnapshotHandler({
+        eventBus,
+        history,
+        analyzer,
+        signalHistoryEngine,
+        executionPipeline,
+        commitCoordinator: coordinator,
+      });
+    });
+
+    if (!initialCycleStarted) {
+      const initialCycle = lifecycle.startLiveCycle(({ signal }) => fetchCycle({ signal }));
+      if (!initialCycle) throw new Error('Initial live cycle could not start');
+      initialCycleStarted = true;
+      initialCycle.catch(error => logger.error('Server', 'Initial live cycle failed', { error: error.message }));
+    }
+
+    if (!schedulerStarted) {
+      const started = lifecycle.startLiveScheduler(interval, ({ signal }) => fetchCycle({ signal }));
+      if (!started) throw new Error('Live scheduler could not start');
+      schedulerStarted = true;
+    }
+
+    return liveRuntime.getStatus();
+  })().catch(error => {
+    liveRuntime.markFailed();
+    throw error;
+  });
+
+  return liveActivationPromise;
+}
+
+async function recoverLiveState({ signal } = {}) {
+  liveRuntime.beginRestore();
+
+  let result;
+  try {
+    result = await stateStore.read(expectedContext());
+  } catch (error) {
+    if (isCancellation(error, signal) || lifecycle.isShuttingDown()) return;
+    liveRuntime.markFailed();
+    logger.error('Server', 'Live state startup failed', { code: error.code || 'STATE_RECOVERY_FAILED' });
+    lifecycle.markRunning();
+    return;
+  }
+
+  if (signal?.aborted || lifecycle.isShuttingDown()) return;
+
+  if (result.status === 'NOT_FOUND') {
+    await seedHistoricalCandles({ signal });
+    if (signal?.aborted || lifecycle.isShuttingDown()) return;
+    liveRuntime.markUninitialized();
+    lifecycle.markRunning();
+    return;
+  }
+
+  if (result.status !== 'VALID') {
+    liveRuntime.markFailed();
+    logger.error('Server', 'Live state startup failed', { code: 'STATE_RECOVERY_FAILED' });
+    lifecycle.markRunning();
+    return;
+  }
+
+  try {
+    aggregate.restoreSnapshot(result.state);
+  } catch (error) {
+    liveRuntime.markFailed();
+    logger.error('Server', 'Live state restore failed', { code: error.code || 'STATE_RESTORE_FAILED' });
+    lifecycle.markRunning();
+    return;
+  }
+
+  await seedHistoricalCandles({ signal });
+  if (signal?.aborted || lifecycle.isShuttingDown()) return;
+  lifecycle.markRunning();
+
+  try {
+    await activateLivePath();
+  } catch (error) {
+    logger.error('Server', 'Live state activation failed', { code: error.code || 'LIVE_STATE_ACTIVATION_FAILED' });
+  }
+}
+
+function isRetryableInitializationFailure(error) {
+  return error?.code !== 'STATE_RENAME_FAILED'
+    && error?.durability !== 'uncertified'
+    && error?.code !== 'STATE_RECOVERY_FAILED';
+}
+
+async function proveUninitialized() {
+  const result = await stateStore.read(expectedContext());
+  return result.status === 'NOT_FOUND';
+}
+
+async function initializeLiveState() {
+  liveRuntime.beginInitialization();
+  const operation = (async () => {
+    let writeAttempted = false;
+    try {
+      const current = await stateStore.read(expectedContext());
+      if (current.status !== 'NOT_FOUND') {
+        liveRuntime.markFailed();
+        throw new Error('Live state already exists or is uncertain');
+      }
+
+      const snapshot = aggregate.captureSnapshot();
+      writeAttempted = true;
+      const result = await stateStore.write(snapshot, expectedContext(Date.parse(snapshot.savedAt)));
+      if (!result || result.status !== 'WRITTEN') {
+        liveRuntime.markFailed();
+        throw new Error('Live state write was not certified');
+      }
+
+      await activateLivePath();
+    } catch (error) {
+      if (liveRuntime.getState() === 'FAILED' || liveRuntime.getState() === 'READY') throw error;
+      if (writeAttempted && !isRetryableInitializationFailure(error)) {
+        liveRuntime.markFailed();
+        throw error;
+      }
+      let cleanNotFound;
+      try {
+        cleanNotFound = await proveUninitialized();
+      } catch (recheckError) {
+        liveRuntime.markFailed();
+        throw recheckError;
+      }
+      if (cleanNotFound) {
+        liveRuntime.markUninitialized();
+        throw error;
+      }
+      liveRuntime.markFailed();
+      throw error;
+    }
+  })();
+
+  return liveRuntime.finishInitialization(operation);
+}
+
 const port = config.get('PORT');
 const interval = config.get('REFRESH_INTERVAL');
 
 const server = app.listen(port, async () => {
-  let bootstrapSignal;
-  const bootstrap = lifecycle.startBootstrap(({ signal }) => {
-    bootstrapSignal = signal;
-    return seedHistoricalCandles({ signal });
-  });
-  lifecycle.markRunning();
-
   logger.system('Server', `Atlas v1.0 running on port ${port}`);
   logger.system('Server', `Config loaded`, {
     refreshInterval: interval,
@@ -309,17 +489,14 @@ const server = app.listen(port, async () => {
     logLevel: config.get('LOG_LEVEL'),
   });
 
-  try {
-    if (bootstrap) await bootstrap;
-    if (bootstrapSignal?.aborted || lifecycle.isShuttingDown() || lifecycle.getState() !== 'RUNNING') return;
-
-    const initialCycle = lifecycle.startLiveCycle(({ signal }) => fetchCycle({ signal }));
-    if (initialCycle) initialCycle.catch(error => logger.error('Server', 'Initial live cycle failed', { error: error.message }));
-    lifecycle.startLiveScheduler(interval, ({ signal }) => fetchCycle({ signal }));
-  } catch (error) {
-    if (isCancellation(error, bootstrapSignal) || lifecycle.isShuttingDown()) return;
-    lifecycle.fatal(`startup: ${error.message}`);
-  }
+  const bootstrap = lifecycle.startBootstrap(({ signal }) => recoverLiveState({ signal }));
+  if (!bootstrap) return;
+  bootstrap.catch(error => {
+    if (isCancellation(error) || lifecycle.isShuttingDown()) return;
+    liveRuntime.markFailed();
+    logger.error('Server', 'Live state startup failed', { code: error.code || 'STATE_STARTUP_FAILED' });
+    lifecycle.markRunning();
+  });
 });
 
 lifecycle.attachServer(server);

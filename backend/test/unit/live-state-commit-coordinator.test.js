@@ -354,12 +354,13 @@ test('commits real overflow closure, risk sync, and replacement as one write', a
   assert.equal(first.status, 'OPEN');
 });
 
-test('PH-4D remains inactive in the current server composition', () => {
+test('PH-4E is active in the current server composition', () => {
   const serverPath = path.join(__dirname, '../../server.js');
   const source = fs.readFileSync(serverPath, 'utf8');
 
-  assert.doesNotMatch(source, /createAtomicJsonStateStore/);
-  assert.doesNotMatch(source, /createLiveExecutionStateAggregate/);
-  assert.doesNotMatch(source, /createLiveStateCommitCoordinator/);
-  assert.doesNotMatch(source, /emitAsync\(/);
+  assert.match(source, /createAtomicJsonStateStore/);
+  assert.match(source, /createLiveExecutionStateAggregate/);
+  assert.match(source, /createLiveStateCommitCoordinator/);
+  assert.match(source, /recoverLiveState/);
+  assert.match(source, /emitAsync\(/);
 });
