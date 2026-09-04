@@ -311,6 +311,40 @@ class AdvanceRiskEngine {
   }
   getAccountBalance() { return this._accountBalance; }
 
+  exportDurableState() {
+    return {
+      accountBalance: this._accountBalance,
+      dailyPnL: this._dailyPnL,
+      dailyHighWater: this._dailyHighWater,
+      consecutiveLosses: this._consecutiveLosses,
+      lossPauseUntil: this._lossPauseUntil,
+      dailyLossLimitReached: this._dailyLossLimitReached,
+      tradingEnabled: this._tradingEnabled,
+      lastResetDay: this._lastResetDay,
+      riskStateHealthy: this._riskStateHealthy,
+    };
+  }
+
+  prepareDurableState(state) {
+    return { ...state };
+  }
+
+  applyDurableState(prepared) {
+    this._accountBalance = prepared.accountBalance;
+    this._dailyPnL = prepared.dailyPnL;
+    this._dailyHighWater = prepared.dailyHighWater;
+    this._consecutiveLosses = prepared.consecutiveLosses;
+    this._lossPauseUntil = prepared.lossPauseUntil;
+    this._dailyLossLimitReached = prepared.dailyLossLimitReached;
+    this._tradingEnabled = prepared.tradingEnabled;
+    this._lastResetDay = prepared.lastResetDay;
+    this._riskStateHealthy = prepared.riskStateHealthy;
+  }
+
+  restoreDurableState(state) {
+    this.applyDurableState(this.prepareDurableState(state));
+  }
+
   getState() {
     const nowMs = readNowMs(this.clock);
     this._resetDailyIfNeeded(nowMs);
