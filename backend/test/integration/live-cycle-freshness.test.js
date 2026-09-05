@@ -268,7 +268,7 @@ saveProbe();
       ATLAS_ORIGIN: `http://127.0.0.1:${port}`,
       ATLAS_COOKIE_SECURE: 'false',
       ATLAS_LIVE_STATE_FILE_PATH: statePath,
-      REFRESH_INTERVAL: '100',
+       REFRESH_INTERVAL: '500',
       MIN_API_INTERVAL: '1',
       API_THROTTLE_TTL: '1',
       RATE_LIMIT_MAX_REQUESTS: '500',

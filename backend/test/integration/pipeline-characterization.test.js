@@ -32,7 +32,7 @@ function createHarness(overrides = {}) {
   const state = { signals: [], executionPlans: [], evaluations: 0, closedPnLs: [], candleClosures: 0 };
   const active = overrides.activeCandle ? { ...candles[candles.length - 1], openTime: candles[candles.length - 1].openTime + 3600000 } : null;
   const deps = {
-    config: config(),
+    config: overrides.config || config(),
     logger: logger(errors),
     symbol: 'BTCUSDT',
     clock: { now: () => FIXED_NOW, isoNow: () => FIXED_ISO, localeTime: () => '12:00:00 AM' },
@@ -79,6 +79,21 @@ function createHarness(overrides = {}) {
   const pipeline = createExecutionPipeline({ ...deps, ...overrides, logger: deps.logger, clock: deps.clock });
   return { pipeline, state, errors, candles };
 }
+
+test('preserves a valid zero bearish threshold in the execution decision', () => {
+  const harness = createHarness({
+    config: {
+      get(key) {
+        if (key === 'CONFLUENCE_BULLISH_THRESHOLD') return 65;
+        if (key === 'CONFLUENCE_BEARISH_THRESHOLD') return 0;
+        return undefined;
+      },
+    },
+  });
+
+  const decision = run(harness);
+  assert.deepEqual(decision.thresholds, { bullish: 65, bearish: 0 });
+});
 
 function run(harness, price = 100) {
   const originalLog = console.log;

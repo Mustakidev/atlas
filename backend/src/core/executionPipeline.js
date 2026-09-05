@@ -197,8 +197,8 @@ function createExecutionPipeline({
     console.log(`\n${divider}`);
     console.log(`[Pipeline] Cycle #${pipelineCycleCount} | ${cycle.localeTime} | Price: $${price || 'N/A'}`);
 
-    const riskThreshold = config.get('CONFLUENCE_BULLISH_THRESHOLD') || 65;
-    const bearThreshold = config.get('CONFLUENCE_BEARISH_THRESHOLD') || 35;
+    const riskThreshold = config.get('CONFLUENCE_BULLISH_THRESHOLD') ?? 65;
+    const bearThreshold = config.get('CONFLUENCE_BEARISH_THRESHOLD') ?? 35;
 
     const decision = {
       timestamp: cycle.isoNow,
