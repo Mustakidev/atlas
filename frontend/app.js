@@ -115,6 +115,22 @@ function setClass(el, cls) {
   el.className = 'kv-val ' + cls;
 }
 
+function appendTextCell(parent, value, cls) {
+  var cell = document.createElement('span');
+  if (cls) cell.className = cls;
+  cell.textContent = value;
+  parent.appendChild(cell);
+  return cell;
+}
+
+function renderEmptyState(container, className, text) {
+  container.replaceChildren();
+  var empty = document.createElement('div');
+  empty.className = className;
+  empty.textContent = text;
+  container.appendChild(empty);
+}
+
 function trendClass(v) {
   if (!v) return '';
   v = String(v).toLowerCase();
@@ -586,10 +602,10 @@ async function fetchPaperTrades() {
     var allTrades = openTrades.concat(closedTrades.slice(-20).reverse());
     var list = $('paperTrades');
     if (allTrades.length === 0) {
-      list.innerHTML = '<div class="paper-empty">No trades yet</div>';
+      renderEmptyState(list, 'paper-empty', 'No trades yet');
       return;
     }
-    var html = '';
+    list.replaceChildren();
     for (var i = 0; i < allTrades.length; i++) {
       var t = allTrades[i];
       var dirCls = t.direction === 'BUY' ? 'dir-buy' : 'dir-sell';
@@ -598,17 +614,17 @@ async function fetchPaperTrades() {
       var pnlText = t.pnl != null ? (t.pnl >= 0 ? '+$' : '-$') + Math.abs(t.pnl).toFixed(2) : '--';
       var pnlCls = t.pnl == null ? '' : t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
       var reason = t.exitReason || t.status || '';
-      html += '<div class="paper-row">' +
-        '<span>' + fmtShortTime(t.entryTime || t.timestamp) + '</span>' +
-        '<span class="' + dirCls + '">' + t.direction + '</span>' +
-        '<span>' + fmtUSD(t.entryPrice) + '</span>' +
-        '<span>' + fmtUSD(t.stopLoss) + '</span>' +
-        '<span>' + fmtUSD(t.takeProfit) + '</span>' +
-        '<span class="' + stCls + '">' + (t.status || '--') + '</span>' +
-        '<span class="' + pnlCls + '">' + pnlText + '</span>' +
-        '</div>';
+      var row = document.createElement('div');
+      row.className = 'paper-row';
+      appendTextCell(row, fmtShortTime(t.entryTime || t.timestamp));
+      appendTextCell(row, t.direction, dirCls);
+      appendTextCell(row, fmtUSD(t.entryPrice));
+      appendTextCell(row, fmtUSD(t.stopLoss));
+      appendTextCell(row, fmtUSD(t.takeProfit));
+      appendTextCell(row, t.status || '--', stCls);
+      appendTextCell(row, pnlText, pnlCls);
+      list.appendChild(row);
     }
-    list.innerHTML = html;
 
     // Update performance panel
     $('perfWinRate').textContent = stats.winRate != null ? stats.winRate + '%' : '0%';
@@ -626,26 +642,26 @@ async function fetchPaperTrades() {
     // Render closed trades in performance history
     var histList = $('perfSignals');
     if (closedTrades.length === 0) {
-      histList.innerHTML = '<div class="perf-empty">No trade history</div>';
+      renderEmptyState(histList, 'perf-empty', 'No trade history');
       return;
     }
-    var histHtml = '';
+    histList.replaceChildren();
     var shown = closedTrades.slice(-20).reverse();
     for (var j = 0; j < shown.length; j++) {
       var ct = shown[j];
       var biasCls = ct.direction === 'BUY' ? 'dir-buy' : 'dir-sell';
       var outCls = ct.pnl > 0 ? 'outcome-correct' : ct.pnl < 0 ? 'outcome-incorrect' : 'outcome-neutral';
       var outcomeText = ct.pnl > 0 ? 'WIN' : ct.pnl < 0 ? 'LOSS' : 'BREAKEVEN';
-      histHtml += '<div class="perf-row">' +
-        '<span>' + fmtShortTime(ct.entryTime) + '</span>' +
-        '<span class="' + biasCls + '">' + ct.direction + '</span>' +
-        '<span>' + (ct.confidence || '--') + '</span>' +
-        '<span>' + fmtUSD(ct.entryPrice) + '</span>' +
-        '<span>' + fmtUSD(ct.exitPrice) + '</span>' +
-        '<span class="' + outCls + '">' + outcomeText + '</span>' +
-        '</div>';
+      var historyRow = document.createElement('div');
+      historyRow.className = 'perf-row';
+      appendTextCell(historyRow, fmtShortTime(ct.entryTime));
+      appendTextCell(historyRow, ct.direction, biasCls);
+      appendTextCell(historyRow, ct.confidence || '--');
+      appendTextCell(historyRow, fmtUSD(ct.entryPrice));
+      appendTextCell(historyRow, fmtUSD(ct.exitPrice));
+      appendTextCell(historyRow, outcomeText, outCls);
+      histList.appendChild(historyRow);
     }
-    histList.innerHTML = histHtml;
     $('perfStatus').textContent = closedTrades.length + ' trades';
   } catch(e) {}
 }
@@ -660,10 +676,18 @@ async function fetchLogs() {
       var entry = logs[i];
       var div = document.createElement('div');
       var level = (entry.level || 'info').toLowerCase();
-      div.className = 'log-entry log-' + level;
+      var levelClass = {
+        info: 'log-info',
+        error: 'log-error',
+        warning: 'log-warning',
+        success: 'log-success',
+        system: 'log-system',
+      }[level] || 'log-info';
+      div.className = 'log-entry ' + levelClass;
       var time = fmtTime(entry.timestamp);
       var meta = entry.meta && Object.keys(entry.meta).length ? ' ' + JSON.stringify(entry.meta) : '';
-      div.innerHTML = '<span class="log-time">[' + time + ']</span>[' + (entry.level || 'INFO').toUpperCase() + '] ' + entry.message + meta;
+      appendTextCell(div, '[' + time + ']', 'log-time');
+      appendTextCell(div, '[' + (entry.level || 'INFO').toUpperCase() + '] ' + entry.message + meta);
       body.appendChild(div);
     }
     if (body.children.length > 100) {
@@ -860,7 +884,8 @@ async function fetchInspector() {
 
     var gateNames = ['confluenceBias', 'regimeDecision', 'mtfConfirmation', 'trend', 'structure', 'rsi', 'ema', 'macd', 'atr', 'bollinger', 'advanceRisk'];
     var gateLabels = { confluenceBias: 'Confluence Bias', regimeDecision: 'Regime Decision', mtfConfirmation: 'MTF Confirmation', trend: 'Trend', structure: 'Structure', rsi: 'RSI', ema: 'EMA', macd: 'MACD', atr: 'ATR', bollinger: 'Bollinger', advanceRisk: 'Advance Risk' };
-    var gatesHtml = '';
+    var gatesEl = $('inspGates');
+    gatesEl.replaceChildren();
     for (var i = 0; i < gateNames.length; i++) {
       var gk = gateNames[i];
       var g = d.gates && d.gates[gk];
@@ -874,9 +899,13 @@ async function fetchInspector() {
         statusText = '--';
         detail = 'Not evaluated';
       }
-      gatesHtml += '<div class="inspector-gate-row"><span>' + gateLabels[gk] + '</span><span class="' + statusCls + '">' + statusText + '</span><span>' + detail + '</span></div>';
+      var gateRow = document.createElement('div');
+      gateRow.className = 'inspector-gate-row';
+      appendTextCell(gateRow, gateLabels[gk]);
+      appendTextCell(gateRow, statusText, statusCls);
+      appendTextCell(gateRow, detail);
+      gatesEl.appendChild(gateRow);
     }
-    $('inspGates').innerHTML = gatesHtml;
 
     var v = d.verdict;
     var vIcon = $('inspVerdictIcon');
