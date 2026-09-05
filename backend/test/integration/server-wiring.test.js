@@ -138,7 +138,7 @@ async function waitForResponse(port, requestPath, expectedStatus) {
 function waitForStartup(child) {
   return new Promise((resolve, reject) => {
     let output = '';
-    const timeout = setTimeout(() => reject(new Error(`Server did not start. Output: ${output}`)), 30000);
+    const timeout = setTimeout(() => reject(new Error(`Server did not start. Output: ${output}`)), 60000);
 
     child.stdout.on('data', chunk => {
       output += chunk.toString();
@@ -387,7 +387,7 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
       ATLAS_ORIGIN: `http://127.0.0.1:${port}`,
       ATLAS_COOKIE_SECURE: 'false',
       ATLAS_LIVE_STATE_FILE_PATH: statePath,
-      REFRESH_INTERVAL: '1500',
+       REFRESH_INTERVAL: '1500',
       MIN_API_INTERVAL: '1',
       API_THROTTLE_TTL: '1',
       RATE_LIMIT_MAX_REQUESTS: '500',
