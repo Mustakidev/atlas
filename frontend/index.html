@@ -329,7 +329,7 @@
             <div class="regime-details">
               <div class="kv-row"><span class="kv-key">Volatility</span><span class="kv-val" id="regimeVol">--</span></div>
               <div class="kv-row"><span class="kv-key">Vol Score</span><span class="kv-val" id="regimeVolScore">--</span></div>
-              <div class="kv-row"><span class="kv-key">Reason</span><span class="kv-val" id="regimeReason" style="font-size:10px;max-width:200px;text-align:right">--</span></div>
+              <div class="kv-row"><span class="kv-key">Reason</span><span class="kv-val regime-reason" id="regimeReason">--</span></div>
             </div>
           </div>
         </div>
@@ -353,18 +353,18 @@
             <div class="inspector-snap-item"><span class="inspector-snap-label">Sell &le;</span><span class="inspector-snap-val" id="inspSellThresh">--</span></div>
             <div class="inspector-snap-item"><span class="inspector-snap-label">Cycle</span><span class="inspector-snap-val" id="inspCycle">--</span></div>
           </div>
-          <div class="inspector-snapshot" style="margin-top:6px;background:rgba(0,0,0,.08)">
+          <div class="inspector-snapshot inspector-snapshot-secondary">
             <div class="inspector-snap-item"><span class="inspector-snap-label">Regime</span><span class="inspector-snap-val" id="inspRegime">--</span></div>
             <div class="inspector-snap-item"><span class="inspector-snap-label">Regime Conf</span><span class="inspector-snap-val" id="inspRegimeConf">--</span></div>
             <div class="inspector-snap-item"><span class="inspector-snap-label">Trend</span><span class="inspector-snap-val" id="inspRegimeTrend">--</span></div>
             <div class="inspector-snap-item"><span class="inspector-snap-label">Range</span><span class="inspector-snap-val" id="inspRegimeRange">--</span></div>
             <div class="inspector-snap-item"><span class="inspector-snap-label">Vol</span><span class="inspector-snap-val" id="inspRegimeVol">--</span></div>
           </div>
-          <div class="inspector-snapshot" style="margin-top:6px;background:rgba(100,200,255,.06);border:1px solid rgba(100,200,255,.15)">
-            <div class="inspector-snap-item"><span class="inspector-snap-label" style="color:#64c8ff">Regime Decision</span><span class="inspector-snap-val" id="inspRegimeDecisionStatus">--</span></div>
+          <div class="inspector-snapshot inspector-snapshot-decision">
+            <div class="inspector-snap-item"><span class="inspector-snap-label regime-decision-label">Regime Decision</span><span class="inspector-snap-val" id="inspRegimeDecisionStatus">--</span></div>
             <div class="inspector-snap-item"><span class="inspector-snap-label">Preferred</span><span class="inspector-snap-val" id="inspRegimeDecisionPref">--</span></div>
             <div class="inspector-snap-item"><span class="inspector-snap-label">Penalty</span><span class="inspector-snap-val" id="inspRegimeDecisionPenalty">--</span></div>
-            <div class="inspector-snap-item" style="grid-column:1/-1"><span class="inspector-snap-label">Reason</span><span class="inspector-snap-val" id="inspRegimeDecisionReason" style="font-size:11px;color:#aaa">--</span></div>
+            <div class="inspector-snap-item inspector-snap-item-wide"><span class="inspector-snap-label">Reason</span><span class="inspector-snap-val inspector-regime-decision-reason" id="inspRegimeDecisionReason">--</span></div>
           </div>
           <div class="inspector-gates">
             <div class="inspector-gates-header"><span>Gate</span><span>Status</span><span>Detail</span></div>
@@ -377,7 +377,7 @@
             </div>
             <div class="inspector-verdict-detail" id="inspVerdictDetail"></div>
           </div>
-          <div class="inspector-trade" id="inspTrade" style="display:none">
+          <div class="inspector-trade hidden" id="inspTrade">
             <div class="inspector-trade-header">Trade Details</div>
             <div class="inspector-trade-grid">
               <div class="inspector-trade-item"><span class="inspector-trade-label">Entry</span><span class="inspector-trade-val" id="inspEntry">--</span></div>
@@ -491,7 +491,7 @@
           <span class="panel-badge replay">R</span>
           <span class="panel-title">Strategy Replay</span>
           <span class="panel-status" id="replayStatus">--</span>
-          <button class="replay-btn" id="replayBtn" onclick="runReplay()">Run 30D</button>
+          <button class="replay-btn" id="replayBtn">Run 30D</button>
         </div>
         <div class="panel-body">
           <div class="replay-summary">
@@ -550,7 +550,7 @@
     </section>
   </div>
 
-  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="vendor/lightweight-charts-4.1.3/dist/lightweight-charts.standalone.production.js"></script>
   <script src="js/chart/engine.js"></script>
   <script src="replayRequest.js"></script>
   <script src="replayPresentation.js"></script>

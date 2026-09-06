@@ -8,6 +8,72 @@ const { createAuth, createSessionOriginGuard } = require('./middleware/auth');
 const { createGlobalLimiter, createExpensiveLimiter, createConditionalExpensive, createLoginLimiter } = require('./middleware/rateLimit');
 const { createRouter } = require('./routes/routes');
 const { createProductionReplayRouter } = require('./routes/productionReplayRoutes');
+const { isLoopbackOrigin } = require('./auth/origin');
+
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "script-src-elem 'self'",
+  "script-src-attr 'none'",
+  "style-src 'self'",
+  "style-src-elem 'self'",
+  "style-src-attr 'none'",
+  "connect-src 'self'",
+  "img-src 'none'",
+  "font-src 'none'",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "frame-src 'none'",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+  "worker-src 'none'",
+  "manifest-src 'none'",
+  "media-src 'none'",
+].join('; ');
+
+const PERMISSIONS_POLICY = [
+  'camera=()',
+  'microphone=()',
+  'geolocation=()',
+  'payment=()',
+  'usb=()',
+  'serial=()',
+  'bluetooth=()',
+  'clipboard-read=()',
+  'clipboard-write=()',
+  'fullscreen=()',
+  'display-capture=()',
+  'accelerometer=()',
+  'gyroscope=()',
+  'magnetometer=()',
+].join(', ');
+
+function createSecurityHeaders(config) {
+  return (req, res, next) => {
+    res.set({
+      'Content-Security-Policy': CONTENT_SECURITY_POLICY,
+      'X-Frame-Options': 'DENY',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
+      'Permissions-Policy': PERMISSIONS_POLICY,
+    });
+
+    const origin = config.get('ATLAS_ORIGIN');
+    if (typeof origin === 'string' && origin.startsWith('https://')) {
+      try {
+        if (!isLoopbackOrigin(origin)) res.set('Strict-Transport-Security', 'max-age=31536000');
+      } catch {
+        // Invalid configuration is rejected before the real app is created.
+      }
+    }
+
+    if (req.path === '/api' || req.path.startsWith('/api/')) {
+      res.set('Cache-Control', 'no-store');
+    }
+
+    next();
+  };
+}
 
 function isMalformedJsonError(error) {
   return error instanceof SyntaxError
@@ -37,6 +103,24 @@ function createErrorHandler(logger) {
   };
 }
 
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, character => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[character]));
+}
+
+function createNotFoundHandler() {
+  return function notFoundHandler(req, res) {
+    return res.status(404).type('html').send(
+      `Cannot ${escapeHtml(req.method)} ${escapeHtml(req.originalUrl)}`,
+    );
+  };
+}
+
 function classifyLifecycleRequest(req) {
   if (req.path === '/healthz') return 'health';
   if (req.path === '/readyz') return 'health';
@@ -52,6 +136,8 @@ function shuttingDownResponse(res) {
 
 function createApp({ config, logger, routes, getLastDecision, getPipelineHealth, lifecycle, liveRuntime }) {
   const app = express();
+  app.disable('x-powered-by');
+  app.use(createSecurityHeaders(config));
   const sessionStore = new SingleOperatorSessionStore();
   const auth = createAuth(config, logger, { sessionStore });
   const sessionOriginGuard = createSessionOriginGuard(config);
@@ -137,6 +223,7 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth,
   });
   app.use('/api/auth', authRouter);
   app.use('/api', auth, sessionOriginGuard, expensiveLimiter, canonicalRouter, router);
+  app.use(createNotFoundHandler());
   app.use(createErrorHandler(logger));
 
   return app;

@@ -940,14 +940,14 @@ async function fetchInspector() {
 
     var tradeEl = $('inspTrade');
     if (v.tradeOpened && v.trade) {
-      tradeEl.style.display = '';
+      tradeEl.classList.remove('hidden');
       $('inspEntry').textContent = fmtUSD(v.trade.entryPrice);
       $('inspSL').textContent = fmtUSD(v.trade.stopLoss);
       $('inspTP').textContent = fmtUSD(v.trade.takeProfit);
       $('inspPosSize').textContent = v.trade.positionSize;
       $('inspRR').textContent = '1:' + v.trade.riskReward;
     } else {
-      tradeEl.style.display = 'none';
+      tradeEl.classList.add('hidden');
     }
 
     $('inspectorStatus').textContent = 'Cycle #' + (d.cycle || 0);
@@ -1210,5 +1210,8 @@ window.runReplay = async function() {
   }
   finishReplay(btn);
 };
+
+var replayButton = $('replayBtn');
+if (replayButton) replayButton.addEventListener('click', window.runReplay);
 
 })();
