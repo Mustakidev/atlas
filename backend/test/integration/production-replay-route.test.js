@@ -316,6 +316,37 @@ test('canonical route inherits the expensive limiter', async () => {
   assert.equal(calls, 1);
 });
 
+test('canonical Replay rejects concurrent analytical work without retaining a queue', async () => {
+  let release;
+  const application = {
+    run: async () => new Promise(resolve => { release = resolve; }),
+  };
+
+  await withApp({ application }, async server => {
+    const first = request(server, {
+      path: `/api/strategy/replay/v2?${VALID_QUERY}`,
+      headers: authHeaders(),
+    });
+    await new Promise(resolve => setImmediate(resolve));
+
+    const rejected = await request(server, {
+      path: `/api/strategy/replay/v2?${VALID_QUERY}`,
+      headers: authHeaders(),
+    });
+    assert.equal(rejected.statusCode, 429);
+    assert.equal(rejected.headers['retry-after'], '1');
+    assert.deepEqual(rejected.body, {
+      error: 'Analytical capacity exceeded',
+      code: 'ANALYTICAL_CAPACITY_EXCEEDED',
+    });
+
+    release({ ok: true });
+    const accepted = await first;
+    assert.equal(accepted.statusCode, 200);
+    assert.deepEqual(accepted.body, { ok: true });
+  });
+});
+
 test('canonical unknown errors use the generic error boundary', async () => {
   const loggerState = {};
   const application = {

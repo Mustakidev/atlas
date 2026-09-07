@@ -105,7 +105,11 @@ function createExecutionPipeline({
   mtfEngine,
   paperTradeEngine,
   clock,
+  silent = false,
 }) {
+  const console = {
+    log: silent ? () => {} : (...args) => globalThis.console.log(...args),
+  };
   const effectiveMtfCandleEngine = mtfCandleEngine ?? candleEngine;
   const mtfAtrEngine = effectiveMtfCandleEngine === candleEngine
     ? atrEngine

@@ -9,6 +9,7 @@ const { createLiveExecutionStateAggregate } = require('../../src/state/liveExecu
 const { createConfigFingerprint } = require('../../src/state/liveExecutionStateSchema');
 const {
   DURABILITY_UNAVAILABLE,
+  STATE_QUEUE_FULL,
   MUTATION_UNCERTIFIED,
   createLiveStateCommitCoordinator,
 } = require('../../src/state/liveStateCommitCoordinator');
@@ -138,6 +139,66 @@ test('starts healthy and serializes queued mutations in invocation order', async
   assert.deepEqual(order, ['first-start', 'first-end', 'second-start', 'second-end']);
   assert.deepEqual(state.writes.map(write => write.snapshot.mutationSequence), [1, 2]);
   assert.equal(state.sequence, 2);
+});
+
+test('rejects the sixth admitted coordinator item before retaining or invoking it', async () => {
+  const state = harness();
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  state.stateStore.write = async () => gate.then(() => ({ status: 'WRITTEN' }));
+  const coordinator = createLiveStateCommitCoordinator(state);
+
+  const first = coordinator.runMutation({
+    name: 'active',
+    mutate: () => { state.domain = { value: 1 }; },
+  });
+  await new Promise(resolve => setImmediate(resolve));
+
+  const waiting = Array.from({ length: 4 }, (_, index) => coordinator.runMutation({
+    name: `waiting-${index}`,
+    mutate: () => undefined,
+  }));
+  let called = false;
+  await assert.rejects(
+    coordinator.runMutation({
+      name: 'sixth',
+      mutate: () => { called = true; },
+    }),
+    error => error.code === STATE_QUEUE_FULL,
+  );
+  assert.equal(called, false);
+  assert.equal(coordinator.getStatus().queueDepth, 5);
+  assert.equal(coordinator.getStatus().commitQueueRejects, 1);
+
+  release();
+  await Promise.all([first, ...waiting]);
+  assert.equal(coordinator.getStatus().queueDepth, 0);
+});
+
+test('queue-full committed reads do not execute their callback', async () => {
+  const state = harness();
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  state.stateStore.write = async () => gate.then(() => ({ status: 'WRITTEN' }));
+  const coordinator = createLiveStateCommitCoordinator(state);
+
+  const active = coordinator.runMutation({
+    name: 'active',
+    mutate: () => { state.domain = { value: 1 }; },
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  const waiting = Array.from({ length: 4 }, () => coordinator.readCommitted(() => 'waiting'));
+  let called = false;
+  await assert.rejects(
+    coordinator.readCommitted(() => {
+      called = true;
+      return 'rejected';
+    }),
+    error => error.code === STATE_QUEUE_FULL,
+  );
+  assert.equal(called, false);
+  release();
+  assert.deepEqual(await Promise.all([active, ...waiting]), [undefined, 'waiting', 'waiting', 'waiting', 'waiting']);
 });
 
 test('no-op mutations do not write or advance the sequence', async () => {

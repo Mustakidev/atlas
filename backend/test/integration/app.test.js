@@ -227,6 +227,26 @@ test('real Express app serves the public health endpoint without authentication'
   }
 });
 
+test('entity-too-large JSON bodies use the stable 413 contract', async () => {
+  const server = await startApp({ configValues: { MAX_BODY_SIZE: '1kb' } });
+  try {
+    const result = await request(server, {
+      method: 'POST',
+      path: '/api/auth/login',
+      rawBody: 'x'.repeat(2048),
+      headers: { origin: ATLAS_ORIGIN },
+    });
+
+    assert.equal(result.statusCode, 413);
+    assert.deepEqual(result.json(), {
+      error: 'Request body too large',
+      code: 'REQUEST_BODY_TOO_LARGE',
+    });
+  } finally {
+    await stopApp(server);
+  }
+});
+
 test('lifecycle gate rejects new unsafe work after shutdown while exposing health state', async () => {
   const exits = [];
   const lifecycle = createLifecycleController({

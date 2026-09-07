@@ -5,6 +5,8 @@ function registerLiveSnapshotHandler({
   signalHistoryEngine,
   executionPipeline,
   commitCoordinator,
+  candleEngine,
+  logger,
 }) {
   function assertDurablePipelineCompletion() {
     if (!commitCoordinator || !executionPipeline?.getLastRunStatus) return;
@@ -37,11 +39,27 @@ function registerLiveSnapshotHandler({
     assertDurablePipelineCompletion();
   };
 
+  const processAdmittedSnapshot = (snapshot, transition) => {
+    let effectiveTransition = transition;
+    if (effectiveTransition === undefined && candleEngine) {
+      history.add(snapshot);
+      effectiveTransition = candleEngine.ingest(snapshot);
+    }
+    return processSnapshot(snapshot, effectiveTransition);
+  };
+
   const handler = (snapshot, transition) => {
-    if (!commitCoordinator) return processSnapshot(snapshot, transition);
-    return commitCoordinator.runMutation({
+    if (!commitCoordinator) return processAdmittedSnapshot(snapshot, transition);
+    const operation = commitCoordinator.runMutation({
       name: 'live-snapshot',
-      mutate: () => processSnapshot(snapshot, transition),
+      mutate: () => processAdmittedSnapshot(snapshot, transition),
+    });
+    return operation.catch(error => {
+      if (error?.code !== 'STATE_QUEUE_FULL') throw error;
+      logger?.warn?.('ResourceAdmission', 'Live snapshot skipped because commit capacity is full', {
+        code: error.code,
+      });
+      return Object.freeze({ status: 'SKIPPED', code: error.code });
     });
   };
 

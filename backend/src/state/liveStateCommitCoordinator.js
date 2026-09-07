@@ -2,6 +2,8 @@ const { isDeepStrictEqual } = require('node:util');
 
 const DURABILITY_UNAVAILABLE = 'LIVE_STATE_DURABILITY_UNAVAILABLE';
 const MUTATION_UNCERTIFIED = 'LIVE_STATE_MUTATION_UNCERTIFIED';
+const STATE_QUEUE_FULL = 'STATE_QUEUE_FULL';
+const MAX_QUEUE_DEPTH = 5;
 
 class LiveStateCommitError extends Error {
   constructor(code, message, { cause = null, operation = null, phase = null } = {}) {
@@ -60,6 +62,7 @@ function createLiveStateCommitCoordinator({ aggregate, stateStore } = {}) {
   let queue = Promise.resolve();
   let queueDepth = 0;
   let inFlight = null;
+  let commitQueueRejects = 0;
 
   function unavailable(operation, cause = null, phase = null) {
     return new LiveStateCommitError(
@@ -74,7 +77,19 @@ function createLiveStateCommitCoordinator({ aggregate, stateStore } = {}) {
     return unavailable(operation, cause, phase);
   }
 
+  function queueFull(operation, kind) {
+    commitQueueRejects++;
+    return new LiveStateCommitError(
+      STATE_QUEUE_FULL,
+      'Live state commit capacity is full',
+      { operation, phase: kind },
+    );
+  }
+
   function enqueue(name, kind, work) {
+    if (!durabilityHealthy) return Promise.reject(unavailable(name));
+    if (queueDepth >= MAX_QUEUE_DEPTH) return Promise.reject(queueFull(name, kind));
+
     queueDepth++;
     const operation = queue.then(async () => {
       if (!durabilityHealthy) throw unavailable(name);
@@ -175,6 +190,7 @@ function createLiveStateCommitCoordinator({ aggregate, stateStore } = {}) {
     return Object.freeze({
       durabilityHealthy,
       queueDepth,
+      commitQueueRejects,
       inFlight: inFlight ? Object.freeze({ ...inFlight }) : null,
     });
   }
@@ -190,7 +206,9 @@ function createLiveStateCommitCoordinator({ aggregate, stateStore } = {}) {
 
 module.exports = {
   DURABILITY_UNAVAILABLE,
+  MAX_QUEUE_DEPTH,
   MUTATION_UNCERTIFIED,
+  STATE_QUEUE_FULL,
   LiveStateCommitError,
   createLiveStateCommitCoordinator,
 };

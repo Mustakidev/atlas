@@ -183,9 +183,10 @@ function createReplayPipelineRunner({ dependencies, normalizedInput } = {}) {
   const executionPipeline = mtfMode
     ? createExecutionPipeline({
       ...dependencies,
+      silent: true,
       mtfCandleEngine: dependencies.replayCandleView,
     })
-    : createExecutionPipeline(dependencies);
+    : createExecutionPipeline({ ...dependencies, silent: true });
   let status = 'READY';
   let cycleCount = 0;
   let lastResult = null;

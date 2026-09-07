@@ -5,6 +5,7 @@ const { getFinalizedCandles } = require('../engine/candleUtils');
 function createRouter(deps) {
   const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision, commitCoordinator, liveRuntime, initializeLiveState, getCommitCoordinator } = deps;
   const router = express.Router();
+  const ANALYTICAL_MAX_CANDLES = 1000;
 
   router.use(sanitizeQuery);
 
@@ -15,8 +16,24 @@ function createRouter(deps) {
     error: 'Live state durability unavailable',
   });
 
+  const respondQueueFull = res => {
+    if (typeof res.set === 'function') res.set('Retry-After', '1');
+    else res.setHeader?.('Retry-After', '1');
+    return res.status(503).json({
+      error: 'Live state resource capacity unavailable',
+      code: 'STATE_QUEUE_FULL',
+    });
+  };
+
+  const sendGeneratedResponse = (req, res, result) => (
+    typeof req.resourceAdmission?.sendGeneratedJson === 'function'
+      ? req.resourceAdmission.sendGeneratedJson(res, result)
+      : res.json(result)
+  );
+
   function handleCoordinatorError(error, res, next) {
     if (isDurabilityError(error)) return respondDurabilityUnavailable(res);
+    if (error?.code === 'STATE_QUEUE_FULL') return respondQueueFull(res);
     return next(error);
   }
 
@@ -595,7 +612,7 @@ function createRouter(deps) {
 
     logger.info('Validation', `Validation | overall=${result.overall} | ${result.calculationTime}ms`);
 
-    res.json(result);
+    sendGeneratedResponse(req, res, result);
   });
 
   // ---------------------------------------------------------------------------
@@ -638,11 +655,17 @@ function createRouter(deps) {
         supported: valid,
       });
     }
+    if (limit > ANALYTICAL_MAX_CANDLES) {
+      return res.status(400).json({
+        error: 'Analytical candle limit exceeded',
+        code: 'ANALYTICAL_LIMIT_EXCEEDED',
+      });
+    }
 
     const finalized = getFinalizedCandles(candleEngine, tf, limit);
 
     if (finalized.length === 0) {
-      return res.json({
+      return sendGeneratedResponse(req, res, {
         symbol: config.get('SYMBOL') || 'BTCUSDT',
         timeframe: tf,
         reason: 'No finalized candle data available',
@@ -663,7 +686,7 @@ function createRouter(deps) {
 
     logger.info('Backtest', `Backtest | ${tf} | signals=${result.signals.length} | win=${result.stats.winRate}% | ${duration}ms`);
 
-    res.json(result);
+    sendGeneratedResponse(req, res, result);
   });
 
   // ---------------------------------------------------------------------------
@@ -682,6 +705,12 @@ function createRouter(deps) {
     // Gather backtest data if candles are available
     let backtestResult = null;
     const valid = candleEngine.getAllTimeframes();
+    if (limit > ANALYTICAL_MAX_CANDLES) {
+      return res.status(400).json({
+        error: 'Analytical candle limit exceeded',
+        code: 'ANALYTICAL_LIMIT_EXCEEDED',
+      });
+    }
     if (valid.includes(tf)) {
       const finalized = getFinalizedCandles(candleEngine, tf, limit);
       if (finalized.length > 0 && backtestEngine) {
@@ -706,7 +735,7 @@ function createRouter(deps) {
 
     logger.info('Analytics', `Analytics | ${tf} | signals=${result.general.totalSignals} | accuracy=${result.accuracy.overall}% | ${duration}ms`);
 
-    res.json(result);
+    sendGeneratedResponse(req, res, result);
   });
 
   // ---------------------------------------------------------------------------
@@ -773,8 +802,16 @@ function createRouter(deps) {
     const ready = requireLiveReady(res);
     if (ready !== true) return ready;
     const { tradeId, reason } = req.body || {};
-    if (!tradeId) {
+    if (typeof tradeId !== 'string'
+      || tradeId.length === 0
+      || Buffer.byteLength(tradeId, 'utf8') > 64) {
       return res.status(400).json({ error: 'tradeId is required' });
+    }
+    if (reason !== undefined
+      && (typeof reason !== 'string'
+        || reason.length === 0
+        || Buffer.byteLength(reason, 'utf8') > 256)) {
+      return res.status(400).json({ error: 'reason must be a non-empty string of at most 256 bytes' });
     }
 
     if (!paperTradeEngine || typeof paperTradeEngine.close !== 'function') {

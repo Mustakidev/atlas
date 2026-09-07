@@ -9,6 +9,7 @@ const { createGlobalLimiter, createExpensiveLimiter, createConditionalExpensive,
 const { createRouter } = require('./routes/routes');
 const { createProductionReplayRouter } = require('./routes/productionReplayRoutes');
 const { isLoopbackOrigin } = require('./auth/origin');
+const { createResourceAdmission } = require('./core/resourceAdmission');
 
 const CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
@@ -82,11 +83,18 @@ function isMalformedJsonError(error) {
     && error.type === 'entity.parse.failed';
 }
 
+function isEntityTooLargeError(error) {
+  return error?.status === 413 && error?.type === 'entity.too.large';
+}
+
 function createErrorHandler(logger) {
   return function errorHandler(error, req, res, next) {
     const malformedJson = isMalformedJsonError(error);
-    const status = malformedJson ? 400 : 500;
-    const category = malformedJson ? 'malformed-json' : 'unhandled';
+    const entityTooLarge = isEntityTooLargeError(error);
+    const status = malformedJson ? 400 : entityTooLarge ? 413 : 500;
+    const category = malformedJson
+      ? 'malformed-json'
+      : entityTooLarge ? 'body-too-large' : 'unhandled';
 
     logger.error('ErrorBoundary', 'Request error', {
       method: req.method,
@@ -98,7 +106,10 @@ function createErrorHandler(logger) {
     if (res.headersSent) return next(error);
 
     return res.status(status).json({
-      error: malformedJson ? 'Invalid JSON payload' : 'Internal server error',
+      error: malformedJson
+        ? 'Invalid JSON payload'
+        : entityTooLarge ? 'Request body too large' : 'Internal server error',
+      ...(entityTooLarge ? { code: 'REQUEST_BODY_TOO_LARGE' } : {}),
     });
   };
 }
@@ -144,6 +155,7 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth,
   const globalLimiter = createGlobalLimiter(config, logger);
   const expensiveLimiter = createConditionalExpensive(createExpensiveLimiter(config, logger));
   const loginLimiter = createLoginLimiter(config, logger);
+  const resourceAdmission = createResourceAdmission();
   const authRouter = createAuthRouter({ config, sessionStore, loginLimiter });
   const allowedOrigins = config.get('CORS_ORIGIN').split(',').map(s => s.trim());
 
@@ -222,7 +234,7 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth,
     lifecycle,
   });
   app.use('/api/auth', authRouter);
-  app.use('/api', auth, sessionOriginGuard, expensiveLimiter, canonicalRouter, router);
+  app.use('/api', auth, sessionOriginGuard, expensiveLimiter, resourceAdmission.middleware(), canonicalRouter, router);
   app.use(createNotFoundHandler());
   app.use(createErrorHandler(logger));
 

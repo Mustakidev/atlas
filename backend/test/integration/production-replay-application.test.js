@@ -558,6 +558,19 @@ test('runs the real no-network A1H1/A1H2 production chain and returns exact proj
   assert.equal(setup.observed.mtfResult.rawInput[Symbol.for('APP_MUTATION_CHECK')] ?? null, null);
 });
 
+test('Replay composition suppresses direct pipeline console output', async () => {
+  const setup = makeApplication();
+  const output = [];
+  const originalLog = console.log;
+  console.log = (...args) => output.push(args);
+  try {
+    await setup.application.run(request());
+  } finally {
+    console.log = originalLog;
+  }
+  assert.deepEqual(output, []);
+});
+
 test('limits timestamp stripping to canonical MTF confirmation output', async () => {
   const provenanceTimestamp = '2026-01-10T00:00:00.000Z';
   const setup = makeApplication({
