@@ -140,7 +140,17 @@ test('GET /api/market returns the current market contract', async () => {
 });
 
 test('GET /api/status returns health and pipeline fields', async () => {
-  const result = await dispatch('/status');
+  const result = await dispatch('/status', {}, {
+    advanceRiskEngine: { isRiskStateHealthy: () => true },
+    getPipelineHealth: () => ({
+      pipelineCycleCount: 2,
+      pipelineErrors: 0,
+      lastPipelineError: null,
+      lastSuccessfulCycle: '2026-01-01T00:00:00.000Z',
+      riskSyncFailure: false,
+      lastRunStatus: { status: 'COMPLETED', failure: null },
+    }),
+  });
 
   assert.equal(result.statusCode, 200);
   assert.equal(typeof result.body.version, 'string');
@@ -148,6 +158,9 @@ test('GET /api/status returns health and pipeline fields', async () => {
   assert.equal(typeof result.body.historySize, 'number');
   assert.ok(Object.hasOwn(result.body, 'connected'));
   assert.ok(Object.hasOwn(result.body, 'pipeline'));
+  assert.equal(result.body.riskStateHealthy, true);
+  assert.equal(result.body.pipeline.riskSyncFailure, false);
+  assert.deepEqual(result.body.pipeline.lastRunStatus, { status: 'COMPLETED', failure: null });
 });
 
 test('live routes reject access before runtime readiness', async () => {

@@ -628,7 +628,17 @@ function createExecutionPipeline({
     getPolicy,
     restoreDurableState,
     getLastDecision: () => lastDecision,
-    getPipelineHealth: () => ({ pipelineCycleCount, pipelineErrors, lastPipelineError, lastSuccessfulCycle }),
+    getPipelineHealth: () => ({
+      pipelineCycleCount,
+      pipelineErrors,
+      lastPipelineError,
+      lastSuccessfulCycle,
+      riskSyncFailure: Boolean(riskSyncFailure),
+      lastRunStatus: lastRunStatus && {
+        status: lastRunStatus.status,
+        failure: lastRunStatus.failure && { ...lastRunStatus.failure },
+      },
+    }),
     getLastRunStatus: () => lastRunStatus && {
       status: lastRunStatus.status,
       failure: lastRunStatus.failure && { ...lastRunStatus.failure },

@@ -655,7 +655,7 @@ test('two monotonic source cycles pass progress and exact runtime boundary passe
 
   const checks = Object.fromEntries(evaluateChecks([], [], { metrics }).checks.map(check => [check.name, check]));
   assert.equal(checks['Source cycle progressed'].pass, true);
-  assert.equal(checks['Requested runtime completed'].pass, true);
+  assert.equal(checks['Observation duration completed'].pass, true);
   assert.equal(metrics.runtime.actualElapsedMs, metrics.runtime.requestedDurationMs);
 });
 
@@ -663,7 +663,7 @@ test('runtime below the requested boundary fails completion', () => {
   const metrics = verificationMetrics();
   finalizeVerificationMetrics(metrics, 9999);
 
-  const check = evaluateChecks([], [], { metrics }).checks.find(item => item.name === 'Requested runtime completed');
+  const check = evaluateChecks([], [], { metrics }).checks.find(item => item.name === 'Observation duration completed');
   assert.equal(metrics.runtime.runCompleted, false);
   assert.equal(check.pass, false);
 });
@@ -893,12 +893,12 @@ test('report serializes compact diagnostics, failures, and truthful labels witho
   const after = JSON.stringify(serializeVerificationMetrics(metrics));
 
   assert.equal(after, before);
-  assert.match(report, /Missing Source Cycle Count \(diagnostic only\) \| 1/);
-  assert.match(report, /Missing Source Cycle Ranges \(diagnostic only\).*\"from\":11.*\"to\":11/);
-  assert.match(report, /Maximum Observed Source Stall \(diagnostic only\)/);
-  assert.match(report, /Final Source Stall \(diagnostic only\)/);
-  assert.match(report, /Polling Drift \(diagnostic only\)/);
-  assert.match(report, /do not independently fail verification/);
+  assert.match(report, /Missing Source Cycle Count \(diagnostic\) \| 1/);
+  assert.match(report, /Missing Source Cycle Ranges \(diagnostic\).*\"from\":11.*\"to\":11/);
+  assert.match(report, /Maximum Observed Source Stall \|/);
+  assert.match(report, /Final Source Stall \|/);
+  assert.match(report, /Polling Drift \(diagnostic\)/);
+  assert.match(report, /Source stalls.*hard acceptance criteria/);
   assert.match(report, /inspectorEndpoint \| 1 \| timeout \| 3000/);
   assert.doesNotMatch(report, /missingSourceCycleIds/);
 });
@@ -930,6 +930,26 @@ test('AdvanceRisk rejection is an evaluated rejection', () => {
   const coverage = evaluateGateCoverage(normalizeInspectorResponse(advanceRiskRejectedInspector()));
   assert.equal(coverage.valid, true);
   assert.equal(coverage.statuses.advanceRisk, 'evaluated-fail');
+});
+
+test('ordinary policy rejections remain verifier-compatible when system health is safe', () => {
+  const cases = [
+    ['NO TRADE', earlyInspector({ verdict: { tradeOpened: false, rejectionReason: 'NO TRADE', trade: null } })],
+    ['tradeAllowed=false', advanceRiskRejectedInspector()],
+    ['cooldown', earlyInspector({ verdict: { tradeOpened: false, rejectionReason: 'Signal cooldown active', trade: null } })],
+    ['neutral confluence', neutralInspector()],
+    ['MTF rejection', mtfRejectedInspector()],
+    ['daily-risk denial', advanceRiskRejectedInspector()],
+  ];
+
+  for (const [label, response] of cases) {
+    const normalized = normalizeInspectorResponse(response);
+    const coverage = evaluateGateCoverage(normalized);
+    assert.equal(coverage.valid, true, `${label} remains a valid decision path`);
+    const cycle = buildCycleRecord(normalized);
+    assert.equal(cycle.tradeOpened, false, `${label} does not open a trade`);
+    assert.equal(typeof cycle.rejectionReason, 'string', `${label} records a rejection reason`);
+  }
 });
 
 test('fully evaluated opened-trade path accepts all canonical gates', () => {

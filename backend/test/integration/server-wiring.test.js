@@ -483,8 +483,10 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     assert.deepEqual(Object.keys(first.statusResponse.body.pipeline).sort(), [
       'lastPipelineError',
       'lastSuccessfulCycle',
+      'lastRunStatus',
       'pipelineCycleCount',
       'pipelineErrors',
+      'riskSyncFailure',
     ].sort());
 
     const firstInspector = await request(port, '/api/signal/inspector');
