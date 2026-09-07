@@ -10,6 +10,7 @@ const MIN_START_TIME = DAY_MS;
 const MIN_HORIZON_MS = 51 * HOUR_MS;
 const MAX_HORIZON_MS = 99 * DAY_MS - HOUR_MS;
 const MAX_DATE_MS = 8_640_000_000_000_000;
+const REPLAY_EXECUTION_DEADLINE_MS = 180_000;
 const REQUEST_KEYS = Object.freeze(['symbol', 'startTime', 'endTime']);
 
 const APP_ERROR_RESPONSES = new Map([
@@ -126,7 +127,69 @@ function logKnownApplicationError(logger, error) {
   }
 }
 
-function createProductionReplayRouter({ application, logger, lifecycle } = {}) {
+function createReplayCancellation({ req, res, deadlineMs } = {}) {
+  const controller = new AbortController();
+  let completed = false;
+  let deadlineExpired = false;
+  let disconnected = false;
+  let lifecycleSignal = null;
+
+  const abort = reason => {
+    if (!controller.signal.aborted) controller.abort(reason);
+  };
+  const onRequestAbort = () => {
+    disconnected = true;
+    abort(new Error('Replay client disconnected'));
+  };
+  const onResponseClose = () => {
+    if (completed) return;
+    disconnected = true;
+    abort(new Error('Replay client disconnected'));
+  };
+  const onLifecycleAbort = () => abort(lifecycleSignal.reason);
+  const timer = setTimeout(() => {
+    deadlineExpired = true;
+    abort(new Error('Replay execution deadline exceeded'));
+  }, deadlineMs);
+
+  req.once('aborted', onRequestAbort);
+  res.once('close', onResponseClose);
+
+  function attachLifecycle(signal) {
+    lifecycleSignal = signal;
+    if (!signal) return;
+    if (signal.aborted) onLifecycleAbort();
+    else signal.addEventListener('abort', onLifecycleAbort, { once: true });
+  }
+
+  function cleanup() {
+    clearTimeout(timer);
+    req.removeListener('aborted', onRequestAbort);
+    res.removeListener('close', onResponseClose);
+    lifecycleSignal?.removeEventListener('abort', onLifecycleAbort);
+  }
+
+  function complete() {
+    completed = true;
+    cleanup();
+  }
+
+  return Object.freeze({
+    signal: controller.signal,
+    attachLifecycle,
+    complete,
+    cleanup,
+    get deadlineExpired() { return deadlineExpired; },
+    get disconnected() { return disconnected; },
+  });
+}
+
+function createProductionReplayRouter({
+  application,
+  logger,
+  lifecycle,
+  deadlineMs = REPLAY_EXECUTION_DEADLINE_MS,
+} = {}) {
   if (application !== null && application !== undefined
     && typeof application.run !== 'function') {
     throw new TypeError('application.run must be a function when application is provided');
@@ -148,23 +211,62 @@ function createProductionReplayRouter({ application, logger, lifecycle } = {}) {
       });
     }
 
+    const cancellation = createReplayCancellation({
+      req,
+      res,
+      deadlineMs,
+    });
+
     try {
       let replaySignal;
-      const result = lifecycle
-        ? await lifecycle.startReplay(({ signal }) => {
-          replaySignal = signal;
-          return application.run(request, { signal });
-        })
-        : await application.run(request);
-      if (res.destroyed || res.writableEnded) return undefined;
+      const replay = ({ signal }) => {
+        replaySignal = signal;
+        cancellation.attachLifecycle(signal);
+        return application.run(request, { signal: cancellation.signal });
+      };
+      const task = lifecycle ? lifecycle.startReplay(replay) : replay({ signal: undefined });
+      if (task === null) {
+        cancellation.complete();
+        return res.status(503).json({ error: 'Server shutting down' });
+      }
+      const result = await task;
+      if (cancellation.deadlineExpired) {
+        cancellation.complete();
+        return res.status(504).json({
+          error: 'Replay execution timed out',
+          code: 'REPLAY_TIMEOUT',
+        });
+      }
+      if (res.destroyed || res.writableEnded || cancellation.disconnected) {
+        cancellation.complete();
+        return undefined;
+      }
       if (result === null
         || replaySignal?.aborted
         || lifecycle?.isShuttingDown?.()) {
+        cancellation.complete();
         return res.status(503).json({ error: 'Server shutting down' });
       }
-      return res.json(result);
+      const send = req.resourceAdmission?.sendGeneratedJson;
+      const response = typeof send === 'function'
+        ? send(res, result)
+        : res.json(result);
+      cancellation.complete();
+      return response;
     } catch (error) {
-      if (res.destroyed || res.writableEnded) return undefined;
+      if (cancellation.deadlineExpired) {
+        cancellation.complete();
+        if (res.destroyed || res.writableEnded) return undefined;
+        return res.status(504).json({
+          error: 'Replay execution timed out',
+          code: 'REPLAY_TIMEOUT',
+        });
+      }
+      if (res.destroyed || res.writableEnded || cancellation.disconnected) {
+        cancellation.complete();
+        return undefined;
+      }
+      cancellation.complete();
       if (isCancellation(error)) return res.status(503).json({ error: 'Server shutting down' });
       if (!(error instanceof ProductionReplayApplicationError)) return next(error);
 

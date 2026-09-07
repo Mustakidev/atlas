@@ -316,9 +316,7 @@ async function fetchCycle({ signal } = {}) {
     }
 
     const snapshot = result.snapshot;
-    history.add(snapshot);
-    const transition = candleEngine.ingest(snapshot);
-    await eventBus.emitAsync('market:snapshot', snapshot, transition);
+    await eventBus.emitAsync('market:snapshot', snapshot);
   } catch (err) {
     if (isCancellation(err, signal) || lifecycle.isShuttingDown()) return;
     if (isDurabilityError(err)) {
@@ -351,6 +349,8 @@ async function activateLivePath() {
         signalHistoryEngine,
         executionPipeline,
         commitCoordinator: coordinator,
+        candleEngine,
+        logger,
       });
     });
 

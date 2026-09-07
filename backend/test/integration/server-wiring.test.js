@@ -454,7 +454,7 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     assert.equal(first.probe.marketSnapshotEmitCount, 1);
     assert.equal(first.probe.marketSnapshotEmits.length, 1);
     assert.deepEqual(first.probe.marketSnapshotEmits[0], {
-      argumentCount: 2,
+      argumentCount: 1,
       price: 110,
       timestamp: '2024-01-01T10:00:00.000Z',
       oneHourOpenTime: null,
@@ -466,7 +466,7 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
       lifecycleOpenTime: null,
       activeOpenTime: Date.parse('2024-01-01T10:00:00.000Z'),
       finalizedOpenTimes: [],
-      sameLifecycle: false,
+       sameLifecycle: true,
     }]);
     assert.deepEqual(first.probe.order.slice(-3), ['analyzer', 'signalHistory', 'pipeline']);
     assert.equal(first.probe.simplePriceFetch, 1);
@@ -501,7 +501,7 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     assert.equal(second.probe.createExecutionPipeline, 1);
     assert.equal(second.probe.pipelineRun, 2);
     assert.equal(second.probe.marketSnapshotEmitCount, 2);
-    assert.deepEqual(second.probe.marketSnapshotEmits.map(event => event.argumentCount), [2, 2]);
+     assert.deepEqual(second.probe.marketSnapshotEmits.map(event => event.argumentCount), [1, 1]);
     assert.deepEqual(second.probe.pipelineCalls.map(call => call.argumentCount), [1, 1]);
     assert.equal(second.probe.simplePriceFetch, 2);
     assert.equal(second.probe.paperEvaluateTrades, 2);
@@ -523,10 +523,10 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     const third = await waitForCycle(port, probePath, 3);
     assert.equal(third.probe.pipelineRun, 3);
     assert.deepEqual(third.probe.marketSnapshotEmits[2], {
-      argumentCount: 2,
+      argumentCount: 1,
       price: 120,
       timestamp: '2024-01-01T11:00:00.000Z',
-      oneHourOpenTime: Date.parse('2024-01-01T10:00:00.000Z'),
+      oneHourOpenTime: null,
     });
     assert.deepEqual(third.probe.pipelineCalls[2], {
       argumentCount: 2,
@@ -535,7 +535,7 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
       lifecycleOpenTime: Date.parse('2024-01-01T10:00:00.000Z'),
       activeOpenTime: Date.parse('2024-01-01T11:00:00.000Z'),
       finalizedOpenTimes: [Date.parse('2024-01-01T10:00:00.000Z')],
-      sameLifecycle: true,
+       sameLifecycle: false,
     });
     assert.deepEqual(third.probe.order.slice(-3), ['analyzer', 'signalHistory', 'pipeline']);
 

@@ -227,3 +227,97 @@ test('settled and deregistered Replay is denied publication after authoritative 
     if (server.listening) await close(server);
   }
 });
+
+test('Replay deadline aborts the operation and returns the timeout contract', async () => {
+  const lifecycle = createLifecycleController({
+    logger: { info() {}, warn() {}, error() {}, system() {} },
+  });
+  lifecycle.markRunning();
+  let aborted = false;
+  const application = {
+    run(requestValue, { signal }) {
+      return new Promise((resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          aborted = true;
+          reject(createAbortError());
+        }, { once: true });
+      });
+    },
+  };
+  const app = express();
+  app.use(createProductionReplayRouter({
+    application,
+    logger: { error() {} },
+    lifecycle,
+    deadlineMs: 1,
+  }));
+  const server = http.createServer(app);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+
+  try {
+    const response = await request(server);
+    assert.equal(response.statusCode, 504);
+    assert.deepEqual(response.body, {
+      error: 'Replay execution timed out',
+      code: 'REPLAY_TIMEOUT',
+    });
+    assert.equal(aborted, true);
+  } finally {
+    await close(server);
+  }
+});
+
+test('Replay aborts on premature client disconnect without attempting a response', async () => {
+  const lifecycle = createLifecycleController({
+    logger: { info() {}, warn() {}, error() {}, system() {} },
+  });
+  lifecycle.markRunning();
+  let aborted = false;
+  let resolveAborted;
+  const abortedPromise = new Promise(resolve => { resolveAborted = resolve; });
+  let resolveStarted;
+  const started = new Promise(resolve => { resolveStarted = resolve; });
+  const application = {
+    run(requestValue, { signal }) {
+      resolveStarted();
+      return new Promise((resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          aborted = true;
+          resolveAborted();
+          reject(createAbortError());
+        }, { once: true });
+      });
+    },
+  };
+  const app = express();
+  app.use(createProductionReplayRouter({
+    application,
+    logger: { error() {} },
+    lifecycle,
+  }));
+  const server = http.createServer(app);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+
+  try {
+    const client = http.get({
+      host: '127.0.0.1',
+      port: server.address().port,
+      path: `/strategy/replay/v2?symbol=BTCUSDT&startTime=${START_TIME}&endTime=${END_TIME}`,
+    });
+    client.once('error', error => {
+      if (error.code !== 'ECONNRESET') throw error;
+    });
+    await started;
+    client.destroy();
+    await abortedPromise;
+    assert.equal(aborted, true);
+  } finally {
+    await close(server);
+  }
+});

@@ -495,3 +495,82 @@ test('coordinator-backed manual close failure does not persist a partial cross-d
   assert.equal(sequence, 0);
   assert.equal(coordinator.isDurabilityHealthy(), false);
 });
+
+test('Backtest and Analytics reject analytical candle limits above 1000', async () => {
+  const backtest = await dispatch('/backtest', { limit: '1001' }, {
+    backtestEngine: { run() { throw new Error('must not run'); } },
+    candleEngine: {
+      getAllTimeframes: () => ['1h'],
+      getCandles: () => [],
+      getActive: () => null,
+    },
+  });
+  const analytics = await dispatch('/analytics', { limit: '1001' }, {
+    analyticsEngine: { analyze() { throw new Error('must not run'); } },
+    candleEngine: {
+      getAllTimeframes: () => ['1h'],
+      getCandles: () => [],
+      getActive: () => null,
+    },
+  });
+
+  for (const result of [backtest, analytics]) {
+    assert.equal(result.statusCode, 400);
+    assert.deepEqual(result.body, {
+      error: 'Analytical candle limit exceeded',
+      code: 'ANALYTICAL_LIMIT_EXCEEDED',
+    });
+  }
+});
+
+test('manual close enforces bounded tradeId and reason fields before mutation', async () => {
+  let closeCalls = 0;
+  const overrides = {
+    liveRuntime: { getEffectiveState: () => 'READY' },
+    paperTradeEngine: {
+      close() {
+        closeCalls++;
+        return null;
+      },
+    },
+    advanceRiskEngine: { onTradeClosed() {} },
+  };
+  const longTradeId = await dispatchRequest('POST', '/paper-trades/close', {}, {
+    tradeId: 'x'.repeat(65),
+  }, overrides);
+  const longReason = await dispatchRequest('POST', '/paper-trades/close', {}, {
+    tradeId: 'PT-1',
+    reason: 'x'.repeat(257),
+  }, overrides);
+
+  assert.equal(longTradeId.statusCode, 400);
+  assert.equal(longReason.statusCode, 400);
+  assert.equal(closeCalls, 0);
+});
+
+test('HTTP queue-full mutations and committed reads fail closed with retry guidance', async () => {
+  let closeCalls = 0;
+  const queueFull = () => Promise.reject(Object.assign(new Error('full'), { code: 'STATE_QUEUE_FULL' }));
+  const mutation = await dispatchRequest('POST', '/paper-trades/close', {}, { tradeId: 'PT-1' }, {
+    liveRuntime: { getEffectiveState: () => 'READY' },
+    commitCoordinator: { runMutation: queueFull },
+    paperTradeEngine: {
+      close() {
+        closeCalls++;
+        return null;
+      },
+    },
+    advanceRiskEngine: { onTradeClosed() {} },
+  });
+  const read = await dispatch('/paper-trades', {}, {
+    liveRuntime: { getEffectiveState: () => 'READY' },
+    commitCoordinator: { readCommitted: queueFull },
+  });
+
+  for (const result of [mutation, read]) {
+    assert.equal(result.statusCode, 503);
+    assert.equal(result.body.code, 'STATE_QUEUE_FULL');
+  }
+  assert.equal(mutation.body.error, 'Live state resource capacity unavailable');
+  assert.equal(closeCalls, 0);
+});

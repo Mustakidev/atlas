@@ -15,7 +15,7 @@ function sanitizeQuery(req, res, next) {
   }
 
   if (q.limit !== undefined) {
-    q.limit = String(clampInt(q.limit, 1, 10000, 100));
+    q.limit = String(clampInt(q.limit, 1, 5000, 100));
   }
 
   const intParams = ['predictionCandles', 'warmupCandles', 'minSignalConfidence', 'period'];

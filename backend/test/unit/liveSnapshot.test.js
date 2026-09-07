@@ -3,7 +3,7 @@ const test = require('node:test');
 
 const { registerLiveSnapshotHandler } = require('../../src/core/liveSnapshot');
 
-function harness({ commitCoordinator, pipelineStatus = null } = {}) {
+function harness({ commitCoordinator, pipelineStatus = null, candleEngine, logger } = {}) {
   const calls = [];
   let handler;
   const history = {};
@@ -40,6 +40,8 @@ function harness({ commitCoordinator, pipelineStatus = null } = {}) {
     signalHistoryEngine,
     executionPipeline,
     commitCoordinator,
+    candleEngine,
+    logger,
   });
 
   return { calls, handler, registered, history, snapshot };
@@ -177,4 +179,31 @@ test('a completed fail-closed safety latch is not reclassified as an exception',
   });
 
   await state.handler(state.snapshot);
+});
+
+test('queue-full live snapshots skip before history and candle ingestion', async () => {
+  let historyAdds = 0;
+  let candleIngests = 0;
+  const state = harness({
+    commitCoordinator: {
+      runMutation() {
+        return Promise.reject(Object.assign(new Error('full'), { code: 'STATE_QUEUE_FULL' }));
+      },
+    },
+    candleEngine: {
+      ingest() {
+        candleIngests++;
+        return { finalized: {} };
+      },
+    },
+    logger: { warn() {} },
+  });
+  state.history.add = () => { historyAdds++; };
+
+  const result = await state.handler(state.snapshot);
+
+  assert.deepEqual(result, { status: 'SKIPPED', code: 'STATE_QUEUE_FULL' });
+  assert.equal(historyAdds, 0);
+  assert.equal(candleIngests, 0);
+  assert.deepEqual(state.calls.map(([name]) => name), ['register']);
 });
