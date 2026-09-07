@@ -38,6 +38,7 @@ const defaults = {
   RATE_LIMIT_LOGIN_MAX_REQUESTS: 10,
   RATE_LIMIT_LOGIN_WINDOW_MS: 900000,
   ATLAS_LIVE_STATE_FILE_PATH: undefined,
+  ATLAS_LOG_FILE_PATH: undefined,
 };
 
 const INTEGER_KEYS = new Set([
@@ -324,6 +325,12 @@ class ConfigManager {
     if (statePath !== undefined
       && (typeof statePath !== 'string' || statePath.trim() === '' || !path.isAbsolute(statePath))) {
       errors.push('ATLAS_LIVE_STATE_FILE_PATH must be a nonblank absolute path when set');
+    }
+
+    const logPath = this.config.ATLAS_LOG_FILE_PATH;
+    if (logPath !== undefined
+      && (typeof logPath !== 'string' || logPath.trim() === '' || !path.isAbsolute(logPath))) {
+      errors.push('ATLAS_LOG_FILE_PATH must be a nonblank absolute path when set');
     }
 
     const logLevel = this.config.LOG_LEVEL;
