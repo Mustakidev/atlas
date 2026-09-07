@@ -234,6 +234,8 @@ test('isolates engine exceptions and updates exact pipeline health state', () =>
     pipelineErrors: 1,
     lastPipelineError: { engine: 'ConfluenceEngine', timestamp: FIXED_ISO, error: 'confluence failed' },
     lastSuccessfulCycle: FIXED_ISO,
+    riskSyncFailure: false,
+    lastRunStatus: { status: 'COMPLETED', failure: null },
   });
   assert.deepEqual(harness.errors, [{ module: 'Pipeline', message: 'Engine failure: ConfluenceEngine', data: { error: 'confluence failed' } }]);
 });

@@ -126,12 +126,15 @@ function createRouter(deps) {
       cacheAge: deps.cache.getAge(),
       ...health,
       ...(pipelineHealth ? { pipeline: pipelineHealth } : {}),
-      ...(runtime ? {
-        liveStateReadiness: runtime.effectiveState,
-        durabilityHealthy: runtime.durabilityHealthy,
-        mutationSequence: runtime.mutationSequence,
-      } : {}),
-    };
+       ...(runtime ? {
+         liveStateReadiness: runtime.effectiveState,
+         durabilityHealthy: runtime.durabilityHealthy,
+         mutationSequence: runtime.mutationSequence,
+       } : {}),
+       riskStateHealthy: typeof advanceRiskEngine?.isRiskStateHealthy === 'function'
+         ? advanceRiskEngine.isRiskStateHealthy()
+         : null,
+     };
   };
 
   router.get('/status', (req, res, next) => {

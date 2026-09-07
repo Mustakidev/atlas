@@ -203,8 +203,8 @@ function responseAt(sequence, index) {
   return typeof selected === 'function' ? selected(index) : selected;
 }
 
-async function startFixture({ inspector, paper, secure = false }) {
-  const counters = { inspector: 0, paper: 0 };
+async function startFixture({ inspector, paper, readiness = null, status = null, secure = false }) {
+  const counters = { inspector: 0, paper: 0, readiness: 0, status: 0 };
   const requests = [];
   const sockets = new Set();
   const timers = new Set();
@@ -214,7 +214,11 @@ async function startFixture({ inspector, paper, secure = false }) {
       ? 'inspector'
       : req.method === 'GET' && req.url === '/api/paper-trades'
         ? 'paper'
-        : null;
+        : req.method === 'GET' && req.url === '/readyz'
+          ? 'readiness'
+          : req.method === 'GET' && req.url === '/api/status'
+            ? 'status'
+            : null;
 
     if (!endpoint) {
       res.statusCode = 404;
@@ -223,7 +227,23 @@ async function startFixture({ inspector, paper, secure = false }) {
     }
 
     const index = counters[endpoint]++;
-    const configured = responseAt(endpoint === 'inspector' ? inspector : paper, index);
+    const configured = responseAt({ inspector, paper, readiness, status }[endpoint] || [
+      endpoint === 'readiness'
+        ? jsonResponse({ status: 'ok', liveState: 'READY', durabilityHealthy: true })
+        : jsonResponse({
+          liveStateReadiness: 'READY',
+          durabilityHealthy: true,
+          riskStateHealthy: true,
+          mutationSequence: 0,
+          uptime: 100 + index,
+          pipeline: {
+            pipelineCycleCount: index + 1,
+            pipelineErrors: 0,
+            riskSyncFailure: false,
+            lastRunStatus: null,
+          },
+        }),
+    ], index);
     requests.push({
       endpoint,
       index,
@@ -333,6 +353,7 @@ async function runScenario(t, fixtureConfig, options = {}) {
     ATLAS_VERIFY_BASE_URL: fixture.url,
     ATLAS_VERIFY_OUTPUT_DIR: temporaryDirectory,
     ATLAS_VERIFY_API_KEY: VERIFY_API_KEY,
+    NODE_ENV: 'test',
     ATLAS_VERIFY_DURATION_MS: String(options.durationMs || VERIFY_DURATION_MS),
     ATLAS_VERIFY_INTERVAL_MS: String(options.intervalMs || VERIFY_INTERVAL_MS),
     ...(options.environment || {}),
@@ -419,6 +440,8 @@ function completedRun(run) {
   ], 'JSON top-level schema is unchanged');
   check(run, !Object.hasOwn(run.reports.json.verification, 'checks'), 'JSON has no checks field');
   check(run, !Object.hasOwn(run.reports.json.verification, 'allPass'), 'JSON has no allPass field');
+  check(run, run.reports.json.verification.acceptance && typeof run.reports.json.verification.acceptance.passed === 'boolean', 'JSON contains acceptance result');
+  check(run, Array.isArray(run.reports.json.verification.acceptance.checks), 'JSON contains machine-readable acceptance checks');
 }
 
 function checkMap(run) {
@@ -460,7 +483,7 @@ test('CLI environment overrides take precedence over CLI duration and interval a
     ],
     paper: validPaperSequence(),
   }, {
-    args: ['--duration', '1', '--interval', '1'],
+    args: ['--duration', '10', '--interval', '1'],
     environment: {
       ATLAS_VERIFY_DURATION_MS: '5000',
       ATLAS_VERIFY_INTERVAL_MS: '100',
@@ -477,7 +500,7 @@ test('CLI environment overrides take precedence over CLI duration and interval a
   check(run, run.fixture.requests.every(request => request.authenticated), 'Atlas requests carry the verifier API key');
   equal(run, run.reports.jsonFiles.length, 1, 'output directory override receives JSON');
   equal(run, run.reports.markdownFiles.length, 1, 'output directory override receives Markdown');
-  match(run, markdown, /Requested Duration \| 5000ms/, 'Markdown reports the effective duration override');
+  match(run, markdown, /Observation Duration Required \| 5000ms/, 'Markdown reports the effective duration override');
   match(run, markdown, /\*\*Poll Interval:\*\* 0\.1s/, 'Markdown reports the effective interval override');
 });
 
@@ -493,6 +516,7 @@ test('CLI HTTPS run uses the secure fixture and preserves all verification contr
     paper: validPaperSequence(),
   }, {
     durationMs: 5000,
+    intervalMs: 200,
     assertCleanup: true,
     environment: { NODE_TLS_REJECT_UNAUTHORIZED: '0' },
   });
@@ -536,10 +560,7 @@ test('CLI classifies HTTPS invalid JSON as a contract failure', async t => {
   const { json } = run.reports;
   equal(run, run.result.code, 1, 'HTTPS invalid JSON exits nonzero');
   equal(run, run.result.signal, null, 'HTTPS invalid JSON exits without a signal');
-  assertFirstFailure(run, 'inspectorContract', /JSON parse error/, {
-    firstLabel: 'https-invalid-json',
-    laterLabel: 'https-invalid-json-later',
-  });
+  assertFirstFailure(run, 'inspectorContract', /JSON parse error/);
   equal(run, json.verification.errors.inspectorEndpoint.count, 0, 'HTTPS invalid JSON is not an endpoint failure');
   check(run, json.verification.polling.successfulPaperPolls > 0, 'HTTPS paper processing continues after invalid JSON');
   equal(run, process.env.NODE_TLS_REJECT_UNAUTHORIZED, parentTlsSetting, 'TLS override remains scoped to the child process');
@@ -581,6 +602,29 @@ for (const invalidCase of INVALID_OVERRIDE_CASES) {
     equal(run, run.reports.jsonFiles.length, 0, 'invalid configuration creates no JSON report');
     equal(run, run.reports.markdownFiles.length, 0, 'invalid configuration creates no Markdown report');
     equal(run, run.reports.entries.length, 0, 'invalid configuration leaves the temporary directory empty');
+  });
+}
+
+const INVALID_ARGUMENT_CASES = [
+  { args: ['--duration', '9'], pattern: /--duration.*between 10 and 1440/ },
+  { args: ['--duration', '1441'], pattern: /--duration.*between 10 and 1440/ },
+  { args: ['--duration', '10.5'], pattern: /--duration.*whole minutes/ },
+  { args: ['--interval', '0'], pattern: /--interval.*between 1 and 30/ },
+  { args: ['--interval', '31'], pattern: /--interval.*between 1 and 30/ },
+  { args: ['--interval', '1.5'], pattern: /--interval.*whole seconds/ },
+];
+
+for (const invalidCase of INVALID_ARGUMENT_CASES) {
+  test(`CLI rejects invalid arguments ${invalidCase.args.join(' ')}`, async t => {
+    const run = await runScenario(t, {
+      inspector: [jsonResponse(canonicalInspector(1), { label: 'not-contacted' })],
+      paper: validPaperSequence(),
+    }, { args: invalidCase.args });
+
+    equal(run, run.result.code, 1, 'invalid argument exits nonzero');
+    match(run, `${run.stdout}\n${run.stderr}`, invalidCase.pattern, 'argument error explains the bound');
+    equal(run, run.fixture.requests.length, 0, 'invalid argument makes no requests');
+    equal(run, run.reports.entries.length, 0, 'invalid argument creates no reports');
   });
 }
 
@@ -644,12 +688,12 @@ test('CLI passing run writes reports and preserves diagnostic gap telemetry', as
   equal(run, checks['Gate coverage contract'].pass, true, 'gate coverage passes');
   equal(run, checks['Source cycle progressed'].pass, true, 'source progress passes');
   equal(run, checks['Source cycle continuity'].pass, true, 'source continuity passes');
-  match(run, markdown, /Missing Source Cycle Count \(diagnostic only\) \| 1/, 'Markdown reports the exact gap count');
-  match(run, markdown, /Missing Source Cycle Ranges \(diagnostic only\).*"from":11.*"to":11/, 'Markdown reports the compact gap range');
-  match(run, markdown, /Polling Drift \(diagnostic only\)/, 'Markdown labels drift diagnostic-only');
-  match(run, markdown, /Maximum Observed Source Stall \(diagnostic only\)/, 'Markdown labels maximum stall diagnostic-only');
-  match(run, markdown, /Final Source Stall \(diagnostic only\)/, 'Markdown labels final stall diagnostic-only');
-  match(run, markdown, /Requested runtime completed \| ✅ PASS/, 'Markdown reports runtime completion');
+  match(run, markdown, /Missing Source Cycle Count \(diagnostic\) \| 1/, 'Markdown reports the exact gap count');
+  match(run, markdown, /Missing Source Cycle Ranges \(diagnostic\).*"from":11.*"to":11/, 'Markdown reports the compact gap range');
+  match(run, markdown, /Polling Drift \(diagnostic\)/, 'Markdown labels drift diagnostic-only');
+  match(run, markdown, /Maximum Observed Source Stall \|/, 'Markdown reports maximum stall');
+  match(run, markdown, /Final Source Stall \|/, 'Markdown reports final stall');
+  match(run, markdown, /Observation duration completed \| ✅ PASS/, 'Markdown reports runtime completion');
   match(run, markdown, /Gate coverage contract \| ✅ PASS/, 'Markdown reports gate coverage');
 });
 
@@ -669,14 +713,14 @@ test('CLI accepts unavailable startup and records later available progress', asy
   const { json } = run.reports;
   equal(run, run.result.code, 0, 'startup transition exits zero');
   equal(run, run.fixture.requests[0].label, 'startup-unavailable', 'startup unavailable response is observed');
-  equal(run, json.verification.polling.unavailableInspectorPolls, 0, 'startup unavailability is excluded from runtime polling metrics');
+  equal(run, json.verification.polling.unavailableInspectorPolls, 1, 'startup unavailability is recorded');
   check(run, json.verification.source.uniqueSourceCycles >= 2, 'later available responses establish progress');
   equal(run, json.verification.source.firstSourceCycle, 1, 'startup unavailable response is not a source cycle');
   equal(run, json.verification.runtime.runCompleted, true, 'transition run completes');
   equal(run, checkMap(run).evaluation.allPass, true, 'transition run checks pass');
 });
 
-test('CLI records inspector schema failure while continuing paper processing', async t => {
+test('CLI fails immediately on inspector schema failure while preserving paper processing', async t => {
   const run = await runScenario(t, {
     inspector: [
       jsonResponse(canonicalInspector(1), { label: 'startup-valid' }),
@@ -693,12 +737,15 @@ test('CLI records inspector schema failure while continuing paper processing', a
   completedRun(run);
   const { json, markdown } = run.reports;
   equal(run, run.result.code, 1, 'inspector schema failure exits nonzero');
-  assertFirstFailure(run, 'inspectorContract', /missing gates/, {
-    firstLabel: 'inspector-malformed',
-    laterLabel: 'inspector-malformed-later',
-  });
-  check(run, json.verification.errors.inspectorContract.count > 1, 'later inspector contract failures are also counted');
+  assertFirstFailure(run, 'inspectorContract', /missing gates/);
+  equal(run, json.verification.errors.inspectorContract.count, 1, 'contract failure terminates polling immediately');
   equal(run, json.verification.errors.inspectorEndpoint.count, 0, 'inspector schema failure is not an endpoint failure');
+  equal(run, json.verification.polling.endpointStats.inspector.successes, 0, 'malformed inspector response does not count as an observation endpoint success');
+  equal(run, json.verification.polling.endpointStats.inspector.failures, 1, 'malformed inspector response is excluded from endpoint success accounting');
+  equal(run, json.verification.acceptance.passed, false, 'hard inspector contract failure makes acceptance false');
+  equal(run, json.verification.acceptance.state, 'FAILED', 'hard inspector contract failure makes acceptance terminally failed');
+  match(run, markdown, /\*\*Acceptance State:\*\* FAILED/, 'Markdown reports terminal hard failure state');
+  match(run, markdown, /\*\*Acceptance Passed:\*\* false/, 'Markdown reports failed acceptance');
   check(run, json.verification.polling.successfulPaperPolls > 0, 'paper processing continues');
   equal(run, json.verification.errors.paperContract.count, 0, 'paper contract remains healthy');
   const { checks } = checkMap(run);
@@ -707,7 +754,7 @@ test('CLI records inspector schema failure while continuing paper processing', a
   match(run, markdown, /Inspector schema integrity \| ❌ FAIL/, 'Markdown reports inspector schema failure');
 });
 
-test('CLI records paper contract failure while preserving inspector metrics', async t => {
+test('CLI fails immediately on paper contract failure while preserving inspector metrics', async t => {
   const run = await runScenario(t, {
     inspector: [
       jsonResponse(canonicalInspector(1), { label: 'startup-valid' }),
@@ -726,13 +773,10 @@ test('CLI records paper contract failure while preserving inspector metrics', as
   completedRun(run);
   const { json, markdown } = run.reports;
   equal(run, run.result.code, 1, 'paper contract failure exits nonzero');
-  assertFirstFailure(run, 'paperContract', /must contain open and closed arrays/, {
-    firstLabel: 'paper-malformed',
-    laterLabel: 'paper-malformed-later',
-  });
-  check(run, json.verification.errors.paperContract.count > 1, 'later paper contract failures are also counted');
+  assertFirstFailure(run, 'paperContract', /must contain open and closed arrays/);
+  equal(run, json.verification.errors.paperContract.count, 1, 'contract failure terminates polling immediately');
   equal(run, json.verification.errors.paperEndpoint.count, 0, 'paper schema failure is not an endpoint failure');
-  check(run, json.verification.source.uniqueSourceCycles >= 2, 'inspector source metrics remain intact');
+  check(run, json.verification.source.uniqueSourceCycles >= 1, 'inspector source metrics remain intact');
   equal(run, json.verification.errors.inspectorContract.count, 0, 'inspector contract remains healthy');
   const { checks } = checkMap(run);
   equal(run, checks['Inspector schema integrity'].pass, true, 'inspector schema check passes');
@@ -768,28 +812,25 @@ for (const endpoint of ['inspector', 'paper']) {
     equal(run, run.result.code, 1, `${endpoint} invalid JSON exits nonzero`);
     const contractCategory = `${endpoint}Contract`;
     const endpointCategory = `${endpoint}Endpoint`;
-    assertFirstFailure(run, contractCategory, /JSON parse error: Expected property name/, {
-      firstLabel: `${endpoint}-invalid-json`,
-      laterLabel: `${endpoint}-invalid-json-later`,
-    });
-    check(run, json.verification.errors[contractCategory].count > 1, `${endpoint} later invalid JSON failures are also counted`);
+    assertFirstFailure(run, contractCategory, /JSON parse error: Expected property name/);
+    equal(run, json.verification.errors[contractCategory].count, 1, `${endpoint} contract failure terminates polling immediately`);
     equal(run, json.verification.errors[endpointCategory].count, 0, `${endpoint} invalid JSON is not an endpoint failure`);
     const opposite = endpoint === 'inspector' ? 'paper' : 'inspector';
     check(run, json.verification.polling[opposite === 'paper' ? 'successfulPaperPolls' : 'validInspectorResponses'] > 0, `${opposite} continues processing`);
     check(run, json.verification.errors[contractCategory].firstMessage.startsWith('JSON parse error'), 'first parsing failure is retained');
     check(run, Number.isFinite(json.verification.errors[contractCategory].firstTimestamp), 'first parsing failure timestamp is retained');
-    match(run, markdown, new RegExp(`${endpoint}Contract \\| 2 \\| JSON parse error`), `${endpoint} parsing failure appears in Markdown`);
+    match(run, markdown, new RegExp(`${endpoint}Contract \\| 1 \\| JSON parse error`), `${endpoint} parsing failure appears in Markdown`);
   });
 }
 
-test('CLI isolates an inspector endpoint failure from paper processing', async t => {
+test('CLI allows a transient inspector endpoint failure within the availability budget', async t => {
   const run = await runScenario(t, {
     inspector: [
       jsonResponse(canonicalInspector(1), { label: 'startup-valid' }),
       endpointFailure(503, { label: 'inspector-http-503' }),
       endpointFailure(502, { label: 'inspector-http-502-later' }),
       jsonResponse(canonicalInspector(1), { label: 'runtime-cycle-1' }),
-      jsonResponse(canonicalInspector(2), { label: 'runtime-cycle-2' }),
+      jsonResponse(rejectedInspector(2), { label: 'runtime-cycle-2' }),
     ],
     paper: validPaperSequence(),
   }, {
@@ -798,7 +839,7 @@ test('CLI isolates an inspector endpoint failure from paper processing', async t
 
   completedRun(run);
   const { json, markdown } = run.reports;
-  equal(run, run.result.code, 1, 'endpoint failure exits nonzero');
+  equal(run, run.result.code, 0, 'transient endpoint failure remains acceptance-compatible');
   assertFirstFailure(run, 'inspectorEndpoint', /HTTP 503/, {
     firstLabel: 'inspector-http-503',
     laterLabel: 'inspector-http-502-later',
@@ -807,9 +848,10 @@ test('CLI isolates an inspector endpoint failure from paper processing', async t
   equal(run, json.verification.errors.inspectorContract.count, 0, 'HTTP failure is not an inspector contract failure');
   check(run, json.verification.polling.successfulPaperPolls > 0, 'paper endpoint continues processing');
   equal(run, json.verification.errors.paperEndpoint.count, 0, 'paper endpoint remains healthy');
+  equal(run, json.verification.acceptance.passed, true, 'transient endpoint failure leaves final acceptance passing');
   const { checks } = checkMap(run);
-  equal(run, checks['Inspector endpoint integrity'].pass, false, 'inspector endpoint check fails');
-  equal(run, checks['Paper endpoint integrity'].pass, true, 'paper endpoint check passes');
+  equal(run, checks['inspector endpoint availability'].pass, true, 'inspector endpoint ratio remains passing');
+  equal(run, checks['paper endpoint availability'].pass, true, 'paper endpoint check passes');
   match(run, markdown, /inspectorEndpoint \| 2 \| HTTP 503/, 'Markdown reports the endpoint failure');
 });
 
@@ -834,7 +876,7 @@ test('CLI fails source progress when one cycle is repeatedly observed', async t 
   match(run, markdown, /Source cycle progressed \| ❌ FAIL/, 'Markdown reports source progress failure');
 });
 
-test('CLI records source regression without losing later valid progress', async t => {
+test('CLI fails immediately on source regression', async t => {
   const run = await runScenario(t, {
     inspector: [
       jsonResponse(canonicalInspector(8), { label: 'startup-cycle-8' }),
@@ -856,9 +898,9 @@ test('CLI records source regression without losing later valid progress', async 
     cycle: 3,
     observedAt: json.verification.source.sourceCycleRegressionDetails[0].observedAt,
   }, 'regression details retain the previous and observed cycles');
-  check(run, json.verification.source.lastSourceCycle > json.verification.source.sourceCycleRegressionDetails[0].previousCycle, 'later valid progress advances beyond the pre-regression cycle');
+  equal(run, json.verification.source.lastSourceCycle, 8, 'regression does not replace the prior source baseline');
   const { checks } = checkMap(run);
-  equal(run, checks['Source cycle progressed'].pass, true, 'source progress passes after later progress');
+  equal(run, checks['Source cycle progressed'].pass, false, 'source progress does not erase a regression failure');
   equal(run, checks['Source cycle continuity'].pass, false, 'source continuity fails after regression');
   match(run, markdown, /Source cycle continuity \| ❌ FAIL/, 'Markdown reports source continuity failure');
 });
