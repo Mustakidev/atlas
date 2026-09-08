@@ -19,7 +19,7 @@ Thumbs.db
 .idea/
 
 # Verification reports (generated)
-verification-reports/*.json
+verification-reports/
 
 # Runtime durable state (generated)
 backend/runtime-data/
