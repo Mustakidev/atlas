@@ -3,6 +3,10 @@
   "version": "0.5.0",
   "description": "Atlas v0.5 - BTC Market Dashboard Backend",
   "main": "server.js",
+  "engines": {
+    "node": ">=22.23.1 <23",
+    "npm": ">=10.9.8 <11"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
