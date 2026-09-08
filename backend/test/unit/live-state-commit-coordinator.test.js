@@ -100,6 +100,27 @@ function harness({ write } = {}) {
   };
 }
 
+function auditLogger({ failIntent = false, failCompletion = false } = {}) {
+  const events = [];
+  let health = 'HEALTHY';
+  return {
+    events,
+    getHealth: () => health,
+    async record(event) {
+      events.push(event);
+      if (event.event.endsWith('_INTENT') && failIntent) {
+        health = 'UNSAFE';
+        throw Object.assign(new Error('audit intent failed'), { code: 'LOG_FSYNC_FAILED' });
+      }
+      if (event.event.endsWith('_COMMITTED') && failCompletion) {
+        health = 'UNSAFE';
+        throw Object.assign(new Error('audit completion failed'), { code: 'LOG_FSYNC_FAILED' });
+      }
+      return { status: 'DURABLE_CRITICAL_CERTIFIED', record: event };
+    },
+  };
+}
+
 test('starts healthy and serializes queued mutations in invocation order', async () => {
   const state = harness();
   const coordinator = createLiveStateCommitCoordinator(state);
@@ -413,6 +434,105 @@ test('commits real overflow closure, risk sync, and replacement as one write', a
   assert.equal(writes[0].paperTrading.closedTrades.length, 1);
   assert.equal(writes[0].advanceRisk.dailyPnL, 0);
   assert.equal(first.status, 'OPEN');
+});
+
+test('audited mutations certify intent before callback and completion after state commit', async () => {
+  const state = harness();
+  const audit = auditLogger();
+  const order = [];
+  const coordinator = createLiveStateCommitCoordinator({ ...state, logger: audit });
+
+  await coordinator.runMutation({
+    name: 'audited-close',
+    audit: {
+      intent: {
+        event: 'PAPER_TRADE_CLOSE_INTENT',
+        source: 'test',
+        category: 'audit',
+        message: 'intent',
+        context: { tradeId: 'PT-1', reason: 'Manual', operation: 'audited-close' },
+      },
+      completion: ({ mutationSequence }) => ({
+        event: 'PAPER_TRADE_CLOSE_COMMITTED',
+        source: 'test',
+        category: 'audit',
+        message: 'completion',
+        context: {
+          tradeId: 'PT-1',
+          reason: 'Manual',
+          operation: 'audited-close',
+          outcome: 'CLOSED',
+          pnl: 5,
+          mutationSequence,
+        },
+      }),
+    },
+    mutate: () => {
+      order.push('mutation');
+      state.domain = { value: 1 };
+      order.push('state');
+    },
+  });
+
+  assert.deepEqual(audit.events.map(event => event.event), [
+    'PAPER_TRADE_CLOSE_INTENT',
+    'PAPER_TRADE_CLOSE_COMMITTED',
+  ]);
+  assert.equal(audit.events[0].correlationId, audit.events[1].correlationId);
+  assert.deepEqual(order, ['mutation', 'state']);
+  assert.equal(audit.events[1].context.mutationSequence, 1);
+});
+
+test('audit intent failure prevents the domain callback', async () => {
+  const state = harness();
+  const audit = auditLogger({ failIntent: true });
+  const coordinator = createLiveStateCommitCoordinator({ ...state, logger: audit });
+  let called = false;
+
+  await assert.rejects(
+    coordinator.runMutation({
+      name: 'audited-intent-failure',
+      audit: {
+        intent: {
+          event: 'PAPER_TRADE_CLOSE_INTENT',
+          source: 'test',
+          category: 'audit',
+          message: 'intent',
+          context: { tradeId: 'PT-1', reason: 'Manual', operation: 'audited-intent-failure' },
+        },
+        completion: { event: 'PAPER_TRADE_CLOSE_COMMITTED', source: 'test', category: 'audit', message: 'completion', context: {} },
+      },
+      mutate: () => { called = true; },
+    }),
+    error => error.code === 'AUDIT_INTENT_FAILED',
+  );
+  assert.equal(called, false);
+  assert.equal(state.writes.length, 0);
+});
+
+test('audit completion failure leaves committed state and gates later audited work', async () => {
+  const state = harness();
+  const audit = auditLogger({ failCompletion: true });
+  const coordinator = createLiveStateCommitCoordinator({ ...state, logger: audit });
+  const descriptor = {
+    intent: { event: 'PAPER_TRADE_CLOSE_INTENT', source: 'test', category: 'audit', message: 'intent', context: { tradeId: 'PT-1', reason: 'Manual', operation: 'completion-failure' } },
+    completion: { event: 'PAPER_TRADE_CLOSE_COMMITTED', source: 'test', category: 'audit', message: 'completion', context: { tradeId: 'PT-1', reason: 'Manual', operation: 'completion-failure', outcome: 'CLOSED', pnl: 1, mutationSequence: 1 } },
+  };
+
+  await assert.rejects(
+    coordinator.runMutation({ name: 'completion-failure', audit: descriptor, mutate: () => { state.domain = { value: 3 }; } }),
+    error => error.code === 'AUDIT_COMPLETION_FAILED',
+  );
+  assert.equal(state.writes.length, 1);
+  assert.equal(state.sequence, 1);
+  assert.equal(coordinator.isDurabilityHealthy(), true);
+
+  let called = false;
+  await assert.rejects(
+    coordinator.runMutation({ name: 'later-audited', audit: descriptor, mutate: () => { called = true; } }),
+    error => error.code === 'AUDIT_UNSAFE',
+  );
+  assert.equal(called, false);
 });
 
 test('PH-4E is active in the current server composition', () => {

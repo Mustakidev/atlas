@@ -1,6 +1,12 @@
 const express = require('express');
 const { sanitizeQuery } = require('../middleware/validate');
 const { getFinalizedCandles } = require('../engine/candleUtils');
+const {
+  AUDIT_COMPLETION_FAILED,
+  AUDIT_INTENT_FAILED,
+  AUDIT_QUEUE_FULL,
+  AUDIT_UNSAFE,
+} = require('../state/liveStateCommitCoordinator');
 
 function createRouter(deps) {
   const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision, commitCoordinator, liveRuntime, initializeLiveState, getCommitCoordinator } = deps;
@@ -12,8 +18,20 @@ function createRouter(deps) {
   const isDurabilityError = error => error?.code === 'LIVE_STATE_DURABILITY_UNAVAILABLE'
     || error?.code === 'LIVE_STATE_MUTATION_UNCERTIFIED';
 
+  const isAuditError = error => [
+    AUDIT_UNSAFE,
+    AUDIT_QUEUE_FULL,
+    AUDIT_INTENT_FAILED,
+    AUDIT_COMPLETION_FAILED,
+  ].includes(error?.code);
+
   const respondDurabilityUnavailable = res => res.status(503).json({
     error: 'Live state durability unavailable',
+  });
+
+  const respondAuditUnavailable = (res, code = AUDIT_UNSAFE) => res.status(503).json({
+    error: 'Audit durability unavailable',
+    code,
   });
 
   const respondQueueFull = res => {
@@ -34,6 +52,7 @@ function createRouter(deps) {
   function handleCoordinatorError(error, res, next) {
     if (isDurabilityError(error)) return respondDurabilityUnavailable(res);
     if (error?.code === 'STATE_QUEUE_FULL') return respondQueueFull(res);
+    if (isAuditError(error)) return respondAuditUnavailable(res, error.code);
     return next(error);
   }
 
@@ -125,17 +144,24 @@ function createRouter(deps) {
   });
 
   router.get('/logs', (req, res, next) => {
-    const limit = parseInt(req.query.limit) || 50;
+    const parsedLimit = Number(req.query.limit);
+    const limit = Number.isSafeInteger(parsedLimit)
+      ? Math.max(1, Math.min(100, parsedLimit))
+      : 50;
     const level = req.query.level || null;
-    return committedRead(res, next, () => logger.getLogs(limit, level), logs => {
-      res.json({ count: logs.length, logs });
-    });
+    try {
+      const logs = logger.getLogs(limit, level);
+      return res.json({ count: logs.length, logs });
+    } catch (error) {
+      return next(error);
+    }
   });
 
   const readStatus = () => {
     const health = apiManager.getHealth();
     const pipelineHealth = deps.getPipelineHealth ? deps.getPipelineHealth() : null;
     const runtime = runtimeStatus();
+    const auditHealth = typeof logger.getHealth === 'function' ? logger.getHealth() : null;
     return {
       version: '1.0.0',
       uptime: process.uptime(),
@@ -148,10 +174,14 @@ function createRouter(deps) {
          durabilityHealthy: runtime.durabilityHealthy,
          mutationSequence: runtime.mutationSequence,
        } : {}),
-       riskStateHealthy: typeof advanceRiskEngine?.isRiskStateHealthy === 'function'
-         ? advanceRiskEngine.isRiskStateHealthy()
-         : null,
-     };
+        riskStateHealthy: typeof advanceRiskEngine?.isRiskStateHealthy === 'function'
+          ? advanceRiskEngine.isRiskStateHealthy()
+          : null,
+        ...(auditHealth ? {
+          auditState: auditHealth,
+          auditStateHealthy: auditHealth === 'HEALTHY',
+        } : {}),
+      };
   };
 
   router.get('/status', (req, res, next) => {
@@ -854,7 +884,37 @@ function createRouter(deps) {
     };
 
     if (!coordinator) return publish(closeMutation());
-    return coordinator.runMutation({ name: 'manual-close', mutate: closeMutation })
+    return coordinator.runMutation({
+      name: 'manual-close',
+      mutate: closeMutation,
+      audit: {
+        intent: {
+          event: 'PAPER_TRADE_CLOSE_INTENT',
+          source: 'PaperTradeRoutes',
+          category: 'audit',
+          message: 'Manual paper-trade close intent',
+          context: {
+            tradeId,
+            reason: normalizedReason,
+            operation: 'manual-close',
+          },
+        },
+        completion: ({ result, mutationSequence }) => ({
+          event: 'PAPER_TRADE_CLOSE_COMMITTED',
+          source: 'PaperTradeRoutes',
+          category: 'audit',
+          message: 'Manual paper-trade close committed',
+          context: {
+            tradeId,
+            reason: normalizedReason,
+            operation: 'manual-close',
+            outcome: result?.closed?.status || 'CLOSED',
+            pnl: result?.closed?.pnl,
+            mutationSequence,
+          },
+        }),
+      },
+    })
       .then(publish)
       .catch(error => handleCoordinatorError(error, res, next));
   });

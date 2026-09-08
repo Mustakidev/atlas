@@ -226,8 +226,11 @@ function createLifecycleController(options = {}) {
     });
   }
 
-  function startLiveCycle(factory) {
-    if (typeof factory !== 'function' || !canStartWork(WORK_KINDS.LIVE_CYCLE)) return null;
+  function startLiveCycle(factory, options = {}) {
+    const allowStarting = options?.allowStarting === true;
+    if (typeof factory !== 'function'
+      || liveCycleTask !== null
+      || !(state === STATES.RUNNING || (allowStarting && state === STATES.STARTING))) return null;
     return createTask(WORK_KINDS.LIVE_CYCLE, factory, task => {
       liveCycleTask = task;
     });
@@ -240,10 +243,11 @@ function createLifecycleController(options = {}) {
     });
   }
 
-  function startLiveScheduler(intervalMs, factory) {
+  function startLiveScheduler(intervalMs, factory, options = {}) {
+    const allowStarting = options?.allowStarting === true;
     if (!Number.isFinite(intervalMs) || intervalMs <= 0
       || typeof factory !== 'function'
-      || state !== STATES.RUNNING
+      || !(state === STATES.RUNNING || (allowStarting && state === STATES.STARTING))
       || schedulerHandle !== null) {
       return false;
     }
@@ -383,6 +387,14 @@ function createLifecycleController(options = {}) {
     return true;
   }
 
+  function markFailed(reason = 'failed') {
+    if ([STATES.FAILED, STATES.SHUTTING_DOWN, STATES.STOPPED].includes(state)) return false;
+    transition(STATES.FAILED, reason);
+    stopScheduler();
+    abortTrackedWork();
+    return true;
+  }
+
   function runResourceCleanup(reason) {
     if (resourceCleanupPromise) return resourceCleanupPromise;
     resourceCleanupPromise = Promise.resolve().then(() => resourceCleanupHook({ reason }));
@@ -436,7 +448,6 @@ function createLifecycleController(options = {}) {
   function shutdown(reason = 'explicit') {
     if (shutdownPromise) return shutdownPromise;
     if (state === STATES.STOPPED) return Promise.resolve(Object.freeze({ state, reason: stateReason }));
-    if (state === STATES.FAILED) return Promise.reject(new Error('Lifecycle is already FAILED'));
 
     transition(STATES.SHUTTING_DOWN, reason);
     shutdownPromise = (async () => {
@@ -515,7 +526,16 @@ function createLifecycleController(options = {}) {
         forceTerminate(`second ${signal}`);
         return;
       }
-      if (state === STATES.FAILED || state === STATES.STOPPED) {
+      if (state === STATES.FAILED) {
+        if (fatalSeen || shutdownPromise) {
+          forceTerminate(`${signal} after ${state}`);
+          return;
+        }
+        const pending = shutdown(signal);
+        pending.catch(error => safeLog('error', 'Graceful shutdown failed', { error: error.message }));
+        return;
+      }
+      if (state === STATES.STOPPED) {
         forceTerminate(`${signal} after ${state}`);
         return;
       }
@@ -563,6 +583,7 @@ function createLifecycleController(options = {}) {
     isShuttingDown,
     canStartWork,
     attachServer,
+    markFailed,
     markRunning,
     startBootstrap,
     startLiveCycle,

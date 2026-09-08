@@ -474,6 +474,10 @@ test('coordinator-backed manual close failure does not persist a partial cross-d
   };
   const coordinator = createLiveStateCommitCoordinator({
     aggregate,
+    logger: {
+      getHealth: () => 'HEALTHY',
+      async record() { return { status: 'DURABLE_CRITICAL_CERTIFIED' }; },
+    },
     stateStore: { write: async () => { writes++; return { status: 'WRITTEN' }; } },
   });
 

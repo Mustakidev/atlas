@@ -1,8 +1,13 @@
 const { isDeepStrictEqual } = require('node:util');
+const crypto = require('node:crypto');
 
 const DURABILITY_UNAVAILABLE = 'LIVE_STATE_DURABILITY_UNAVAILABLE';
 const MUTATION_UNCERTIFIED = 'LIVE_STATE_MUTATION_UNCERTIFIED';
 const STATE_QUEUE_FULL = 'STATE_QUEUE_FULL';
+const AUDIT_UNSAFE = 'AUDIT_UNSAFE';
+const AUDIT_QUEUE_FULL = 'AUDIT_QUEUE_FULL';
+const AUDIT_INTENT_FAILED = 'AUDIT_INTENT_FAILED';
+const AUDIT_COMPLETION_FAILED = 'AUDIT_COMPLETION_FAILED';
 const MAX_QUEUE_DEPTH = 5;
 
 class LiveStateCommitError extends Error {
@@ -45,6 +50,63 @@ function isThenable(value) {
     && typeof value.then === 'function';
 }
 
+function auditFailureCode(error, phase) {
+  if (error?.code === 'LOG_QUEUE_FULL') return AUDIT_QUEUE_FULL;
+  if (error?.code === 'LOG_UNSAFE') return AUDIT_UNSAFE;
+  return phase === 'intent' ? AUDIT_INTENT_FAILED : AUDIT_COMPLETION_FAILED;
+}
+
+function auditUnavailable(operation, phase, cause = null) {
+  return new LiveStateCommitError(
+    AUDIT_UNSAFE,
+    'Audit durability is unavailable',
+    { cause, operation, phase },
+  );
+}
+
+function buildAuditEvent(descriptor, phase, details, correlationId) {
+  const builder = descriptor?.[phase];
+  const input = typeof builder === 'function' ? builder(details) : builder;
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new TypeError(`Audit ${phase} descriptor must produce an object`);
+  }
+  return {
+    ...input,
+    durability: 'DURABLE_CRITICAL',
+    correlationId,
+  };
+}
+
+async function certifyAudit(logger, eventInput, operation, phase) {
+  if (!logger || typeof logger.record !== 'function') {
+    throw auditUnavailable(operation, phase);
+  }
+  if (typeof logger.getHealth === 'function' && logger.getHealth() === 'UNSAFE') {
+    throw auditUnavailable(operation, phase);
+  }
+
+  let result;
+  try {
+    result = await logger.record(eventInput);
+  } catch (error) {
+    const code = auditFailureCode(error, phase);
+    throw new LiveStateCommitError(code, 'Audit certification failed', {
+      cause: error,
+      operation,
+      phase,
+    });
+  }
+  if (result?.status !== 'DURABLE_CRITICAL_CERTIFIED') {
+    const code = auditFailureCode(result, phase);
+    throw new LiveStateCommitError(code, 'Audit certification was not completed', {
+      cause: result?.code ? Object.assign(new Error('Audit certification was not completed'), { code: result.code }) : null,
+      operation,
+      phase,
+    });
+  }
+  return result;
+}
+
 function candidateContext(candidate) {
   const nowMs = Date.parse(candidate.savedAt);
   if (!Number.isFinite(nowMs)) throw new TypeError('Candidate snapshot savedAt must be a valid timestamp');
@@ -55,7 +117,7 @@ function candidateContext(candidate) {
   };
 }
 
-function createLiveStateCommitCoordinator({ aggregate, stateStore } = {}) {
+function createLiveStateCommitCoordinator({ aggregate, stateStore, logger = null } = {}) {
   assertDependencies(aggregate, stateStore);
 
   let durabilityHealthy = true;
@@ -79,6 +141,22 @@ function createLiveStateCommitCoordinator({ aggregate, stateStore } = {}) {
 
   function queueFull(operation, kind) {
     commitQueueRejects++;
+    if (logger?.record) {
+      void Promise.resolve().then(() => logger.record({
+        event: 'STATE_QUEUE_FULL',
+        source: 'LiveStateCommitCoordinator',
+        category: 'operational',
+        durability: 'DURABLE_ASYNC',
+        level: 'WARNING',
+        message: 'Live-state commit capacity is full',
+        context: {
+          code: STATE_QUEUE_FULL,
+          operation: typeof operation === 'string' ? operation : 'unknown',
+          queueDepth,
+          capacity: MAX_QUEUE_DEPTH,
+        },
+      })).catch(() => {});
+    }
     return new LiveStateCommitError(
       STATE_QUEUE_FULL,
       'Live state commit capacity is full',
@@ -105,10 +183,28 @@ function createLiveStateCommitCoordinator({ aggregate, stateStore } = {}) {
     return operation;
   }
 
-  function runMutation({ name = 'mutation', mutate } = {}) {
+  function runMutation({ name = 'mutation', mutate, audit = null } = {}) {
     if (typeof mutate !== 'function') throw new TypeError('mutate must be a function');
 
     return enqueue(name, 'mutation', async () => {
+      const correlationId = audit ? crypto.randomUUID() : null;
+      if (audit) {
+        let intent;
+        try {
+          intent = buildAuditEvent(audit, 'intent', {
+            operation: name,
+            mutationSequence: aggregate.getMutationSequence(),
+          }, correlationId);
+        } catch (cause) {
+          throw new LiveStateCommitError(AUDIT_INTENT_FAILED, 'Audit intent is invalid', {
+            cause,
+            operation: name,
+            phase: 'intent',
+          });
+        }
+        await certifyAudit(logger, intent, name, 'intent');
+      }
+
       const before = aggregate.captureDurableDomainState();
       const sequence = aggregate.getMutationSequence();
       let result;
@@ -169,6 +265,24 @@ function createLiveStateCommitCoordinator({ aggregate, stateStore } = {}) {
       } catch (cause) {
         throw latchUnsafe(name, cause, 'sequence-apply');
       }
+
+      if (audit) {
+        let completion;
+        try {
+          completion = buildAuditEvent(audit, 'completion', {
+            operation: name,
+            result,
+            mutationSequence: nextSequence,
+          }, correlationId);
+        } catch (cause) {
+          throw new LiveStateCommitError(AUDIT_COMPLETION_FAILED, 'Audit completion is invalid', {
+            cause,
+            operation: name,
+            phase: 'completion',
+          });
+        }
+        await certifyAudit(logger, completion, name, 'completion');
+      }
       return result;
     });
   }
@@ -206,6 +320,10 @@ function createLiveStateCommitCoordinator({ aggregate, stateStore } = {}) {
 
 module.exports = {
   DURABILITY_UNAVAILABLE,
+  AUDIT_COMPLETION_FAILED,
+  AUDIT_INTENT_FAILED,
+  AUDIT_QUEUE_FULL,
+  AUDIT_UNSAFE,
   MAX_QUEUE_DEPTH,
   MUTATION_UNCERTIFIED,
   STATE_QUEUE_FULL,

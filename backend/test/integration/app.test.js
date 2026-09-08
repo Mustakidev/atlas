@@ -53,6 +53,16 @@ function logger(state) {
       state.errors.push({ module, message, data });
     },
     system() {},
+    getHealth() { return state.auditHealth; },
+    getLogs(limit) { return (state.auditEvents || []).slice(-limit); },
+    record(event) {
+      state.auditEvents = state.auditEvents || [];
+      state.auditEvents.push(event);
+      if (state.auditFailure && (event.durability === 'DURABLE_CRITICAL' || state.auditFailure === 'all')) {
+        return Promise.reject(new Error('controlled audit failure'));
+      }
+      return Promise.resolve({ status: event.durability === 'DURABLE_CRITICAL' ? 'DURABLE_CRITICAL_CERTIFIED' : 'DURABLE_ASYNC_ACCEPTED' });
+    },
   };
 }
 
@@ -298,6 +308,32 @@ test('/readyz becomes unavailable when lifecycle shutdown begins', async () => {
   }
 });
 
+test('/readyz separates audit health from live-state durability', async () => {
+  const lifecycle = createLifecycleController({
+    logger: { info() {}, warn() {}, error() {}, system() {} },
+  });
+  lifecycle.markRunning();
+  const server = await startApp({
+    auditHealth: 'UNSAFE',
+    lifecycle,
+    liveRuntime: {
+      getStatus: () => ({ effectiveState: 'READY', durabilityHealthy: true }),
+    },
+  });
+  try {
+    const ready = await request(server, { path: '/readyz' });
+    assert.equal(ready.statusCode, 503);
+    assert.deepEqual(ready.json(), {
+      status: 'not_ready',
+      liveState: 'READY',
+      auditState: 'UNSAFE',
+      auditStateHealthy: false,
+    });
+  } finally {
+    await stopApp(server);
+  }
+});
+
 test('root HTML contains no browser API-key bootstrap', async () => {
   const server = await startApp({});
   try {
@@ -406,7 +442,8 @@ test('login rejects wrong origin before validation or password verification', as
 });
 
 test('login validates password shape and rejects incorrect credentials generically', async () => {
-  const server = await startApp({});
+  const state = {};
+  const server = await startApp(state);
   try {
     for (const body of [{}, { password: '' }, { password: ' '.repeat(3) }, { password: 42 }]) {
       const result = await request(server, {
@@ -429,13 +466,15 @@ test('login validates password shape and rejects incorrect credentials generical
     assert.deepEqual(wrong.json(), { error: 'Authentication failed', message: 'Invalid credentials' });
     assert.equal(wrong.headers['set-cookie'], undefined);
     assert.equal(JSON.stringify(wrong).includes(OPERATOR_PASSWORD), false);
+    assert.ok(state.auditEvents?.some(event => event.event === 'AUTH_LOGIN_FAILED'));
   } finally {
     await stopApp(server);
   }
 });
 
 test('valid login creates an HttpOnly session and protected APIs accept it', async () => {
-  const server = await startApp({});
+  const state = {};
+  const server = await startApp(state);
   try {
     const login = await request(server, {
       method: 'POST',
@@ -455,6 +494,40 @@ test('valid login creates an HttpOnly session and protected APIs accept it', asy
     const status = await request(server, { path: '/api/status', headers: { cookie } });
     assert.equal(status.statusCode, 200);
     assert.equal(typeof status.json().uptime, 'number');
+    assert.equal(state.auditEvents.filter(event => event.event === 'AUTH_LOGIN_SUCCEEDED').length, 1);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('successful login fails closed when critical audit certification fails', async () => {
+  const server = await startApp({ auditFailure: 'all' });
+  try {
+    const result = await request(server, {
+      method: 'POST',
+      path: '/api/auth/login',
+      headers: { origin: ATLAS_ORIGIN },
+      body: { password: OPERATOR_PASSWORD },
+    });
+    assert.equal(result.statusCode, 503);
+    assert.deepEqual(result.json(), { error: 'Audit durability unavailable', code: 'AUDIT_UNSAFE' });
+    assert.equal(result.headers['set-cookie'], undefined);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('invalid credentials remain 401 when audit logging fails', async () => {
+  const server = await startApp({ auditFailure: 'all' });
+  try {
+    const result = await request(server, {
+      method: 'POST',
+      path: '/api/auth/login',
+      headers: { origin: ATLAS_ORIGIN },
+      body: { password: 'wrong password' },
+    });
+    assert.equal(result.statusCode, 401);
+    assert.equal(result.headers['set-cookie'], undefined);
   } finally {
     await stopApp(server);
   }
@@ -525,7 +598,8 @@ test('session-authenticated mutation requires exact Origin before state mutation
 });
 
 test('logout is idempotent, clears the session cookie, and invalidates access', async () => {
-  const server = await startApp({});
+  const state = {};
+  const server = await startApp(state);
   try {
     const login = await request(server, {
       method: 'POST', path: '/api/auth/login', headers: { origin: ATLAS_ORIGIN }, body: { password: OPERATOR_PASSWORD },
@@ -541,6 +615,37 @@ test('logout is idempotent, clears the session cookie, and invalidates access', 
 
     const noSessionLogout = await request(server, { method: 'POST', path: '/api/auth/logout', headers: { origin: ATLAS_ORIGIN } });
     assert.equal(noSessionLogout.statusCode, 204);
+    assert.ok(state.auditEvents.some(event => event.event === 'AUTH_LOGOUT'));
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('logout remains effective when audit logging fails', async () => {
+  const state = {};
+  const server = await startApp(state);
+  try {
+    const login = await request(server, {
+      method: 'POST', path: '/api/auth/login', headers: { origin: ATLAS_ORIGIN }, body: { password: OPERATOR_PASSWORD },
+    });
+    const cookie = sessionCookie(login);
+    state.auditFailure = 'all';
+    const logout = await request(server, { method: 'POST', path: '/api/auth/logout', headers: { origin: ATLAS_ORIGIN, cookie } });
+    assert.equal(logout.statusCode, 204);
+    assert.equal((await request(server, { path: '/api/status', headers: { cookie } })).statusCode, 401);
+  } finally {
+    await stopApp(server);
+  }
+});
+
+test('/api/logs uses bounded redacted memory records', async () => {
+  const state = {};
+  const server = await startApp(state);
+  try {
+    const result = await request(server, { path: '/api/logs?limit=999999', headers: { 'x-api-key': API_KEY } });
+    assert.equal(result.statusCode, 200);
+    assert.ok(result.json().count <= 100);
+    assert.ok(Array.isArray(result.json().logs));
   } finally {
     await stopApp(server);
   }

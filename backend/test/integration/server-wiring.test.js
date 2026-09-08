@@ -387,7 +387,8 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
       ATLAS_ORIGIN: `http://127.0.0.1:${port}`,
       ATLAS_COOKIE_SECURE: 'false',
       ATLAS_LIVE_STATE_FILE_PATH: statePath,
-       REFRESH_INTERVAL: '1500',
+      ATLAS_LOG_FILE_PATH: path.join(tempDir, 'atlas-events.jsonl'),
+      REFRESH_INTERVAL: '1500',
       MIN_API_INTERVAL: '1',
       API_THROTTLE_TTL: '1',
       RATE_LIMIT_MAX_REQUESTS: '500',
@@ -397,7 +398,6 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-
   try {
     await waitForStartup(child);
 
@@ -409,6 +409,8 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     assert.deepEqual(readinessBeforeInitialization.body, {
       status: 'not_ready',
       liveState: 'UNINITIALIZED',
+      auditState: 'HEALTHY',
+      auditStateHealthy: true,
     });
     assert.equal(fs.existsSync(statePath), false);
 
@@ -416,6 +418,13 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     assert.equal(initializeResponse.statusCode, 201);
     assert.deepEqual(initializeResponse.body, { status: 'READY', mutationSequence: 0 });
     assert.equal(fs.existsSync(statePath), true);
+    const auditEvents = fs.readFileSync(path.join(tempDir, 'atlas-events.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line).event);
+    assert.ok(auditEvents.includes('ATLAS_STARTING'));
+    assert.ok(auditEvents.includes('LIVE_STATE_INITIALIZED'));
+    assert.ok(auditEvents.includes('ATLAS_READY'));
 
     const readinessAfterInitialization = await request(port, '/readyz', {});
     assert.equal(readinessAfterInitialization.statusCode, 200);
@@ -423,6 +432,8 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
       status: 'ok',
       liveState: 'READY',
       durabilityHealthy: true,
+      auditState: 'HEALTHY',
+      auditStateHealthy: true,
     });
 
     const configResponse = await request(port, '/api/config');
@@ -563,6 +574,83 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
   }
 });
 
+test('failed live activation marks lifecycle failed while preserving diagnostics', async () => {
+  const port = await reservePort();
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-activation-failure-'));
+  const statePath = path.join(tempDir, 'live-execution-state.json');
+  const preloadPath = path.join(tempDir, 'fail-live-activation.js');
+  const liveSnapshotEntry = path.join(BACKEND, 'src/core/liveSnapshot.js');
+  const preload = `
+const fetchPath = require.resolve(${JSON.stringify(NODE_FETCH_ENTRY)});
+const liveSnapshotPath = require.resolve(${JSON.stringify(liveSnapshotEntry)});
+const liveSnapshot = require(liveSnapshotPath);
+require.cache[liveSnapshotPath] = {
+  id: liveSnapshotPath,
+  filename: liveSnapshotPath,
+  loaded: true,
+  exports: {
+    ...liveSnapshot,
+    registerLiveSnapshotHandler() {
+      throw new Error('injected live activation failure');
+    },
+  },
+};
+require.cache[fetchPath] = {
+  id: fetchPath,
+  filename: fetchPath,
+  loaded: true,
+  exports: async () => ({ ok: true, status: 200, async json() { return []; } }),
+};
+`;
+  fs.writeFileSync(preloadPath, preload);
+  const child = spawn(process.execPath, ['server.js'], {
+    cwd: BACKEND,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      API_KEY,
+      ATLAS_OPERATOR_PASSWORD_HASH: OPERATOR_HASH,
+      ATLAS_ORIGIN: `http://127.0.0.1:${port}`,
+      ATLAS_COOKIE_SECURE: 'false',
+      ATLAS_LIVE_STATE_FILE_PATH: statePath,
+      ATLAS_LOG_FILE_PATH: path.join(tempDir, 'atlas-events.jsonl'),
+      NODE_OPTIONS: `--require=${preloadPath}`,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk.toString(); });
+  child.stderr.on('data', chunk => { output += chunk.toString(); });
+
+  try {
+    await waitForStartup(child);
+    await waitForResponse(port, '/healthz', 200);
+    const initialize = await postJson(port, '/api/live-state/initialize');
+    assert.equal(initialize.statusCode, 503);
+
+    const health = await request(port, '/healthz', {});
+    assert.equal(health.statusCode, 503);
+    assert.deepEqual(health.body, { status: 'failed', lifecycle: 'FAILED' });
+    const ready = await request(port, '/readyz', {});
+    assert.equal(ready.statusCode, 503);
+    assert.equal(ready.body.liveState, 'FAILED');
+    const status = await request(port, '/api/status');
+    assert.equal(status.statusCode, 200);
+    assert.equal(child.exitCode, null);
+
+    await stopServer(child);
+    assert.equal(child.exitCode, 0, output);
+    const events = fs.readFileSync(path.join(tempDir, 'atlas-events.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line).event);
+    assert.equal(events.includes('ATLAS_READY'), false);
+  } finally {
+    await stopServer(child);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('cancelling bootstrap does not start the initial live cycle or scheduler', async () => {
   const port = await reservePort();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-bootstrap-cancellation-'));
@@ -611,6 +699,7 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
       ATLAS_OPERATOR_PASSWORD_HASH: OPERATOR_HASH,
       ATLAS_ORIGIN: `http://127.0.0.1:${port}`,
       ATLAS_COOKIE_SECURE: 'false',
+      ATLAS_LOG_FILE_PATH: path.join(tempDir, 'atlas-events.jsonl'),
       MIN_API_INTERVAL: '1',
       NODE_OPTIONS: `--require=${preloadPath}`,
     },

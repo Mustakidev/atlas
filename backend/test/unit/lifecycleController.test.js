@@ -133,6 +133,36 @@ test('live scheduler owns interval and prevents overlapping live cycles', async 
   assert.equal(timers.intervals.size, 0);
 });
 
+test('startup opt-in permits activation work before RUNNING without weakening normal guards', async () => {
+  const { controller, timers } = makeController();
+  let resolveInitial;
+  let calls = 0;
+  const initial = controller.startLiveCycle(({ signal }) => {
+    calls++;
+    return new Promise(resolve => {
+      resolveInitial = resolve;
+      signal.addEventListener('abort', resolve, { once: true });
+    });
+  }, { allowStarting: true });
+
+  assert.equal(controller.getState(), STATES.STARTING);
+  assert.equal(controller.startLiveCycle(() => Promise.resolve()), null);
+  assert.equal(controller.startLiveScheduler(1000, () => {
+    calls++;
+    return Promise.resolve();
+  }, { allowStarting: true }), true);
+  [...timers.intervals.values()][0]();
+  assert.equal(calls, 1);
+
+  resolveInitial();
+  await initial;
+  controller.markRunning();
+  [...timers.intervals.values()][0]();
+  await Promise.resolve();
+  assert.equal(calls, 2);
+  await controller.shutdown('test');
+});
+
 test('request admission and release are synchronous and idempotent', () => {
   const { controller } = makeController();
   controller.markRunning();
@@ -271,6 +301,44 @@ test('graceful shutdown drains work, invokes flush before cleanup, and stops', a
   assert.equal(server.closeCalls, 1);
   assert.equal(flushSignal.aborted, false);
   assert.notEqual(flushSignal, liveSignal);
+});
+
+test('non-terminal failure preserves diagnostics, stops live work, and allows later shutdown', async () => {
+  const { controller, exits, timers } = makeController();
+  const server = makeServer();
+  const order = [];
+  let liveSignal;
+  controller.attachServer(server);
+  controller.setGracefulFlushHook(async () => { order.push('flush'); });
+  controller.setResourceCleanupHook(async () => { order.push('cleanup'); });
+  controller.markRunning();
+  assert.equal(controller.startLiveScheduler(1000, () => Promise.resolve()), true);
+  const live = controller.startLiveCycle(({ signal }) => {
+    liveSignal = signal;
+    return new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+  });
+
+  assert.equal(controller.markFailed('activation-failed'), true);
+  await live;
+  assert.equal(controller.getState(), STATES.FAILED);
+  assert.equal(controller.getStatus().reason, 'activation-failed');
+  assert.equal(controller.getStatus().schedulerEnabled, false);
+  assert.equal(liveSignal.aborted, true);
+  assert.equal(timers.intervals.size, 0);
+  assert.equal(server.closeCalls, 0);
+  assert.deepEqual(exits, []);
+  assert.equal(controller.markFailed('repeated-failure'), false);
+  assert.equal(controller.startLiveCycle(() => Promise.resolve()), null);
+  assert.equal(controller.startLiveScheduler(1000, () => Promise.resolve()), false);
+
+  const diagnostic = controller.trackRequest({ path: '/api/status' }, new EventEmitter(), 'status');
+  assert.equal(diagnostic.allowed, true);
+  diagnostic.release();
+
+  await controller.shutdown('after-failure');
+  assert.equal(controller.getState(), STATES.STOPPED);
+  assert.equal(server.closeCalls, 1);
+  assert.deepEqual(order, ['flush', 'cleanup']);
 });
 
 test('fatal shutdown skips graceful flush and becomes terminal FAILED', async () => {

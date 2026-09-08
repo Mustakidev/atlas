@@ -27,9 +27,54 @@ const configFingerprint = createConfigFingerprint({
   mtf: { aggressive: false },
 });
 
+const DEFAULT_RUNTIME_LOG_PATH = path.resolve(__dirname, '../../runtime-data/logs/atlas-events.jsonl');
+
 function readState(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
 }
+
+function readAuditEvents(filePath) {
+  return fs.readFileSync(filePath, 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map(line => JSON.parse(line).event);
+}
+
+test('live-process children isolate audit paths and preserve restart continuity', async () => {
+  const ambientPath = process.env.ATLAS_LOG_FILE_PATH;
+  const first = await createLiveProcess();
+  const second = await createLiveProcess();
+  const explicit = await createLiveProcess();
+  const explicitPath = path.join(explicit.stateDirectory, 'explicit-events.jsonl');
+  try {
+    assert.notEqual(first.logPath, DEFAULT_RUNTIME_LOG_PATH);
+    assert.notEqual(second.logPath, DEFAULT_RUNTIME_LOG_PATH);
+    assert.notEqual(first.logPath, second.logPath);
+
+    await Promise.all([
+      first.start({ marketMode: 'idle' }),
+      second.start({ marketMode: 'idle' }),
+      explicit.start({ marketMode: 'idle', extraEnv: { ATLAS_LOG_FILE_PATH: explicitPath } }),
+    ]);
+    assert.equal(explicit.logPath, explicitPath);
+    assert.equal(fs.existsSync(first.logPath), true);
+    assert.equal(fs.existsSync(second.logPath), true);
+    assert.equal(fs.existsSync(explicitPath), true);
+    assert.ok(readAuditEvents(first.logPath).includes('ATLAS_STARTING'));
+    assert.ok(readAuditEvents(second.logPath).includes('ATLAS_STARTING'));
+    assert.ok(readAuditEvents(explicitPath).includes('ATLAS_STARTING'));
+
+    const restartPath = first.logPath;
+    await first.stopGracefully();
+    await first.start({ marketMode: 'idle' });
+    assert.equal(first.logPath, restartPath);
+    assert.ok(readAuditEvents(first.logPath).filter(event => event === 'ATLAS_STARTING').length >= 2);
+  } finally {
+    await Promise.all([first.dispose(), second.dispose(), explicit.dispose()]);
+    assert.equal(process.env.ATLAS_LOG_FILE_PATH, ambientPath);
+  }
+});
 
 async function createCertifiedOpenState() {
   const processHarness = await createLiveProcess();
@@ -242,6 +287,9 @@ test('corrupt primary fails closed without auto-initialization or overwrite', as
 
     await processHarness.start({ marketMode: 'idle' });
     await processHarness.waitForLiveState('FAILED');
+    const health = await processHarness.request('/healthz');
+    assert.deepEqual(health.body, { status: 'failed', lifecycle: 'FAILED' });
+    assert.equal(health.statusCode, 503);
     const ready = await processHarness.request('/readyz');
     assert.equal(ready.statusCode, 503);
     assert.equal(fs.readFileSync(processHarness.statePath, 'utf8'), '{');
@@ -268,6 +316,9 @@ test('fingerprint mismatch fails closed without overwrite or scheduler activatio
 
     await processHarness.start({ marketMode: 'idle', extraEnv: { CONFLUENCE_BULLISH_THRESHOLD: '66' } });
     await processHarness.waitForLiveState('FAILED');
+    const health = await processHarness.request('/healthz');
+    assert.deepEqual(health.body, { status: 'failed', lifecycle: 'FAILED' });
+    assert.equal(health.statusCode, 503);
     assert.equal(fs.readFileSync(processHarness.statePath, 'utf8'), before);
     assert.equal((await processHarness.request('/readyz')).statusCode, 503);
   } finally {
@@ -290,6 +341,9 @@ test('missing primary with a matching temp fails closed instead of becoming firs
     await fs.promises.rename(processHarness.statePath, tempPath);
     await processHarness.start({ marketMode: 'idle' });
     await processHarness.waitForLiveState('FAILED');
+    const health = await processHarness.request('/healthz');
+    assert.deepEqual(health.body, { status: 'failed', lifecycle: 'FAILED' });
+    assert.equal(health.statusCode, 503);
     assert.equal(fs.existsSync(tempPath), true);
     const initialize = await processHarness.request('/api/live-state/initialize', {
       method: 'POST', headers: { 'x-api-key': API_KEY }, body: {},
