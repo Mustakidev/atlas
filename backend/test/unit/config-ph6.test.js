@@ -192,6 +192,13 @@ test('live-state path is optional but absolute when configured', () => {
   }
 });
 
+test('durable log path is optional but absolute when configured', () => {
+  assert.equal(validConfig({ ATLAS_LOG_FILE_PATH: undefined }).validate().valid, true);
+  assert.equal(validConfig({ ATLAS_LOG_FILE_PATH: path.resolve('/tmp', 'atlas-events.jsonl') }).validate().valid, true);
+  assertInvalid({ ATLAS_LOG_FILE_PATH: '' }, 'ATLAS_LOG_FILE_PATH');
+  assertInvalid({ ATLAS_LOG_FILE_PATH: 'relative/atlas-events.jsonl' }, 'ATLAS_LOG_FILE_PATH');
+});
+
 test('CoinGecko key allows disabled mode but rejects whitespace-only values', () => {
   assert.equal(validConfig({ COINGECKO_API_KEY: '' }).validate().valid, true);
   assert.equal(validConfig({ COINGECKO_API_KEY: 'provider-key' }).validate().valid, true);
