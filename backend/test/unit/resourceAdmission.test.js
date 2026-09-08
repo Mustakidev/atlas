@@ -65,6 +65,31 @@ test('analytical admission has one slot, no queue, and idempotent release', () =
   assert.equal(admission.getStatus().activeAnalyticalCount, 0);
 });
 
+test('analytical capacity rejection emits bounded operational evidence without changing admission', async () => {
+  const events = [];
+  const admission = createResourceAdmission({
+    logger: {
+      record: async event => {
+        events.push(event);
+        return { status: 'DURABLE_ASYNC_ACCEPTED' };
+      },
+    },
+  });
+  const release = admission.acquireAnalytical('/backtest');
+  assert.equal(admission.acquireAnalytical('/backtest'), null);
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].event, 'ANALYTICAL_CAPACITY_REJECTED');
+  assert.deepEqual(events[0].context, {
+    code: 'ANALYTICAL_CAPACITY_EXCEEDED',
+    path: '/backtest',
+    capacity: 1,
+    queueDepth: 1,
+  });
+  release();
+});
+
 test('generated response budget sends one serialized string at the exact boundary', () => {
   const admission = createResourceAdmission();
   const response = responseHarness();

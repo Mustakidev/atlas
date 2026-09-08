@@ -16,7 +16,7 @@ function analyticalCapacityResponse(res) {
   });
 }
 
-function createResourceAdmission() {
+function createResourceAdmission({ logger = null } = {}) {
   let activeAnalyticalCount = 0;
   let analyticalCapacityRejects = 0;
   let responseBudgetRejects = 0;
@@ -25,9 +25,25 @@ function createResourceAdmission() {
     return req.method === 'GET' && ANALYTICAL_PATHS.has(req.path);
   }
 
-  function acquireAnalytical() {
+  function acquireAnalytical(path = 'analytical') {
     if (activeAnalyticalCount >= ANALYTICAL_CAPACITY) {
       analyticalCapacityRejects++;
+      if (logger?.record) {
+        void Promise.resolve().then(() => logger.record({
+          event: 'ANALYTICAL_CAPACITY_REJECTED',
+          source: 'ResourceAdmission',
+          category: 'operational',
+          durability: 'DURABLE_ASYNC',
+          level: 'WARNING',
+          message: 'Analytical resource capacity is full',
+          context: {
+            code: 'ANALYTICAL_CAPACITY_EXCEEDED',
+            path,
+            capacity: ANALYTICAL_CAPACITY,
+            queueDepth: activeAnalyticalCount,
+          },
+        })).catch(() => {});
+      }
       return null;
     }
 
@@ -44,7 +60,7 @@ function createResourceAdmission() {
     return (req, res, next) => {
       if (!isAnalyticalRequest(req)) return next();
 
-      const release = acquireAnalytical();
+      const release = acquireAnalytical(req.path);
       if (!release) return analyticalCapacityResponse(res);
 
       req.resourceAdmission = admission;

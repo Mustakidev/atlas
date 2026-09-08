@@ -155,8 +155,8 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth,
   const globalLimiter = createGlobalLimiter(config, logger);
   const expensiveLimiter = createConditionalExpensive(createExpensiveLimiter(config, logger));
   const loginLimiter = createLoginLimiter(config, logger);
-  const resourceAdmission = createResourceAdmission();
-  const authRouter = createAuthRouter({ config, sessionStore, loginLimiter });
+  const resourceAdmission = createResourceAdmission({ logger });
+  const authRouter = createAuthRouter({ config, sessionStore, loginLimiter, logger });
   const allowedOrigins = config.get('CORS_ORIGIN').split(',').map(s => s.trim());
 
   if (lifecycle) {
@@ -202,16 +202,25 @@ function createApp({ config, logger, routes, getLastDecision, getPipelineHealth,
   app.get('/readyz', (req, res) => {
     const status = liveRuntime?.getStatus?.();
     const lifecycleRunning = lifecycle?.getState?.() === 'RUNNING';
-    if (lifecycleRunning && status?.effectiveState === 'READY' && status.durabilityHealthy === true) {
+    const auditState = typeof logger.getHealth === 'function' ? logger.getHealth() : null;
+    const auditAvailable = auditState === null || auditState !== 'UNSAFE';
+    const auditFields = auditState ? {
+      auditState,
+      auditStateHealthy: auditState === 'HEALTHY',
+    } : {};
+    if (lifecycleRunning && status?.effectiveState === 'READY'
+      && status.durabilityHealthy === true && auditAvailable) {
       return res.status(200).json({
         status: 'ok',
         liveState: 'READY',
         durabilityHealthy: true,
+        ...auditFields,
       });
     }
     return res.status(503).json({
       status: 'not_ready',
       liveState: status?.effectiveState || 'STARTING',
+      ...auditFields,
     });
   });
 

@@ -47,6 +47,40 @@ const fetch = require('node-fetch');
 
 const config = new ConfigManager();
 const logger = new Logger(config);
+let server = null;
+let auditReadyEmitted = false;
+
+async function recordCriticalAudit(eventInput) {
+  try {
+    const result = await logger.record(eventInput);
+    return result?.status === 'DURABLE_CRITICAL_CERTIFIED';
+  } catch {
+    return false;
+  }
+}
+
+function reportAuditUnavailable(message) {
+  try {
+    process.stderr.write(`[AUDIT_UNSAFE] ${message}\n`);
+  } catch {
+    // Startup/shutdown safety must not depend on stderr.
+  }
+}
+
+async function emitAuditReady(reason) {
+  if (auditReadyEmitted) return true;
+  const certified = await recordCriticalAudit({
+    event: 'ATLAS_READY',
+    source: 'Server',
+    category: 'operational',
+    durability: 'DURABLE_CRITICAL',
+    level: 'SYSTEM',
+    message: 'Atlas is ready for operational work',
+    context: { code: 'ATLAS_READY', reason },
+  });
+  if (certified) auditReadyEmitted = true;
+  return certified;
+}
 
 const configValidation = config.validate();
 for (const w of configValidation.warnings) {
@@ -63,6 +97,29 @@ logger.system('Config', 'Startup configuration validated successfully');
 
 const lifecycle = createLifecycleController({ logger });
 lifecycle.installSignalHandlers();
+lifecycle.setGracefulFlushHook(async () => {
+  await recordCriticalAudit({
+    event: 'ATLAS_SHUTDOWN',
+    source: 'Server',
+    category: 'operational',
+    durability: 'DURABLE_CRITICAL',
+    level: 'SYSTEM',
+    message: 'Atlas shutdown requested',
+    context: { code: 'ATLAS_SHUTDOWN', reason: 'GRACEFUL_SHUTDOWN' },
+  });
+  try {
+    await logger.flush();
+  } catch {
+    reportAuditUnavailable('Logger flush failed during shutdown');
+  }
+});
+lifecycle.setResourceCleanupHook(async () => {
+  try {
+    await logger.close();
+  } catch {
+    reportAuditUnavailable('Logger close failed during shutdown');
+  }
+});
 
 const eventBus = new EventBus();
 const symbol = config.get('SYMBOL');
@@ -339,7 +396,7 @@ async function activateLivePath() {
   if (liveActivationPromise) return liveActivationPromise;
 
   liveActivationPromise = (async () => {
-    const coordinator = createLiveStateCommitCoordinator({ aggregate, stateStore });
+    const coordinator = createLiveStateCommitCoordinator({ aggregate, stateStore, logger });
     await liveRuntime.activateCoordinator(coordinator, async () => {
       if (liveHandler) throw new Error('Live snapshot handler is already registered');
       liveHandler = registerLiveSnapshotHandler({
@@ -355,14 +412,14 @@ async function activateLivePath() {
     });
 
     if (!initialCycleStarted) {
-      const initialCycle = lifecycle.startLiveCycle(({ signal }) => fetchCycle({ signal }));
+      const initialCycle = lifecycle.startLiveCycle(({ signal }) => fetchCycle({ signal }), { allowStarting: true });
       if (!initialCycle) throw new Error('Initial live cycle could not start');
       initialCycleStarted = true;
       initialCycle.catch(error => logger.error('Server', 'Initial live cycle failed', { error: error.message }));
     }
 
     if (!schedulerStarted) {
-      const started = lifecycle.startLiveScheduler(interval, ({ signal }) => fetchCycle({ signal }));
+      const started = lifecycle.startLiveScheduler(interval, ({ signal }) => fetchCycle({ signal }), { allowStarting: true });
       if (!started) throw new Error('Live scheduler could not start');
       schedulerStarted = true;
     }
@@ -370,6 +427,7 @@ async function activateLivePath() {
     return liveRuntime.getStatus();
   })().catch(error => {
     liveRuntime.markFailed();
+    lifecycle.markFailed('live-activation-failed');
     throw error;
   });
 
@@ -386,7 +444,7 @@ async function recoverLiveState({ signal } = {}) {
     if (isCancellation(error, signal) || lifecycle.isShuttingDown()) return;
     liveRuntime.markFailed();
     logger.error('Server', 'Live state startup failed', { code: error.code || 'STATE_RECOVERY_FAILED' });
-    lifecycle.markRunning();
+    lifecycle.markFailed('live-state-recovery-failed');
     return;
   }
 
@@ -403,7 +461,7 @@ async function recoverLiveState({ signal } = {}) {
   if (result.status !== 'VALID') {
     liveRuntime.markFailed();
     logger.error('Server', 'Live state startup failed', { code: 'STATE_RECOVERY_FAILED' });
-    lifecycle.markRunning();
+    lifecycle.markFailed('live-state-recovery-failed');
     return;
   }
 
@@ -423,7 +481,7 @@ async function recoverLiveState({ signal } = {}) {
     } catch (error) {
       liveRuntime.markFailed();
       logger.error('Server', 'Live state migration failed', { code: error.code || 'STATE_MIGRATION_FAILED' });
-      lifecycle.markRunning();
+      lifecycle.markFailed('live-state-migration-failed');
       return;
     }
   }
@@ -433,16 +491,19 @@ async function recoverLiveState({ signal } = {}) {
   } catch (error) {
     liveRuntime.markFailed();
     logger.error('Server', 'Live state restore failed', { code: error.code || 'STATE_RESTORE_FAILED' });
-    lifecycle.markRunning();
+    lifecycle.markFailed('live-state-restore-failed');
     return;
   }
 
   await seedHistoricalCandles({ signal });
   if (signal?.aborted || lifecycle.isShuttingDown()) return;
-  lifecycle.markRunning();
-
   try {
     await activateLivePath();
+    lifecycle.markRunning();
+    if (!(await emitAuditReady('STATE_RECOVERED'))) {
+      reportAuditUnavailable('ATLAS_READY audit was not certified');
+      lifecycle.markFailed('audit-ready-failed');
+    }
   } catch (error) {
     logger.error('Server', 'Live state activation failed', { code: error.code || 'LIVE_STATE_ACTIVATION_FAILED' });
   }
@@ -478,7 +539,32 @@ async function initializeLiveState() {
         throw new Error('Live state write was not certified');
       }
 
+      const initialized = await recordCriticalAudit({
+        event: 'LIVE_STATE_INITIALIZED',
+        source: 'Server',
+        category: 'audit',
+        durability: 'DURABLE_CRITICAL',
+        level: 'INFO',
+        message: 'Live execution state initialized',
+        context: {
+          operation: 'live-state-initialize',
+          mutationSequence: 0,
+          outcome: 'COMMITTED',
+        },
+      });
+      if (!initialized) {
+        const error = new Error('Audit certification failed after live-state initialization');
+        error.code = 'AUDIT_COMPLETION_FAILED';
+        throw error;
+      }
+
       await activateLivePath();
+      if (!(await emitAuditReady('LIVE_STATE_INITIALIZED'))) {
+        lifecycle.markFailed('audit-ready-failed');
+        const error = new Error('ATLAS_READY audit was not certified after initialization');
+        error.code = 'AUDIT_COMPLETION_FAILED';
+        throw error;
+      }
     } catch (error) {
       if (liveRuntime.getState() === 'FAILED' || liveRuntime.getState() === 'READY') throw error;
       if (writeAttempted && !isRetryableInitializationFailure(error)) {
@@ -507,24 +593,45 @@ async function initializeLiveState() {
 const port = config.get('PORT');
 const interval = config.get('REFRESH_INTERVAL');
 
-const server = app.listen(port, async () => {
-  logger.system('Server', `Atlas v1.0 running on port ${port}`);
-  logger.system('Server', `Config loaded`, {
-    refreshInterval: interval,
-    maxHistory: config.get('MAX_HISTORY'),
-    cacheTTL: config.get('CACHE_TTL'),
-    logLevel: config.get('LOG_LEVEL'),
+async function startServer() {
+  const loggerStatus = await logger.initialize();
+  if (loggerStatus.health === 'UNSAFE') reportAuditUnavailable('Durable audit logger initialized UNSAFE');
+  if (!(await recordCriticalAudit({
+    event: 'ATLAS_STARTING',
+    source: 'Server',
+    category: 'operational',
+    durability: 'DURABLE_CRITICAL',
+    level: 'SYSTEM',
+    message: 'Atlas startup is beginning',
+    context: { code: 'ATLAS_STARTING', reason: 'CONFIG_VALIDATED' },
+  }))) {
+    reportAuditUnavailable('ATLAS_STARTING audit was not certified');
+  }
+
+  server = app.listen(port, async () => {
+    logger.system('Server', `Atlas v1.0 running on port ${port}`);
+    logger.system('Server', `Config loaded`, {
+      refreshInterval: interval,
+      maxHistory: config.get('MAX_HISTORY'),
+      cacheTTL: config.get('CACHE_TTL'),
+      logLevel: config.get('LOG_LEVEL'),
+    });
+
+    const bootstrap = lifecycle.startBootstrap(({ signal }) => recoverLiveState({ signal }));
+    if (!bootstrap) return;
+    bootstrap.catch(error => {
+      if (isCancellation(error) || lifecycle.isShuttingDown()) return;
+      liveRuntime.markFailed();
+      logger.error('Server', 'Live state startup failed', { code: error.code || 'STATE_STARTUP_FAILED' });
+      lifecycle.markFailed('live-state-startup-failed');
+    });
   });
 
-  const bootstrap = lifecycle.startBootstrap(({ signal }) => recoverLiveState({ signal }));
-  if (!bootstrap) return;
-  bootstrap.catch(error => {
-    if (isCancellation(error) || lifecycle.isShuttingDown()) return;
-    liveRuntime.markFailed();
-    logger.error('Server', 'Live state startup failed', { code: error.code || 'STATE_STARTUP_FAILED' });
-    lifecycle.markRunning();
-  });
+  lifecycle.attachServer(server);
+  server.on('error', error => lifecycle.fatal(`http-server: ${error.message}`));
+}
+
+startServer().catch(error => {
+  reportAuditUnavailable(error?.message || 'Server startup failed');
+  process.exitCode = 1;
 });
-
-lifecycle.attachServer(server);
-server.on('error', error => lifecycle.fatal(`http-server: ${error.message}`));

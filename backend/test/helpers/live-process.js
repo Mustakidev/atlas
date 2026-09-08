@@ -9,6 +9,7 @@ const BACKEND = path.join(__dirname, '../..');
 const PRELOAD = path.join(__dirname, 'live-process-preload.js');
 const API_KEY = 'ph4f-process-test-api-key-32-characters';
 const OPERATOR_HASH = 'scrypt$N=16384$r=8$p=1$MDEyMzQ1Njc4OWFiY2RlZg$tjK03tRvEjqCcPwmgtddMkgjlXrk8U_b9rIvfeBMKCc';
+const DEFAULT_RUNTIME_LOG_PATH = path.resolve(BACKEND, 'runtime-data/logs/atlas-events.jsonl');
 
 async function reservePort() {
   return new Promise((resolve, reject) => {
@@ -84,6 +85,8 @@ async function poll(condition, timeoutMs = 10_000) {
 async function createLiveProcess({ directory = null } = {}) {
   const stateDirectory = directory || await fs.promises.mkdtemp(path.join(os.tmpdir(), 'atlas-ph4f-'));
   const statePath = path.join(stateDirectory, 'live-execution-state.json');
+  const defaultLogPath = path.resolve(stateDirectory, 'atlas-events.jsonl');
+  let currentLogPath = defaultLogPath;
   let child = null;
   let port = null;
   let markerPath = null;
@@ -91,6 +94,14 @@ async function createLiveProcess({ directory = null } = {}) {
 
   async function start({ mode = 'none', marketMode = 'idle', extraEnv = {} } = {}) {
     if (child && !childExited) throw new Error('Child process is already running');
+    const overrides = extraEnv || {};
+    const { ATLAS_LOG_FILE_PATH: requestedLogPath, ...childOverrides } = overrides;
+    const logPath = typeof requestedLogPath === 'string'
+      && path.isAbsolute(requestedLogPath)
+      && path.resolve(requestedLogPath) !== DEFAULT_RUNTIME_LOG_PATH
+      ? path.resolve(requestedLogPath)
+      : defaultLogPath;
+    currentLogPath = logPath;
     port = await reservePort();
     markerPath = path.join(stateDirectory, `${mode}-${Date.now()}-${Math.random().toString(16).slice(2)}.barrier`);
     child = spawn(process.execPath, ['server.js'], {
@@ -103,6 +114,7 @@ async function createLiveProcess({ directory = null } = {}) {
         ATLAS_ORIGIN: `http://127.0.0.1:${port}`,
         ATLAS_COOKIE_SECURE: 'false',
         ATLAS_LIVE_STATE_FILE_PATH: statePath,
+        ATLAS_LOG_FILE_PATH: logPath,
         REFRESH_INTERVAL: '500',
         MIN_API_INTERVAL: '1',
         API_THROTTLE_TTL: '1',
@@ -113,7 +125,7 @@ async function createLiveProcess({ directory = null } = {}) {
         LIVE_TEST_MARKET_MODE: marketMode,
         LIVE_TEST_BARRIER_PATH: markerPath,
         NODE_OPTIONS: `--require=${PRELOAD}`,
-        ...extraEnv,
+        ...childOverrides,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -127,7 +139,7 @@ async function createLiveProcess({ directory = null } = {}) {
       if (child.exitCode !== null) throw new Error(`Child exited before listening (${child.exitCode}): ${output}`);
       return output.includes('Atlas v1.0 running on port');
     }, 60_000);
-    return { child, port, statePath, markerPath };
+    return { child, port, statePath, markerPath, logPath };
   }
 
   async function stopGracefully() {
@@ -203,6 +215,7 @@ async function createLiveProcess({ directory = null } = {}) {
   return Object.freeze({
     stateDirectory,
     statePath,
+    get logPath() { return currentLogPath; },
     get child() { return child; },
     get port() { return port; },
     get markerPath() { return markerPath; },
