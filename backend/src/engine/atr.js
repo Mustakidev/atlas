@@ -13,6 +13,7 @@
  * Asset: Configurable via symbol parameter (default: BTCUSDT)
  */
 const { getFinalizedCandles } = require('./candleUtils');
+const { computeRawAtr } = require('./atrCore');
 const ENGINE_VERSION = '1.0.0';
 const DEFAULT_SYMBOL = 'BTCUSDT';
 const DEFAULT_PERIOD = 14;
@@ -52,14 +53,9 @@ class ATREngine {
       return this._notReady(timeframe, finalized ? finalized.length : 0);
     }
 
-    const trValues = this._trueRange(finalized);
-    const atr = this._wilderATR(trValues);
-    const previousAtr = this._wilderATR(trValues.slice(0, -1));
+    const { atr, atrPercent, previousAtr } = computeRawAtr(finalized, this.period);
 
-    const lastClose = finalized[finalized.length - 1].close;
-    const atrPercentage = lastClose > 0 ? (atr / lastClose) * 100 : 0;
-
-    const volatilityLevel = this._classifyVolatility(atrPercentage);
+    const volatilityLevel = this._classifyVolatility(atrPercent);
     const volatilityTrend = this._trendVolatility(atr, previousAtr);
 
     this.calculationTime = Date.now() - start;
@@ -72,7 +68,7 @@ class ATREngine {
       timeframe,
       period: this.period,
       atr: this._round(atr),
-      atrPercentage: this._round(atrPercentage),
+      atrPercentage: this._round(atrPercent),
       volatilityLevel,
       volatilityTrend,
       candleCount: finalized.length,
@@ -114,40 +110,6 @@ class ATREngine {
     } else {
       this._cache = Object.create(null);
     }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Core calculations
-  // ---------------------------------------------------------------------------
-
-  _trueRange(candles) {
-    const tr = new Array(candles.length);
-    tr[0] = candles[0].high - candles[0].low;
-
-    for (let i = 1; i < candles.length; i++) {
-      const highLow = candles[i].high - candles[i].low;
-      const highPrevClose = Math.abs(candles[i].high - candles[i - 1].close);
-      const lowPrevClose = Math.abs(candles[i].low - candles[i - 1].close);
-      tr[i] = Math.max(highLow, highPrevClose, lowPrevClose);
-    }
-
-    return tr;
-  }
-
-  _wilderATR(trValues) {
-    if (trValues.length < this.period) return 0;
-
-    let sum = 0;
-    for (let i = 0; i < this.period; i++) {
-      sum += trValues[i];
-    }
-    let atr = sum / this.period;
-
-    for (let i = this.period; i < trValues.length; i++) {
-      atr = (atr * (this.period - 1) + trValues[i]) / this.period;
-    }
-
-    return atr;
   }
 
   // ---------------------------------------------------------------------------
