@@ -182,7 +182,7 @@ test('live-state initialization accepts an empty request and activates readiness
       getEffectiveState: () => state,
       getMutationSequence: () => 0,
     },
-    initializeLiveState: async () => { state = 'READY'; },
+    initializeLiveState: async () => { state = 'READY'; return 0; },
   });
 
   assert.equal(result.statusCode, 201);

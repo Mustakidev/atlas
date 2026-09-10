@@ -82,6 +82,14 @@ function readProbe(probePath) {
   return JSON.parse(fs.readFileSync(probePath, 'utf8'));
 }
 
+function readPersistedMutationSequence(statePath) {
+  try {
+    return JSON.parse(fs.readFileSync(statePath, 'utf8')).mutationSequence;
+  } catch {
+    return null;
+  }
+}
+
 function waitForCycle(port, probePath, expectedCycle) {
   const deadline = Date.now() + 30000;
 
@@ -507,6 +515,16 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     assert.equal(firstInspector.body.cycle, first.statusResponse.body.pipeline.pipelineCycleCount);
     assert.equal(firstInspector.body.verdict.rejectionReason, 'Insufficient candles (0/15 minimum)');
 
+    const firstMutation = await waitForProbeCondition(
+      port,
+      probePath,
+      (probe, statusResponse) => probe.pipelineRun >= 1
+        && statusResponse.body.mutationSequence === 1
+        && readPersistedMutationSequence(statePath) === 1,
+    );
+    assert.equal(firstMutation.statusResponse.body.mutationSequence, 1);
+    assert.equal(readPersistedMutationSequence(statePath), 1);
+
     const second = await waitForCycle(port, probePath, 2);
     assert.equal(second.statusResponse.statusCode, 200);
     assert.equal(second.probe.createExecutionPipeline, 1);
@@ -654,6 +672,7 @@ require.cache[fetchPath] = {
 test('cancelling bootstrap does not start the initial live cycle or scheduler', async () => {
   const port = await reservePort();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-bootstrap-cancellation-'));
+  const statePath = path.join(tempDir, 'live-execution-state.json');
   const preloadPath = path.join(tempDir, 'mock-bootstrap.js');
   const probePath = path.join(tempDir, 'bootstrap-probe.json');
   const preload = `
@@ -699,6 +718,7 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
       ATLAS_OPERATOR_PASSWORD_HASH: OPERATOR_HASH,
       ATLAS_ORIGIN: `http://127.0.0.1:${port}`,
       ATLAS_COOKIE_SECURE: 'false',
+      ATLAS_LIVE_STATE_FILE_PATH: statePath,
       ATLAS_LOG_FILE_PATH: path.join(tempDir, 'atlas-events.jsonl'),
       MIN_API_INTERVAL: '1',
       NODE_OPTIONS: `--require=${preloadPath}`,
