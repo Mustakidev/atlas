@@ -102,10 +102,10 @@ function createRouter(deps) {
     if (state !== 'UNINITIALIZED') return res.status(503).json({ error: 'Live state not ready' });
 
     try {
-      await initializeLiveState();
+      const mutationSequence = await initializeLiveState();
       return res.status(201).json({
         status: 'READY',
-        mutationSequence: liveRuntime.getMutationSequence(),
+        mutationSequence,
       });
     } catch (error) {
       const finalState = liveRuntime.getEffectiveState();

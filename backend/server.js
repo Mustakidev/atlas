@@ -532,6 +532,7 @@ async function initializeLiveState() {
       }
 
       const snapshot = aggregate.captureSnapshot();
+      const initializationSequence = snapshot.mutationSequence;
       writeAttempted = true;
       const result = await stateStore.write(snapshot, expectedContext(Date.parse(snapshot.savedAt)));
       if (!result || result.status !== 'WRITTEN') {
@@ -565,6 +566,8 @@ async function initializeLiveState() {
         error.code = 'AUDIT_COMPLETION_FAILED';
         throw error;
       }
+
+      return initializationSequence;
     } catch (error) {
       if (liveRuntime.getState() === 'FAILED' || liveRuntime.getState() === 'READY') throw error;
       if (writeAttempted && !isRetryableInitializationFailure(error)) {
