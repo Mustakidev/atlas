@@ -14,6 +14,7 @@
  * Results are calculated from the supplied candle array on every call.
  */
 const { Indicator } = require('./base');
+const { computeRawRsiFromCloses } = require('../rsiCore');
 
 const RSI_PERIOD = 14;
 const MIN_CANDLES = RSI_PERIOD + 1; // need period+1 closes for first delta
@@ -72,44 +73,7 @@ class RSIIndicator extends Indicator {
    * @returns {number} RSI value 0–100
    */
   _wilderRSI(closes) {
-    const period = this._period;
-
-    // --- deltas (price changes) ---
-    const deltas = new Array(closes.length - 1);
-    for (let i = 1; i < closes.length; i++) {
-      deltas[i - 1] = closes[i] - closes[i - 1];
-    }
-
-    // --- separate gains and losses ---
-    const gains = new Array(deltas.length);
-    const losses = new Array(deltas.length);
-    for (let i = 0; i < deltas.length; i++) {
-      gains[i] = deltas[i] > 0 ? deltas[i] : 0;
-      losses[i] = deltas[i] < 0 ? -deltas[i] : 0;
-    }
-
-    // --- first average: simple mean over first `period` values ---
-    let avgGain = 0;
-    let avgLoss = 0;
-    for (let i = 0; i < period; i++) {
-      avgGain += gains[i];
-      avgLoss += losses[i];
-    }
-    avgGain /= period;
-    avgLoss /= period;
-
-    // --- Wilder's smoothing for remaining deltas ---
-    for (let i = period; i < gains.length; i++) {
-      avgGain = (avgGain * (period - 1) + gains[i]) / period;
-      avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
-    }
-
-    // --- RS and RSI ---
-    if (avgLoss === 0) {
-      return avgGain === 0 ? 50 : 100;  // no movement → neutral; all up → 100
-    }
-    const rs = avgGain / avgLoss;
-    return 100 - 100 / (1 + rs);
+    return computeRawRsiFromCloses(closes, this._period);
   }
 
   // ---------------------------------------------------------------------------
