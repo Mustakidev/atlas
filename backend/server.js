@@ -611,7 +611,7 @@ async function startServer() {
     reportAuditUnavailable('ATLAS_STARTING audit was not certified');
   }
 
-  server = app.listen(port, async () => {
+  server = app.listen(port, '0.0.0.0', async () => {
     logger.system('Server', `Atlas v1.0 running on port ${port}`);
     logger.system('Server', `Config loaded`, {
       refreshInterval: interval,
