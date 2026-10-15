@@ -578,3 +578,45 @@ test('HTTP queue-full mutations and committed reads fail closed with retry guida
   assert.equal(mutation.body.error, 'Live state resource capacity unavailable');
   assert.equal(closeCalls, 0);
 });
+
+function trendSignalDeps({ count = 140, price = 150 } = {}) {
+  const H4 = 4 * 3_600_000;
+  const start = Date.UTC(2024, 0, 1);
+  const candles = Array.from({ length: count }, (_, i) => {
+    const close = i < 110 ? 200 - i * 0.5 : 145 + (i - 110) * 2;
+    const open = i === 0 ? close : (i < 110 ? 200 - (i - 1) * 0.5 : 145 + (i - 111) * 2);
+    return { openTime: start + i * H4, open, high: Math.max(open, close) + 1, low: Math.min(open, close) - 1, close, volume: 1 };
+  });
+  return {
+    candleEngine: {
+      getAllTimeframes: () => ['1h', '4h'],
+      getCandles: (tf, limit) => (tf === '4h' ? candles.slice(-limit) : []),
+      getActive: () => null,
+    },
+    cache: { has: () => true, get: () => ({ price, timestamp: '2024-03-01T00:00:00.000Z' }), getAge: () => 100 },
+  };
+}
+
+test('GET /api/trend-signal returns the 4h EMA-cross state with live price context', async () => {
+  const result = await dispatch('/trend-signal', {}, trendSignalDeps());
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.strategy, 'ema-cross-4h');
+  assert.equal(result.body.ready, true);
+  assert.equal(result.body.timeframe, '4h');
+  assert.equal(result.body.trend, 'UP');
+  assert.equal(result.body.action, 'HOLD_LONG');
+  assert.equal(result.body.live.price, 150);
+  assert.equal(result.body.live.stale, true); // fixture candles are from 2024
+  assert.equal(typeof result.body.live.distanceToStopPct, 'number');
+  assert.equal(typeof result.body.live.r, 'number');
+});
+
+test('GET /api/trend-signal reports not ready without enough 4h history', async () => {
+  const result = await dispatch('/trend-signal', {}, trendSignalDeps({ count: 50 }));
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.ready, false);
+  assert.match(result.body.reason, /Insufficient 4h candles/);
+  assert.equal(result.body.live.stale, undefined);
+});

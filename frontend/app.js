@@ -536,6 +536,154 @@ async function updatePipelineDirection() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Trade Signal — validated 4h EMA-cross strategy, executed manually
+// ---------------------------------------------------------------------------
+var MAX_COMFORT_LEVERAGE = 5;
+var lastTrendSignal = null;
+
+var SIGNAL_TEXT = {
+  ENTER_LONG: ['ENTER LONG', 'New long signal. Buy at market and place a stop-loss at {stop}. No take-profit: hold until the signal flips or the stop is hit.'],
+  ENTER_SHORT: ['ENTER SHORT', 'New short signal. Sell at market and place a stop-loss at {stop}. No take-profit: hold until the signal flips or the stop is hit.'],
+  REVERSE_TO_LONG: ['REVERSE TO LONG', 'Trend flipped up. Close any short, buy at market, and place a stop-loss at {stop}.'],
+  REVERSE_TO_SHORT: ['REVERSE TO SHORT', 'Trend flipped down. Close any long, sell at market, and place a stop-loss at {stop}.'],
+  HOLD_LONG: ['HOLDING LONG', 'Keep the long open with the stop at {stop}. Not in yet? You can still enter at market; size it from the current price to the stop.'],
+  HOLD_SHORT: ['HOLDING SHORT', 'Keep the short open with the stop at {stop}. Not in yet? You can still enter at market; size it from the current price to the stop.'],
+  WAIT: ['FLAT — WAIT', 'The last trade hit its stop. Stay out until the trend flips again.'],
+};
+
+function fmtDateTime(ms) {
+  if (!Number.isFinite(ms)) return '--';
+  var d = new Date(ms);
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' + fmtShortTime(ms);
+}
+
+function fmtCountdown(ms) {
+  if (!Number.isFinite(ms)) return '--';
+  var minutes = Math.max(0, Math.round(ms / 60000));
+  return Math.floor(minutes / 60) + 'h ' + ('0' + (minutes % 60)).slice(-2) + 'm';
+}
+
+function setSignalFields(values) {
+  Object.keys(values).forEach(function(id) { $(id).textContent = values[id]; });
+}
+
+function renderSignalHistory(trades) {
+  var list = $('sigHistory');
+  if (!trades.length) {
+    renderEmptyState(list, 'signal-empty', 'No completed signals yet');
+    return;
+  }
+  list.replaceChildren();
+  trades.forEach(function(t) {
+    var row = document.createElement('div');
+    row.className = 'sig-hist-row';
+    appendTextCell(row, t.direction, t.direction === 'LONG' ? 'long' : 'short');
+    appendTextCell(row, fmtDateTime(t.entryTime) + ' ' + fmtUSD(t.entryPrice) + ' → ' + fmtUSD(t.exitPrice));
+    appendTextCell(row, t.exitReason === 'STOP' ? 'stop' : 'flip', 'muted');
+    var r = Number(t.r);
+    appendTextCell(row, Number.isFinite(r) ? (r >= 0 ? '+' : '') + r.toFixed(2) + 'R' : '--', r >= 0 ? 'pos' : 'neg');
+    list.appendChild(row);
+  });
+}
+
+function updatePositionCalc() {
+  var note = $('calcNote');
+  var d = lastTrendSignal;
+  setSignalFields({ calcQty: '--', calcNotional: '--', calcLev: '--', calcRisk: '--' });
+  note.className = 'signal-note';
+  if (!d || !d.direction || !d.signal) {
+    note.textContent = d ? 'No open signal: nothing to size.' : 'Waiting for a signal.';
+    return;
+  }
+  var price = d.live && Number.isFinite(d.live.price) ? d.live.price : d.signal.price;
+  var stop = d.signal.stop;
+  if (d.direction === 'LONG' ? price <= stop : price >= stop) {
+    note.textContent = 'Price is already past the stop. Do not enter.';
+    note.className = 'signal-note warn';
+    return;
+  }
+  var balance = parseFloat($('sigBalance').value);
+  var riskPct = parseFloat($('sigRisk').value);
+  if (!(balance > 0) || !(riskPct > 0)) {
+    note.textContent = 'Enter your account balance to size the trade.';
+    return;
+  }
+  var distance = Math.abs(price - stop);
+  var riskUsd = balance * riskPct / 100;
+  var qty = riskUsd / distance;
+  var leverage = qty * price / balance;
+  setSignalFields({
+    calcQty: qty.toFixed(4) + ' BTC',
+    calcNotional: fmtUSD(qty * price),
+    calcLev: leverage.toFixed(2) + 'x',
+    calcRisk: fmtUSD(riskUsd) + ' (' + riskPct + '%)',
+  });
+  note.textContent = 'From ' + fmtUSD(price) + ' to the stop ' + fmtUSD(stop) + ' (' + (distance / price * 100).toFixed(2)
+    + '% away). Fees add about 0.1% of notional per round trip.';
+  if (leverage > MAX_COMFORT_LEVERAGE) {
+    note.textContent += ' Leverage above ' + MAX_COMFORT_LEVERAGE + 'x: consider lowering risk or skipping.';
+    note.className = 'signal-note warn';
+  }
+}
+
+function renderTrendSignal(d) {
+  var action = $('sigAction');
+  lastTrendSignal = d && d.ready ? d : null;
+  if (!lastTrendSignal) {
+    $('sigStatus').textContent = 'Not ready';
+    action.textContent = '--';
+    action.className = 'signal-action';
+    $('sigInstruction').textContent = d && typeof d.reason === 'string' ? d.reason : 'Waiting for 4h candle data...';
+    setSignalFields({ sigTrend: '--', sigTime: '--', sigPrice: '--', sigEntry: '--', sigStop: '--', sigNow: '--', sigDist: '--', sigPnl: '--', sigEmas: '--', sigNext: '--' });
+    renderSignalHistory([]);
+    updatePositionCalc();
+    return;
+  }
+
+  var live = d.live || {};
+  var sig = d.signal || {};
+  var text = SIGNAL_TEXT[d.action] || [String(d.action), ''];
+  var side = d.direction === 'LONG' ? ' long' : (d.direction === 'SHORT' ? ' short' : '');
+  $('sigStatus').textContent = live.stale ? 'Stale data' : 'Live';
+  action.textContent = text[0];
+  action.className = 'signal-action' + side + (sig.barsAgo === 0 ? ' fresh' : '');
+  $('sigInstruction').textContent = live.stale
+    ? 'Market data is behind: the latest 4h close is missing. Do not act until the status shows Live.'
+    : text[1].replace('{stop}', fmtUSD(sig.stop));
+
+  setSignalFields({
+    sigTrend: d.trend === 'UP' ? 'Up' : 'Down',
+    sigTime: sig.time ? fmtDateTime(sig.time) + (sig.barsAgo ? ' (' + sig.barsAgo + ' candles ago)' : ' (just now)') : '--',
+    sigPrice: fmtUSD(sig.price),
+    sigEntry: sig.entryPrice != null ? fmtUSD(sig.entryPrice) : (d.signal ? 'Next 4h open' : '--'),
+    sigStop: fmtUSD(sig.stop),
+    sigNow: fmtUSD(live.price),
+    sigDist: live.distanceToStopPct != null ? live.distanceToStopPct.toFixed(2) + '%' : '--',
+    sigPnl: live.movePct != null ? fmtPct(live.movePct) + ' (' + (live.r >= 0 ? '+' : '') + Number(live.r).toFixed(2) + 'R)' : '--',
+    sigEmas: fmtUSD(d.indicators && d.indicators.emaFast) + ' / ' + fmtUSD(d.indicators && d.indicators.emaSlow),
+    sigNext: fmtShortTime(d.nextCheckAt) + ' (in ' + fmtCountdown(d.nextCheckAt - Date.now()) + ')',
+  });
+  setClass($('sigTrend'), d.trend === 'UP' ? 'bullish' : 'bearish');
+  setClass($('sigPnl'), live.movePct == null ? '' : (live.movePct >= 0 ? 'bullish' : 'bearish'));
+  renderSignalHistory(Array.isArray(d.history) ? d.history : []);
+  updatePositionCalc();
+}
+
+async function fetchTrendSignal() {
+  try {
+    renderTrendSignal(await dedupedFetch('trendSignal', API + '/api/trend-signal'));
+  } catch (e) { /* keep the last rendered signal; the status dot reports connectivity */ }
+}
+
+// Balance is deliberately not persisted: the frontend keeps no browser storage.
+function setupSignalCalculator() {
+  ['sigBalance', 'sigRisk'].forEach(function(id) {
+    var input = $(id);
+    if (input) input.addEventListener('input', updatePositionCalc);
+  });
+}
+
 async function fetchAdvanceRisk() {
   try {
     var price = currentPrice;
@@ -777,6 +925,7 @@ function startPolling() {
   authState.polling = true;
   fetchReadiness();
   fetchMarket();
+  fetchTrendSignal();
   fetchAnalysis();
   fetchStructure();
   fetchIndicators();
@@ -792,6 +941,7 @@ function startPolling() {
   authState.pollingTimer = setInterval(function() {
     fetchReadiness();
     fetchMarket();
+    fetchTrendSignal();
     fetchAnalysis();
     fetchStructure();
     fetchIndicators();
@@ -895,6 +1045,7 @@ function setupAuthUi() {
   if (logoutButton) logoutButton.addEventListener('click', logout);
   var initButton = $('initLiveBtn');
   if (initButton) initButton.addEventListener('click', initializeLiveState);
+  setupSignalCalculator();
   fetchReadiness();
   bootstrapAuth();
 }

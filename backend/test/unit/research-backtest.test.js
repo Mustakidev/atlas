@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { simulate, summarize } = require('../../research/engine');
 const { createContext } = require('../../research/strategies');
-const ind = require('../../research/indicators');
+const ind = require('../../src/strategy/indicators');
 const { computeRawRsiFromCloses } = require('../../src/engine/rsiCore');
 const { computeRawAtr } = require('../../src/engine/atrCore');
 

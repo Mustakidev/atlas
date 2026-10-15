@@ -1,6 +1,7 @@
 const express = require('express');
 const { sanitizeQuery } = require('../middleware/validate');
 const { getFinalizedCandles } = require('../engine/candleUtils');
+const { EMA_CROSS_DEFAULTS, evaluateEmaCrossTrend } = require('../strategy/emaCrossTrend');
 const {
   AUDIT_COMPLETION_FAILED,
   AUDIT_INTENT_FAILED,
@@ -12,6 +13,7 @@ function createRouter(deps) {
   const { apiManager, history, analyzer, candleEngine, logger, config, eventBus, cache, indicatorRegistry, structureEngine, confluenceEngine, validationEngine, mtfEngine, macdEngine, atrEngine, bollingerEngine, signalHistoryEngine, backtestEngine, analyticsEngine, paperTradeEngine, regimeEngine, regimeDecisionEngine, advanceRiskEngine, mtfConfirmationEngine, symbol, getLastDecision, commitCoordinator, liveRuntime, initializeLiveState, getCommitCoordinator } = deps;
   const router = express.Router();
   const ANALYTICAL_MAX_CANDLES = 1000;
+  const TREND_SIGNAL_STALE_GRACE_MS = 5 * 60_000;
 
   router.use(sanitizeQuery);
 
@@ -573,6 +575,35 @@ function createRouter(deps) {
     logger.info('Structure', `Structure | ${tf} | pattern=${result.structure} | dir=${result.direction} | score=${result.score} | confidence=${result.confidence} | ${duration}ms`);
 
     res.json({ timeframe: tf, candleCount: finalized.length, ...result });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Trend Signal — the validated 4h EMA-cross strategy for manual execution
+  // ---------------------------------------------------------------------------
+
+  router.get('/trend-signal', (req, res) => {
+    const candles = getFinalizedCandles(candleEngine, EMA_CROSS_DEFAULTS.timeframe, ANALYTICAL_MAX_CANDLES);
+    const result = evaluateEmaCrossTrend(candles);
+    const snapshot = (typeof cache?.has === 'function' && cache.has() ? cache.get() : null) || history?.latest?.();
+    const price = Number.isFinite(snapshot?.price) ? snapshot.price : null;
+    const nowMs = Date.now();
+    const live = { price, priceTime: snapshot?.timestamp || null };
+
+    if (result.ready) {
+      // A missing candle close means the feed is behind and the signal may be out of date.
+      live.stale = nowMs > result.nextCheckAt + TREND_SIGNAL_STALE_GRACE_MS;
+      const stop = result.signal?.stop;
+      if (price !== null && Number.isFinite(stop)) {
+        const dir = result.direction === 'LONG' ? 1 : -1;
+        live.distanceToStopPct = Math.round((dir * (price - stop) / price) * 10000) / 100;
+        if (Number.isFinite(result.signal.entryPrice)) {
+          live.movePct = Math.round((dir * (price - result.signal.entryPrice) / result.signal.entryPrice) * 10000) / 100;
+          live.r = Math.round((dir * (price - result.signal.entryPrice) / Math.abs(result.signal.entryPrice - stop)) * 100) / 100;
+        }
+      }
+    }
+
+    res.json({ symbol, ...result, live });
   });
 
   // ---------------------------------------------------------------------------

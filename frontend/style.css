@@ -292,3 +292,35 @@ body{font-family:'SF Mono','Fira Code','Cascadia Code',monospace;background:var(
   .risk-verdict{width:auto;flex:1}
   .risk-rejection{max-width:none}
 }
+
+/* Trade Signal */
+.signal-section{background:var(--bg2);border:1px solid var(--border2);border-radius:8px;margin-bottom:12px;overflow:hidden}
+.signal-head{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.signal-sub{font-size:10px;color:var(--text3);letter-spacing:.5px;flex:1}
+.signal-body{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1.3fr);gap:1px;background:var(--border)}
+.signal-body>div{background:var(--bg2);padding:12px 14px;min-width:0}
+.signal-action{font-size:22px;font-weight:700;letter-spacing:1px;color:var(--text2);margin-bottom:6px}
+.signal-action.long{color:var(--green)}
+.signal-action.short{color:var(--red)}
+.signal-action.fresh{animation:signal-pulse 1.6s ease-in-out infinite}
+@keyframes signal-pulse{50%{opacity:.55}}
+@media (prefers-reduced-motion:reduce){.signal-action.fresh{animation:none}}
+.signal-instruction{font-size:12px;color:var(--text);line-height:1.5;margin-bottom:10px}
+.signal-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:16px}
+.signal-calc-title{font-size:9px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text3);margin-bottom:8px}
+.signal-field{display:block;font-size:10px;color:var(--text2);margin-bottom:8px}
+.signal-field input{display:block;width:100%;margin-top:3px;background:var(--bg);border:1px solid var(--border2);border-radius:5px;color:var(--text);font:inherit;font-size:12px;padding:6px 8px}
+.signal-field input:focus{outline:1px solid var(--cyan);border-color:var(--cyan)}
+.signal-note{font-size:10px;color:var(--text3);margin-top:6px;line-height:1.4}
+.signal-note.warn{color:var(--orange)}
+.signal-history-list{display:flex;flex-direction:column;gap:2px;font-size:11px;max-height:230px;overflow-y:auto}
+.sig-hist-row{display:grid;grid-template-columns:44px minmax(0,1fr) 54px 48px;gap:6px;padding:3px 0;border-bottom:1px solid rgba(26,37,53,.5);font-variant-numeric:tabular-nums}
+.sig-hist-row .long{color:var(--green)}
+.sig-hist-row .short{color:var(--red)}
+.sig-hist-row .pos{color:var(--green);text-align:right}
+.sig-hist-row .neg{color:var(--red);text-align:right}
+.sig-hist-row .muted{color:var(--text3)}
+.signal-empty{font-size:11px;color:var(--text3)}
+.signal-foot{font-size:10px;color:var(--text3);padding:8px 14px;border-top:1px solid var(--border)}
+@media(max-width:1100px){.signal-body{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.signal-main{grid-column:1/-1}}
+@media(max-width:640px){.signal-body{grid-template-columns:minmax(0,1fr)}.signal-grid{grid-template-columns:minmax(0,1fr)}}

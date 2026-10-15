@@ -3,7 +3,8 @@
 // Candidate strategies. Each `build(ctx, params)` returns { signal(i), manage?(i, pos) }
 // where i indexes ctx.h1 and only data up to the close of h1[i] may be used.
 // Higher-timeframe values come from the last 4h bar CLOSED at that moment.
-const ind = require('./indicators');
+const ind = require('../src/strategy/indicators');
+const { EMA_CROSS_DEFAULTS, emaCrossSeries, crossAt, stopFor } = require('../src/strategy/emaCrossTrend');
 
 const HOUR = 3_600_000;
 const H4 = 4 * HOUR;
@@ -64,29 +65,26 @@ const donchianTrend = {
   },
 };
 
+// Same rules the live dashboard uses (src/strategy/emaCrossTrend.js).
 const emaCross = {
   name: 'ema-cross-4h',
   summary: '4h fast/slow EMA crossover, always in the market; ATR safety stop',
-  defaults: { fast: 20, slow: 100, atrMult: 3 },
+  defaults: { fast: EMA_CROSS_DEFAULTS.fast, slow: EMA_CROSS_DEFAULTS.slow, atrMult: EMA_CROSS_DEFAULTS.atrMult },
   grid: { fast: [20, 50], slow: [100, 200], atrMult: [2, 4] },
   build(ctx, p) {
     const { h4, h4Idx, isH4Close, cache } = ctx;
-    const fast = cache(`h4.ema${p.fast}`, () => ind.ema(ctx.closes(h4), p.fast));
-    const slow = cache(`h4.ema${p.slow}`, () => ind.ema(ctx.closes(h4), p.slow));
-    const atr = cache('h4.atr20', () => ind.atr(h4, 20));
-    const side = j => (fast[j] > slow[j] ? 1 : -1);
+    const params = { ...EMA_CROSS_DEFAULTS, ...p };
+    const series = cache(`h4.emaCross.${p.fast}.${p.slow}`, () => emaCrossSeries(h4, params));
     return {
       signal(i) {
         if (!isH4Close[i]) return null;
         const j = h4Idx[i];
-        if (j < 1 || Number.isNaN(slow[j - 1]) || !(atr[j] > 0)) return null;
-        if (side(j) === side(j - 1)) return null;
-        const c = h4[j].close;
-        return { dir: side(j), stop: c - side(j) * p.atrMult * atr[j] };
+        const dir = crossAt(series, j);
+        return dir === 0 ? null : { dir, stop: stopFor(series, h4, j, dir, params) };
       },
       manage(i, pos) {
         if (!isH4Close[i]) return null;
-        return { exit: side(h4Idx[i]) !== pos.dir };
+        return { exit: series.side[h4Idx[i]] !== pos.dir };
       },
     };
   },

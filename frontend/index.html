@@ -62,6 +62,48 @@
       <div class="ov-item"><span class="ov-label">Signal</span><span class="ov-value" id="ovSignal">--</span></div>
     </section>
 
+    <!-- Trade Signal: validated 4h EMA-cross strategy for manual execution -->
+    <section class="signal-section" id="signalSection">
+      <div class="signal-head">
+        <span class="panel-title">Trade Signal</span>
+        <span class="signal-sub">BTCUSDT · 4h EMA 20/100 trend · stop 3×ATR</span>
+        <span class="panel-status" id="sigStatus">--</span>
+      </div>
+      <div class="signal-body">
+        <div class="signal-main">
+          <div class="signal-action" id="sigAction">--</div>
+          <div class="signal-instruction" id="sigInstruction">Waiting for 4h candle data...</div>
+          <div class="signal-grid">
+            <div class="kv-row"><span class="kv-key">Trend</span><span class="kv-val" id="sigTrend">--</span></div>
+            <div class="kv-row"><span class="kv-key">Signal at</span><span class="kv-val" id="sigTime">--</span></div>
+            <div class="kv-row"><span class="kv-key">Signal close</span><span class="kv-val" id="sigPrice">--</span></div>
+            <div class="kv-row"><span class="kv-key">Entry (next open)</span><span class="kv-val" id="sigEntry">--</span></div>
+            <div class="kv-row"><span class="kv-key">Stop-loss</span><span class="kv-val" id="sigStop">--</span></div>
+            <div class="kv-row"><span class="kv-key">Price now</span><span class="kv-val" id="sigNow">--</span></div>
+            <div class="kv-row"><span class="kv-key">Distance to stop</span><span class="kv-val" id="sigDist">--</span></div>
+            <div class="kv-row"><span class="kv-key">Open P/L</span><span class="kv-val" id="sigPnl">--</span></div>
+            <div class="kv-row"><span class="kv-key">EMA20 / EMA100</span><span class="kv-val" id="sigEmas">--</span></div>
+            <div class="kv-row"><span class="kv-key">Next 4h check</span><span class="kv-val" id="sigNext">--</span></div>
+          </div>
+        </div>
+        <div class="signal-calc">
+          <div class="signal-calc-title">Position size</div>
+          <label class="signal-field">Account (USDT)<input id="sigBalance" type="number" min="0" step="any" inputmode="decimal" placeholder="1000"></label>
+          <label class="signal-field">Risk per trade (%)<input id="sigRisk" type="number" min="0.1" max="10" step="0.1" inputmode="decimal" value="2"></label>
+          <div class="kv-row"><span class="kv-key">Size</span><span class="kv-val" id="calcQty">--</span></div>
+          <div class="kv-row"><span class="kv-key">Notional</span><span class="kv-val" id="calcNotional">--</span></div>
+          <div class="kv-row"><span class="kv-key">Leverage needed</span><span class="kv-val" id="calcLev">--</span></div>
+          <div class="kv-row"><span class="kv-key">Loss if stopped</span><span class="kv-val" id="calcRisk">--</span></div>
+          <div class="signal-note" id="calcNote">Sized from the current price to the stop.</div>
+        </div>
+        <div class="signal-history">
+          <div class="signal-calc-title">Recent signals</div>
+          <div class="signal-history-list" id="sigHistory"></div>
+        </div>
+      </div>
+      <div class="signal-foot">Backtest 2020→now (futures costs): ~28% of trades win, winners are large; expect strings of 5–8 losses. Not financial advice.</div>
+    </section>
+
     <!-- Chart -->
     <section class="chart-section">
       <div class="chart-panel">

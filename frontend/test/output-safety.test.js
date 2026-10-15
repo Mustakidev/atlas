@@ -120,7 +120,7 @@ function createEnvironment(responseBody) {
 
   const source = appSource.replace(
     '\nsetupAuthUi();\n',
-    '\nwindow.__ph7 = { fetchPaperTrades: fetchPaperTrades, fetchLogs: fetchLogs, fetchInspector: fetchInspector };\n',
+    '\nwindow.__ph7 = { fetchPaperTrades: fetchPaperTrades, fetchLogs: fetchLogs, fetchInspector: fetchInspector, fetchTrendSignal: fetchTrendSignal };\n',
   );
   vm.runInNewContext(source, context, { filename: 'frontend/app.js' });
   return { document, renderers: window.__ph7 };
@@ -294,4 +294,51 @@ test('open paper trades render a text-only Close control', async () => {
   assert.equal(buttons.length, 1);
   assert.equal(buttons[0].textContent, 'Close');
   assert.equal(typeof buttons[0].listeners.click, 'function');
+});
+
+function trendSignalPayload(overrides = {}) {
+  return {
+    ready: true,
+    action: 'HOLD_LONG',
+    direction: 'LONG',
+    trend: 'UP',
+    nextCheckAt: Date.UTC(2024, 0, 1, 4),
+    indicators: { emaFast: 101, emaSlow: 99 },
+    signal: { time: Date.UTC(2024, 0, 1), price: 100, stop: 90, entryPrice: 100, barsAgo: 2 },
+    live: { price: 105, stale: false, distanceToStopPct: 14.29, movePct: 5, r: 0.5 },
+    history: [{ direction: 'SHORT', entryTime: Date.UTC(2023, 11, 1), entryPrice: 120, exitPrice: 110, exitReason: 'REVERSE', r: 1.2 }],
+    ...overrides,
+  };
+}
+
+test('trend signal panel renders server text literally and sizes from price to stop', async () => {
+  for (const payload of PAYLOADS) {
+    const environment = createEnvironment(trendSignalPayload({
+      action: payload,
+      reason: payload,
+      history: [{ direction: payload, entryTime: 0, entryPrice: 1, exitPrice: 2, exitReason: payload, r: payload }],
+    }));
+    environment.document.getElementById('sigBalance').value = '1000';
+    environment.document.getElementById('sigRisk').value = '2';
+    await environment.renderers.fetchTrendSignal();
+
+    assert.equal(environment.document.getElementById('sigAction').textContent, payload);
+    assertNoMarkupNodes(environment.document.getElementById('sigHistory'));
+    assert.match(environment.document.getElementById('sigHistory').textContent, /--$/);
+    // $20 risk over a $15 stop distance from the live price of $105.
+    assert.equal(environment.document.getElementById('calcQty').textContent, '1.3333 BTC');
+    assert.equal(environment.document.getElementById('calcLev').textContent, '0.14x');
+  }
+});
+
+test('trend signal panel shows the not-ready reason and stale warning as text', async () => {
+  const notReady = createEnvironment({ ready: false, reason: '<b>Insufficient 4h candles</b>' });
+  await notReady.renderers.fetchTrendSignal();
+  assert.equal(notReady.document.getElementById('sigInstruction').textContent, '<b>Insufficient 4h candles</b>');
+  assert.equal(notReady.document.getElementById('sigStatus').textContent, 'Not ready');
+
+  const stale = createEnvironment(trendSignalPayload({ live: { price: 105, stale: true } }));
+  await stale.renderers.fetchTrendSignal();
+  assert.equal(stale.document.getElementById('sigStatus').textContent, 'Stale data');
+  assert.match(stale.document.getElementById('sigInstruction').textContent, /Do not act/);
 });
