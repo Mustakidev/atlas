@@ -39,7 +39,39 @@ function registerLiveSnapshotHandler({
     assertDurablePipelineCompletion();
   };
 
+  // Exchange-bar mode: each closed 1m bar becomes one analyzer observation and one
+  // exact candle update; the pipeline then checks trades against those bars and
+  // the current price. Bars already ingested are ignored by the candle engine.
+  const processBarSnapshot = snapshot => {
+    const ingestedBars = [];
+    for (const bar of snapshot.bars) {
+      const result = candleEngine.ingestBar(bar);
+      if (!result.ingested) continue;
+      ingestedBars.push(result.bar);
+      history.add({
+        symbol: snapshot.symbol,
+        exchange: snapshot.exchange,
+        price: result.bar.close,
+        volume: snapshot.volume,
+        change24h: snapshot.change24h,
+        timestamp: new Date(result.bar.openTime + 60_000).toISOString(),
+      });
+    }
+    candleEngine.setFormingBar(snapshot.forming || null);
+
+    analyzer.analyze(history);
+    signalHistoryEngine.record();
+    executionPipeline.run(
+      { symbol: snapshot.symbol, price: snapshot.price, timestamp: snapshot.timestamp },
+      { lifecycleCandles: ingestedBars },
+    );
+    assertDurablePipelineCompletion();
+  };
+
   const processAdmittedSnapshot = (snapshot, transition) => {
+    if (transition === undefined && candleEngine && Array.isArray(snapshot?.bars)) {
+      return processBarSnapshot(snapshot);
+    }
     let effectiveTransition = transition;
     if (effectiveTransition === undefined && candleEngine) {
       history.add(snapshot);

@@ -75,6 +75,13 @@ ApiManager.prototype.fetchMarketData = async function () {
   };
 };
 
+const binancePath = require.resolve('../../src/network/binanceMarketData');
+const { BinanceMarketData } = require(binancePath);
+BinanceMarketData.prototype.fetchMarketData = ApiManager.prototype.fetchMarketData;
+BinanceMarketData.prototype.fetchSeed = async function () {
+  return { timeframes: {}, history: [] };
+};
+
 if (marketMode === 'open') {
   const pipelinePath = require.resolve('../../src/core/executionPipeline');
   const pipelineModule = require(pipelinePath);

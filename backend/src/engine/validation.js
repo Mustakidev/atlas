@@ -71,6 +71,21 @@ class ValidationEngine {
     results.regimeDecision = this._validateRegimeDecision();
     results.mtfConfirmation = this._validateMTFConfirmation();
 
+    // Each engine's status is derived from its own tests; overall status is never
+    // inferred from a missing field.
+    for (const result of Object.values(results)) {
+      const testStatuses = result.tests.map(t => t.status);
+      if (testStatuses.length === 0 || testStatuses.some(st => !['PASS', 'WARNING', 'FAIL'].includes(st))) {
+        result.status = 'FAIL';
+      } else if (testStatuses.includes('FAIL')) {
+        result.status = 'FAIL';
+      } else if (testStatuses.includes('WARNING')) {
+        result.status = 'WARNING';
+      } else {
+        result.status = 'PASS';
+      }
+    }
+
     const statuses = Object.values(results).map(r => r.status);
     let overall = 'PASS';
     if (statuses.includes('FAIL')) overall = 'FAIL';
@@ -1343,19 +1358,18 @@ class ValidationEngine {
       return { status: 'PASS', reason: `HighVol: allowed with confluence 80, warning=${r.warning}` };
     }));
 
-    // Test 9: Unknown regime — always allowed
+    // Test 9: Unknown regime — fail closed
     tests.push(this._runTest('RegimeDecision Unknown', () => {
       const r = engine.evaluate({ regime: 'UNKNOWN', confidence: 0, direction: 'BUY', confluenceScore: 50 });
-      if (!r.allowTrade) return { status: 'FAIL', reason: `Unknown regime should always allow trade` };
-      if (r.penalty !== 0) return { status: 'FAIL', reason: `Unknown regime should have 0 penalty` };
-      return { status: 'PASS', reason: `Unknown: allowed, penalty=0` };
+      if (r.allowTrade) return { status: 'FAIL', reason: `Unknown regime must block trades` };
+      return { status: 'PASS', reason: `Unknown: blocked (${r.reason})` };
     }));
 
-    // Test 10: Missing regime field
+    // Test 10: Missing regime field — fail closed
     tests.push(this._runTest('RegimeDecision Missing Regime', () => {
       const r = engine.evaluate({ regime: null, confidence: 0, direction: 'BUY', confluenceScore: 50 });
-      if (!r.allowTrade) return { status: 'FAIL', reason: `Missing regime should fall back to unknown (allowed)` };
-      return { status: 'PASS', reason: `Missing regime: falls back to unknown handler, allowed` };
+      if (r.allowTrade) return { status: 'FAIL', reason: `Missing regime must block trades` };
+      return { status: 'PASS', reason: `Missing regime: blocked (${r.reason})` };
     }));
 
     // Test 11: Determinism
@@ -2958,7 +2972,7 @@ class ValidationEngine {
       const candles = [];
       for (let i = 0; i < 30; i++) {
         const c = 100;
-        const range = 2 + i * 0.5; // Range grows from 2 to ~16
+        const range = Math.pow(1.2, i); // Range accelerates so the latest TR outpaces the smoothed ATR
         candles.push({
           openTime: i * 3600000, close: c, high: c + range, low: c - range,
           open: c, volume: 1000, timestamp: new Date(i * 3600000).toISOString(),

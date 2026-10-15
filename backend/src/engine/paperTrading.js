@@ -83,8 +83,18 @@ const EXIT_REASONS = {
 };
 
 class PaperTradingEngine {
-  constructor({ logger, symbol, clock }) {
+  constructor({ logger, symbol, clock, feePct = 0, slippagePct = 0 }) {
+    if (!isFiniteNumber(feePct) || feePct < 0 || feePct >= 5) {
+      throw new TypeError('feePct must be a finite percentage between 0 and 5');
+    }
+    if (!isFiniteNumber(slippagePct) || slippagePct < 0 || slippagePct >= 5) {
+      throw new TypeError('slippagePct must be a finite percentage between 0 and 5');
+    }
     this.logger = logger;
+    // Round-trip costs are charged per side on traded notional: exchange fee plus
+    // an adverse-fill allowance. Both default to zero for isolated unit use.
+    this._feePct = feePct;
+    this._slippagePct = slippagePct;
     this.symbol = symbol || DEFAULT_SYMBOL;
     this.clock = resolveClock(clock);
     this.version = ENGINE_VERSION;
@@ -204,7 +214,15 @@ class PaperTradingEngine {
     const openTrades = this._trades.filter(t => t.status === TRADE_STATES.OPEN || t.status === TRADE_STATES.ACTIVE);
     const closed = [];
 
+    const candleStartMs = Number.isFinite(candle.openTime)
+      ? candle.openTime
+      : (typeof candle.timestamp === 'string' ? Date.parse(candle.timestamp) : NaN);
+
     for (const trade of openTrades) {
+      // A candle that began before the trade was opened contains prices the trade
+      // never experienced, so its extremes must not trigger stop loss or take profit.
+      if (Number.isFinite(candleStartMs) && Date.parse(trade.entryTime) > candleStartMs) continue;
+
       if (trade.status === TRADE_STATES.OPEN) {
         this._updateTradeState(trade, TRADE_STATES.ACTIVE);
       }
@@ -225,15 +243,9 @@ class PaperTradingEngine {
         hitSL = high >= trade.stopLoss;
       }
 
-      if (hitSL && hitTP) {
-        if (trade.direction === 'BUY') {
-          hitTP = trade.takeProfit - trade.entryPrice >= trade.entryPrice - trade.stopLoss;
-          hitSL = !hitTP;
-        } else {
-          hitTP = trade.entryPrice - trade.takeProfit >= trade.stopLoss - trade.entryPrice;
-          hitSL = !hitTP;
-        }
-      }
+      // When one candle reaches both levels the intra-candle order is unknown.
+      // Assume the adverse outcome so simulated results are never optimistic.
+      if (hitSL && hitTP) hitTP = false;
 
       if (hitSL) {
         const closedTrade = this._closeTrade(trade, trade.stopLoss, EXIT_REASONS.STOP_LOSS, context);
@@ -445,7 +457,7 @@ class PaperTradingEngine {
         avgConsecutiveWins: 0, avgConsecutiveLosses: 0,
         currentStreak: 0, currentStreakType: 'None',
         totalPnl: 0, netReturnPct: 0,
-        sharpeRatio: 0, SortinoRatio: 0,
+        sharpeRatio: 0, sortinoRatio: 0,
       };
     }
 
@@ -492,6 +504,8 @@ class PaperTradingEngine {
       version: this.version,
       symbol: this.symbol,
       maxTrades: this._maxTrades,
+      feePct: this._feePct,
+      slippagePct: this._slippagePct,
       balance: this._balance,
       initialBalance: this._initialBalance,
     };
@@ -745,13 +759,20 @@ class PaperTradingEngine {
     trade.exitReason = reason;
 
     const entryPrice = trade.entryPrice;
-    if (trade.direction === 'BUY') {
-      trade.pnl = this._round((exitPrice - entryPrice) * trade.positionSize);
-      trade.pnlPercent = this._round(((exitPrice - entryPrice) / entryPrice) * 100);
-    } else {
-      trade.pnl = this._round((entryPrice - exitPrice) * trade.positionSize);
-      trade.pnlPercent = this._round(((entryPrice - exitPrice) / entryPrice) * 100);
-    }
+    const grossPnl = trade.direction === 'BUY'
+      ? (exitPrice - entryPrice) * trade.positionSize
+      : (entryPrice - exitPrice) * trade.positionSize;
+    const costRate = (this._feePct + this._slippagePct) / 100;
+    const costs = costRate * (entryPrice + exitPrice) * trade.positionSize;
+    const netPnl = grossPnl - costs;
+    const entryNotional = entryPrice * trade.positionSize;
+    trade.pnl = this._round(netPnl);
+    const grossMovePct = trade.direction === 'BUY'
+      ? ((exitPrice - entryPrice) / entryPrice) * 100
+      : ((entryPrice - exitPrice) / entryPrice) * 100;
+    trade.pnlPercent = entryNotional > 0
+      ? this._round((netPnl / entryNotional) * 100)
+      : this._round(grossMovePct - costRate * 100 * ((entryPrice + exitPrice) / entryPrice));
 
     const entryMs = new Date(trade.entryTime).getTime();
     const exitMs = new Date(trade.exitTime).getTime();

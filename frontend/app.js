@@ -5,13 +5,14 @@
 var API = '';
 var REFRESH = 3000;
 var CANDLE_REFRESH = 2000;
+// The live execution pipeline trades on 1h; risk and MTF panels must describe
+// that decision path regardless of the timeframe shown on the chart.
+var TRADING_TF = '1h';
 var chartCurrentTF = '1h';
 var chartLastCandles = [];
 var chartPrevFinalizedCount = 0;
 var chartFirstLoad = true;
 var chartInitialized = false;
-var lastLogCount = 0;
-var lastLogId = 0;
 var currentPrice = null;
 var pipelineDirection = null;
 var authState = {
@@ -164,6 +165,49 @@ function setConnected(ok) {
   var ready = liveReadiness === 'READY';
   dot.className = 'status-dot ' + (ok && ready ? 'connected' : 'disconnected');
   txt.textContent = ready ? (ok ? 'Connected' : 'Disconnected') : readinessLabel(liveReadiness);
+  updateInitializeButton();
+}
+
+function updateInitializeButton() {
+  var button = $('initLiveBtn');
+  if (!button) return;
+  if (authState.authenticated && liveReadiness === 'UNINITIALIZED') button.classList.remove('hidden');
+  else button.classList.add('hidden');
+}
+
+async function initializeLiveState() {
+  var button = $('initLiveBtn');
+  if (button) button.disabled = true;
+  try {
+    var response = await fetch(API + '/api/live-state/initialize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: '{}',
+    });
+    if (response.status === 401) handleAuthenticationLoss('Session expired. Sign in again.');
+  } catch (error) {
+    // Readiness polling reports the resulting state.
+  } finally {
+    if (button) button.disabled = false;
+    fetchReadiness();
+  }
+}
+
+async function closePaperTrade(tradeId) {
+  if (typeof window.confirm === 'function' && !window.confirm('Close paper trade ' + tradeId + ' at the current price?')) return;
+  try {
+    var response = await fetch(API + '/api/paper-trades/close', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ tradeId: tradeId, reason: 'Manual' }),
+    });
+    if (response.status === 401) handleAuthenticationLoss('Session expired. Sign in again.');
+  } catch (error) {
+    // The next paper-trade poll shows the authoritative state.
+  }
+  fetchPaperTrades();
 }
 
 function readinessLabel(state) {
@@ -497,7 +541,7 @@ async function fetchAdvanceRisk() {
     var price = currentPrice;
     var dir = pipelineDirection;
     if (!price || !dir) return;
-    var d = await dedupedFetch('advance-risk-' + chartCurrentTF + '-' + dir, API + '/api/advance-risk?timeframe=' + chartCurrentTF + '&entryPrice=' + price + '&direction=' + dir);
+    var d = await dedupedFetch('advance-risk-' + dir, API + '/api/advance-risk?timeframe=' + TRADING_TF + '&entryPrice=' + price + '&direction=' + dir);
     if (!d) return;
     $('advanceRiskStatus').textContent = d.tradeAllowed ? 'Allowed' : 'Rejected';
     $('advPosSize').textContent = d.positionSize != null ? d.positionSize : '--';
@@ -537,7 +581,7 @@ async function fetchMtfConfirmation() {
     var price = currentPrice;
     var dir = pipelineDirection;
     if (!price || !dir) return;
-    var d = await dedupedFetch('mtf-confirmation-' + dir, API + '/api/mtf-confirmation?direction=' + dir + '&timeframe=' + chartCurrentTF);
+    var d = await dedupedFetch('mtf-confirmation-' + dir, API + '/api/mtf-confirmation?direction=' + dir + '&timeframe=' + TRADING_TF);
     if (!d) return;
     $('mtfConfStatus').textContent = d.mtfAllowed ? 'Allowed' : 'Rejected';
     var alignment = d.alignment || {};
@@ -623,6 +667,14 @@ async function fetchPaperTrades() {
       appendTextCell(row, fmtUSD(t.takeProfit));
       appendTextCell(row, t.status || '--', stCls);
       appendTextCell(row, pnlText, pnlCls);
+      if ((t.status === 'OPEN' || t.status === 'ACTIVE') && typeof t.tradeId === 'string') {
+        var closeButton = document.createElement('button');
+        closeButton.className = 'paper-close-btn';
+        closeButton.type = 'button';
+        closeButton.textContent = 'Close';
+        closeButton.addEventListener('click', closePaperTrade.bind(null, t.tradeId));
+        row.appendChild(closeButton);
+      }
       list.appendChild(row);
     }
 
@@ -672,7 +724,10 @@ async function fetchLogs() {
     if (!d || !d.logs) return;
     var logs = d.logs;
     var body = $('logBody');
-    for (var i = lastLogCount; i < logs.length; i++) {
+    // The endpoint returns a sliding window of the latest entries, so the panel is
+    // re-rendered from that window instead of appending by count (which froze at 100).
+    body.replaceChildren();
+    for (var i = 0; i < logs.length; i++) {
       var entry = logs[i];
       var div = document.createElement('div');
       var level = (entry.level || 'info').toLowerCase();
@@ -685,9 +740,10 @@ async function fetchLogs() {
       }[level] || 'log-info';
       div.className = 'log-entry ' + levelClass;
       var time = fmtTime(entry.timestamp);
-      var meta = entry.meta && Object.keys(entry.meta).length ? ' ' + JSON.stringify(entry.meta) : '';
+      var detail = entry.data || entry.context || entry.meta;
+      var meta = detail && typeof detail === 'object' && Object.keys(detail).length ? ' ' + JSON.stringify(detail) : '';
       appendTextCell(div, '[' + time + ']', 'log-time');
-      appendTextCell(div, '[' + (entry.level || 'INFO').toUpperCase() + '] ' + entry.message + meta);
+      appendTextCell(div, '[' + (entry.level || 'INFO').toUpperCase() + '] ' + (entry.module || entry.source ? '[' + (entry.module || entry.source) + '] ' : '') + entry.message + meta);
       body.appendChild(div);
     }
     if (body.children.length > 100) {
@@ -695,7 +751,6 @@ async function fetchLogs() {
     }
     body.scrollTop = body.scrollHeight;
     $('logCount').textContent = body.children.length;
-    lastLogCount = logs.length;
   } catch(e) {}
 }
 
@@ -838,6 +893,8 @@ function setupAuthUi() {
   var logoutButton = $('logoutBtn');
   if (form) form.addEventListener('submit', submitLogin);
   if (logoutButton) logoutButton.addEventListener('click', logout);
+  var initButton = $('initLiveBtn');
+  if (initButton) initButton.addEventListener('click', initializeLiveState);
   fetchReadiness();
   bootstrapAuth();
 }
@@ -908,6 +965,11 @@ async function fetchInspector() {
     }
 
     var v = d.verdict;
+    var signalEl = $('ovSignal');
+    if (signalEl) {
+      signalEl.textContent = v.tradeOpened && v.trade ? v.trade.direction + ' opened' : 'No trade';
+      setClass(signalEl, v.tradeOpened && v.trade ? trendClass(v.trade.direction === 'BUY' ? 'bullish' : 'bearish') : '');
+    }
     var vIcon = $('inspVerdictIcon');
     var vText = $('inspVerdictText');
     var vDetail = $('inspVerdictDetail');

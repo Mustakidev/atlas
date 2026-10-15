@@ -22,7 +22,8 @@ function createResourceAdmission({ logger = null } = {}) {
   let responseBudgetRejects = 0;
 
   function isAnalyticalRequest(req) {
-    return req.method === 'GET' && ANALYTICAL_PATHS.has(req.path);
+    const path = String(req.path || '').toLowerCase().replace(/\/+$/, '');
+    return req.method === 'GET' && ANALYTICAL_PATHS.has(path);
   }
 
   function acquireAnalytical(path = 'analytical') {

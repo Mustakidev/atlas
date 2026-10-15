@@ -442,3 +442,29 @@ test('rotation keeps at most five rotated files and preserves the newest records
     assert.equal(entries.some(entry => /^atlas-events\.jsonl\.6$/.test(entry)), false);
   });
 });
+
+test('a full queue refuses critical records without latching UNSAFE', async () => {
+  const store = new DurableLogStore();
+  store.initialized = true;
+  store.health = 'HEALTHY';
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let writes = 0;
+  store._write = async serialized => {
+    writes += 1;
+    if (writes === 1) await gate;
+    return { status: 'DURABLE_CRITICAL_CERTIFIED', record: JSON.parse(serialized) };
+  };
+  let markers = 0;
+  store._writeUnsafeMarker = async () => { markers += 1; };
+
+  const accepted = Array.from({ length: 64 }, (_, index) => store.append(line(index)));
+  await new Promise(resolve => setImmediate(resolve));
+  await assert.rejects(store.append(line(64), { critical: true }), error => error.code === 'LOG_QUEUE_FULL');
+  assert.notEqual(store.health, 'UNSAFE');
+  assert.equal(markers, 0);
+
+  release();
+  await Promise.all(accepted);
+  assert.equal((await store.append(line(65), { critical: true })).status, 'DURABLE_CRITICAL_CERTIFIED');
+});

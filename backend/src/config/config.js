@@ -14,15 +14,21 @@ const defaults = {
   PORT: 3000,
   API_URL: 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_vol=true&include_24hr_change=true',
   SYMBOL: 'BTCUSDT',
-  REFRESH_INTERVAL: 2000,
+  MARKET_DATA_PROVIDER: 'binance',
+  BINANCE_BASE_URL: 'https://data-api.binance.vision',
+  REFRESH_INTERVAL: 5000,
   CACHE_TTL: 30000,
-  MAX_HISTORY: 500,
+  MAX_HISTORY: 1500,
   LOG_LEVEL: 'INFO',
   REQUEST_TIMEOUT: 10000,
   MAX_RETRIES: 5,
   INITIAL_BACKOFF: 1000,
   CONFLUENCE_BULLISH_THRESHOLD: 65,
   CONFLUENCE_BEARISH_THRESHOLD: 35,
+  MAX_OPEN_POSITIONS: 1,
+  MAX_LEVERAGE: 1,
+  PAPER_FEE_PCT: 0.1,
+  PAPER_SLIPPAGE_PCT: 0.05,
   MIN_API_INTERVAL: 5000,
   API_THROTTLE_TTL: 30000,
   API_KEY: '',
@@ -56,11 +62,15 @@ const INTEGER_KEYS = new Set([
   'RATE_LIMIT_EXPENSIVE_MAX',
   'RATE_LIMIT_LOGIN_MAX_REQUESTS',
   'RATE_LIMIT_LOGIN_WINDOW_MS',
+  'MAX_OPEN_POSITIONS',
 ]);
 
 const FINITE_NUMBER_KEYS = new Set([
   'CONFLUENCE_BULLISH_THRESHOLD',
   'CONFLUENCE_BEARISH_THRESHOLD',
+  'MAX_LEVERAGE',
+  'PAPER_FEE_PCT',
+  'PAPER_SLIPPAGE_PCT',
 ]);
 
 const BODY_SIZE_PATTERN = /^(?:\d+|\d+(?:\.\d+)?[ \t]*(?:kb|mb|gb|tb|pb))$/i;
@@ -285,6 +295,20 @@ class ConfigManager {
       }
     }
 
+    const provider = this.config.MARKET_DATA_PROVIDER;
+    if (provider !== 'binance' && provider !== 'coingecko') {
+      errors.push('MARKET_DATA_PROVIDER must be binance or coingecko');
+    }
+    const binanceBaseUrl = this.config.BINANCE_BASE_URL;
+    try {
+      const parsed = new URL(binanceBaseUrl);
+      if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.search || parsed.hash) {
+        throw new TypeError('invalid');
+      }
+    } catch {
+      errors.push('BINANCE_BASE_URL must be an HTTPS URL without credentials, query, or fragment');
+    }
+
     const symbol = this.config.SYMBOL;
     if (symbol !== 'BTCUSDT') errors.push('SYMBOL must be exactly BTCUSDT');
 
@@ -308,6 +332,11 @@ class ConfigManager {
     if (bullishThreshold !== null && bearishThreshold !== null && bearishThreshold >= bullishThreshold) {
       errors.push('CONFLUENCE_BEARISH_THRESHOLD must be less than CONFLUENCE_BULLISH_THRESHOLD');
     }
+
+    integer('MAX_OPEN_POSITIONS', 1, 20);
+    finiteNumber('MAX_LEVERAGE', 0.1, 10);
+    finiteNumber('PAPER_FEE_PCT', 0, 1);
+    finiteNumber('PAPER_SLIPPAGE_PCT', 0, 1);
 
     if (cacheTtl !== null && throttleTtl !== null && throttleTtl > cacheTtl) {
       errors.push('API_THROTTLE_TTL must be less than or equal to CACHE_TTL');

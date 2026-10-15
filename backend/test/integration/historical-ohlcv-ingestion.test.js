@@ -234,11 +234,11 @@ test('preserved historical extremes remain usable by paper-trade lifecycle check
   const paper = new PaperTradingEngine({ logger: logger(), symbol: 'BTCUSDT' });
 
   const trade = paper.signal({}, 100, '1h', 'BUY', {
-    stopLoss: 99,
+    stopLoss: 97,
     takeProfit: 101,
     positionSize: 1,
-    riskReward: 2,
-  });
+    riskReward: 0.33,
+  }, { nowMs: candle.openTime });
   const result = paper.onCandle(candle);
 
   assert.ok(trade);
@@ -258,7 +258,7 @@ test('live tick aggregation remains price-driven despite unrelated snapshot extr
     high: 105,
     low: 100,
     close: 105,
-    volume: 2,
+    volume: 0,
     openTime: BASE_TIME + 5 * 60000,
     timestamp: new Date(firstTimestamp).toISOString(),
   });

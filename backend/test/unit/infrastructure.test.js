@@ -300,7 +300,7 @@ test('CandleEngine aggregates active candles and exposes timeframe boundaries', 
   assert.equal(active.high, 105);
   assert.equal(active.low, 100);
   assert.equal(active.close, 105);
-  assert.equal(active.volume, 14);
+  assert.equal(active.volume, 0);
   assert.equal(candles.getTotalCandles(), 8);
   assert.equal(candles.getAllTimeframes().length, 8);
 });
@@ -359,7 +359,7 @@ test('CandleEngine same-bucket ingest preserves state and reports no finalizatio
     high: 105,
     low: 100,
     close: 105,
-    volume: 14,
+    volume: 0,
     openTime: BASE_TIME,
     timestamp: new Date(BASE_TIME).toISOString(),
   });

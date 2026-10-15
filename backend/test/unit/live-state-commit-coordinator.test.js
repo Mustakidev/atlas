@@ -10,6 +10,7 @@ const { createConfigFingerprint } = require('../../src/state/liveExecutionStateS
 const {
   DURABILITY_UNAVAILABLE,
   STATE_QUEUE_FULL,
+  MAX_READ_QUEUE_DEPTH,
   MUTATION_UNCERTIFIED,
   createLiveStateCommitCoordinator,
 } = require('../../src/state/liveStateCommitCoordinator');
@@ -208,7 +209,7 @@ test('queue-full committed reads do not execute their callback', async () => {
     mutate: () => { state.domain = { value: 1 }; },
   });
   await new Promise(resolve => setImmediate(resolve));
-  const waiting = Array.from({ length: 4 }, () => coordinator.readCommitted(() => 'waiting'));
+  const waiting = Array.from({ length: MAX_READ_QUEUE_DEPTH }, () => coordinator.readCommitted(() => 'waiting'));
   let called = false;
   await assert.rejects(
     coordinator.readCommitted(() => {
@@ -219,7 +220,25 @@ test('queue-full committed reads do not execute their callback', async () => {
   );
   assert.equal(called, false);
   release();
-  assert.deepEqual(await Promise.all([active, ...waiting]), [undefined, 'waiting', 'waiting', 'waiting', 'waiting']);
+  assert.deepEqual(await Promise.all([active, ...waiting]), [undefined, ...waiting.map(() => 'waiting')]);
+});
+
+test('waiting committed reads never consume mutation capacity', async () => {
+  const state = harness();
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  state.stateStore.write = async () => gate.then(() => ({ status: 'WRITTEN' }));
+  const coordinator = createLiveStateCommitCoordinator(state);
+
+  const active = coordinator.runMutation({ name: 'active', mutate: () => { state.domain = { value: 1 }; } });
+  await new Promise(resolve => setImmediate(resolve));
+  const reads = Array.from({ length: 10 }, () => coordinator.readCommitted(() => 'read'));
+  const snapshot = coordinator.runMutation({ name: 'live-snapshot', mutate: () => 'admitted' });
+
+  release();
+  assert.equal(await snapshot, 'admitted');
+  await Promise.all([active, ...reads]);
+  assert.equal(coordinator.getStatus().commitQueueRejects, 0);
 });
 
 test('no-op mutations do not write or advance the sequence', async () => {

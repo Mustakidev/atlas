@@ -5,6 +5,7 @@ const { HistoryEngine } = require('./src/engine/history');
 const { MarketAnalyzer } = require('./src/engine/analyzer');
 const { RetryHandler } = require('./src/network/retry');
 const { ApiManager } = require('./src/network/apiManager');
+const { BinanceMarketData } = require('./src/network/binanceMarketData');
 const { CandleEngine, sortHistoricalOhlcRows } = require('./src/engine/candles');
 const { EventBus } = require('./src/core/eventBus');
 const { createIndicatorRegistry } = require('./src/engine/indicators');
@@ -30,7 +31,7 @@ const { createExecutionPipeline } = require('./src/core/executionPipeline');
 const { createSystemClock } = require('./src/core/clock');
 const { registerLiveSnapshotHandler } = require('./src/core/liveSnapshot');
 const { createLifecycleController } = require('./src/core/lifecycleController');
-const { createAtomicJsonStateStore } = require('./src/state/atomicJsonStateStore');
+const { createAtomicJsonStateStore, DEFAULT_STATE_FILE_PATH } = require('./src/state/atomicJsonStateStore');
 const { createLiveExecutionStateAggregate } = require('./src/state/liveExecutionStateAggregate');
 const { createLiveStateCommitCoordinator } = require('./src/state/liveStateCommitCoordinator');
 const { createLiveRuntimeState } = require('./src/state/liveRuntimeState');
@@ -129,7 +130,10 @@ const history = new HistoryEngine(config, logger, symbol);
 const analyzer = new MarketAnalyzer(logger, symbol);
 const candleEngine = new CandleEngine(config, logger, symbol);
 const retry = new RetryHandler(config, logger);
-const apiManager = new ApiManager(config, retry, cache, logger);
+const marketDataProvider = config.get('MARKET_DATA_PROVIDER');
+const apiManager = marketDataProvider === 'coingecko'
+  ? new ApiManager(config, retry, cache, logger)
+  : new BinanceMarketData({ fetch, config, logger, retry, cache, clock });
 const indicatorRegistry = createIndicatorRegistry(symbol);
 const structureEngine = new StructureEngine(logger, symbol);
 const confluenceEngine = new ConfluenceEngine({ analyzer, indicatorRegistry, structureEngine, candleEngine, logger, config, symbol });
@@ -140,7 +144,13 @@ const bollingerEngine = new BollingerEngine({ candleEngine, logger, symbol });
 const signalHistoryEngine = new SignalHistoryEngine({ config, logger, symbol, history, analyzer, structureEngine, candleEngine, indicatorRegistry, confluenceEngine, mtfEngine, macdEngine });
 const backtestEngine = new BacktestEngine({ structureEngine, indicatorRegistry, logger, symbol });
 const analyticsEngine = new AnalyticsEngine({ logger, symbol });
-const paperTradeEngine = new PaperTradingEngine({ logger, symbol, clock });
+const paperTradeEngine = new PaperTradingEngine({
+  logger,
+  symbol,
+  clock,
+  feePct: config.get('PAPER_FEE_PCT'),
+  slippagePct: config.get('PAPER_SLIPPAGE_PCT'),
+});
 const regimeEngine = new RegimeEngine({ indicatorRegistry, atrEngine, candleEngine, analyzer, logger, config, symbol });
 const regimeDecisionEngine = new RegimeDecisionEngine({ logger, symbol });
 const advanceRiskEngine = new AdvanceRiskEngine({ logger, symbol, paperTradeEngine, config, clock });
@@ -267,7 +277,48 @@ function ensureBootstrapActive(signal) {
   if (lifecycle.isShuttingDown()) throw createAbortError('Bootstrap stopped by lifecycle shutdown');
 }
 
-async function seedHistoricalCandles({ signal } = {}) {
+async function seedFromBinance({ signal } = {}) {
+  try {
+    ensureBootstrapActive(signal);
+    logger.system('Server', 'Seeding candles and analyzer history from Binance...');
+    const maxHistory = config.get('MAX_HISTORY');
+    const seed = await apiManager.fetchSeed({
+      candleLimit: Math.min(maxHistory, 1000),
+      historyBars: maxHistory,
+      signal,
+    });
+    ensureBootstrapActive(signal);
+    for (const [timeframe, { closed, forming }] of Object.entries(seed.timeframes)) {
+      candleEngine.seedTimeframe(timeframe, closed, forming);
+    }
+    for (const bar of seed.history) {
+      history.add({
+        symbol,
+        exchange: 'Binance',
+        price: bar.close,
+        volume: 0,
+        change24h: 0,
+        timestamp: new Date(bar.openTime + 60_000).toISOString(),
+      });
+    }
+    analyzer.analyze(history);
+    const perTimeframe = Object.fromEntries(candleEngine.getAllTimeframes()
+      .map(tf => [tf, candleEngine.getCandles(tf).length]));
+    logger.system('Server', 'Binance seed complete', { historyBars: seed.history.length, ...perTimeframe });
+  } catch (err) {
+    if (isCancellation(err, signal) || lifecycle.isShuttingDown()) throw err;
+    logger.warn('Server', `Binance seed failed: ${err.message} — live bars will rebuild history`);
+  }
+}
+
+async function seedHistoricalCandles(options = {}) {
+  if (marketDataProvider !== 'coingecko') return seedFromBinance(options);
+  return seedFromCoinGecko(options);
+}
+
+// Legacy provider. CoinGecko OHLC timestamps mark candle close, and hourly
+// market_chart points are only used as analyzer history, never as sub-hour candles.
+async function seedFromCoinGecko({ signal } = {}) {
   const baseUrl = 'https://api.coingecko.com/api/v3';
   const coinId = 'bitcoin';
   const vsCurrency = 'usd';
@@ -289,15 +340,18 @@ async function seedHistoricalCandles({ signal } = {}) {
         throw new TypeError('Historical OHLC response must be an array');
       }
       const sortedOhlcData = sortHistoricalOhlcRows(ohlcData);
+      const fourHoursMs = 4 * 3600000;
       for (const [ts, open, high, low, close] of sortedOhlcData) {
         ensureBootstrapActive(signal);
+        const openTime = ts - fourHoursMs;
+        if (openTime % fourHoursMs !== 0) continue;
         candleEngine.ingestHistoricalCandle('4h', {
           open: open,
           high: high,
           low: low,
           close,
           volume: 0,
-          timestamp: new Date(ts).toISOString(),
+          openTime,
         });
         seeded++;
       }
@@ -322,11 +376,11 @@ async function seedHistoricalCandles({ signal } = {}) {
       for (let i = 0; i < prices.length; i++) {
         ensureBootstrapActive(signal);
         const [ts, price] = prices[i];
-        const vol = volumes[i] ? volumes[i][1] : 0;
-        candleEngine.ingest({
+        history.add({
           symbol,
           price,
-          volume: vol,
+          volume: volumes[i] ? volumes[i][1] : 0,
+          change24h: 0,
           timestamp: new Date(ts).toISOString(),
         });
         seeded++;
@@ -361,7 +415,7 @@ async function fetchCycle({ signal } = {}) {
   if (signal?.aborted || lifecycle.isShuttingDown() || !liveRuntime.isReady()) return;
   let result;
   try {
-    result = await apiManager.fetchMarketData({ signal });
+    result = await apiManager.fetchMarketData({ signal, sinceOpenTime: candleEngine.getLastBarOpenTime() });
     if (signal?.aborted || lifecycle.isShuttingDown()) return;
     if (!result || result.status !== 'FRESH' || !result.snapshot) {
       logger.warn('Server', 'Live cycle skipped — market data is not fresh', {
@@ -444,6 +498,12 @@ async function recoverLiveState({ signal } = {}) {
     if (isCancellation(error, signal) || lifecycle.isShuttingDown()) return;
     liveRuntime.markFailed();
     logger.error('Server', 'Live state startup failed', { code: error.code || 'STATE_RECOVERY_FAILED' });
+    if (error.code === 'STATE_CONTEXT_MISMATCH') {
+      logger.error('Server', 'Saved live state was created under a different strategy or risk policy. '
+        + 'Archive or remove the live state file to start a fresh paper account.', {
+        path: configuredStatePath || DEFAULT_STATE_FILE_PATH,
+      });
+    }
     lifecycle.markFailed('live-state-recovery-failed');
     return;
   }

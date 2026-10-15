@@ -155,20 +155,23 @@ test('RSI preserves lookup key, arguments, states, direction, fallback, and erro
     score: null, direction: null, available: false, reason: 'insufficient RSI',
   });
   assert.deepEqual(calculate(createComponents({ rsiResult: {
-    ready: true, strength: 80, value: 80, state: 'Overbought', confidence: 80,
-  } }), 'rsi'), { score: 80, direction: 'neutral', available: true, confidence: 80 });
-  assert.deepEqual(calculate(createComponents({ rsiResult: {
-    ready: true, strength: 20, value: 20, state: 'Oversold', confidence: 80,
-  } }), 'rsi'), { score: 20, direction: 'neutral', available: true, confidence: 80 });
-  assert.deepEqual(calculate(createComponents({ rsiResult: {
-    ready: true, strength: 70, value: 60, state: 'Neutral', confidence: 80,
+    ready: true, strength: 60, value: 80, state: 'Overbought', confidence: 80,
   } }), 'rsi'), { score: 70, direction: 'bullish', available: true, confidence: 80 });
   assert.deepEqual(calculate(createComponents({ rsiResult: {
-    ready: true, strength: 30, value: 40, state: 'Neutral', confidence: 80,
+    ready: true, strength: 60, value: 20, state: 'Oversold', confidence: 80,
   } }), 'rsi'), { score: 30, direction: 'bearish', available: true, confidence: 80 });
   assert.deepEqual(calculate(createComponents({ rsiResult: {
-    ready: true, strength: 50, value: 50, state: 'Neutral', confidence: 0,
+    ready: true, strength: 20, value: 60, state: 'Neutral', confidence: 80,
+  } }), 'rsi'), { score: 60, direction: 'bullish', available: true, confidence: 80 });
+  assert.deepEqual(calculate(createComponents({ rsiResult: {
+    ready: true, strength: 20, value: 40, state: 'Neutral', confidence: 80,
+  } }), 'rsi'), { score: 40, direction: 'bearish', available: true, confidence: 80 });
+  assert.deepEqual(calculate(createComponents({ rsiResult: {
+    ready: true, strength: 0, value: 50, state: 'Neutral', confidence: 0,
   } }), 'rsi'), { score: 50, direction: 'neutral', available: true, confidence: 50 });
+  assert.deepEqual(calculate(createComponents({ rsiResult: {
+    ready: true, strength: 1, value: 50.6, state: 'Neutral', confidence: 80,
+  } }), 'rsi'), { score: 51, direction: 'neutral', available: true, confidence: 80 });
   assert.deepEqual(calculate(createComponents({ rsiIndicator: false }), 'rsi'), {
     score: null, direction: null, available: false, reason: 'RSI indicator not registered',
   });
@@ -191,13 +194,13 @@ test('volatility preserves missing data, mappings, alternatives, and confidence 
     analysis: { volatility: {} }, analyzerTf: '1H',
   }), { score: null, direction: null, available: false, reason: 'No volatility data for 1H' });
   assert.deepEqual(calculate(components, 'volatility', withVolatility('Low', 80)), {
-    score: 85, direction: null, available: true, confidence: 80,
+    score: 50, direction: null, available: true, confidence: 80,
   });
   assert.deepEqual(calculate(components, 'volatility', withVolatility('Medium', 0)), {
     score: 50, direction: null, available: true, confidence: 50,
   });
   assert.deepEqual(calculate(components, 'volatility', withVolatility('High')), {
-    score: 15, direction: null, available: true, confidence: 50,
+    score: 50, direction: null, available: true, confidence: 50,
   });
 });
 

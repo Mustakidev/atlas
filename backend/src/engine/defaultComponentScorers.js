@@ -77,16 +77,17 @@ function scoreRsi(candles, tf, ctx, indicatorRegistry) {
     return { score: null, direction: null, available: false, reason: result.reason || 'RSI not ready' };
   }
 
+  // The confluence score is directional (50 = neutral), so RSI contributes its
+  // value, not its distance from 50. The value is clamped to 30-70 so extreme
+  // readings confirm direction without dominating the other components.
+  const value = Number.isFinite(result.value) ? result.value : 50;
+  const score = Math.round(Math.max(30, Math.min(70, value)));
   let direction = 'neutral';
-  if (result.state === 'Overbought') direction = 'neutral';
-  else if (result.state === 'Oversold') direction = 'neutral';
-  else {
-    if (result.value > 55) direction = 'bullish';
-    else if (result.value < 45) direction = 'bearish';
-  }
+  if (value > 55) direction = 'bullish';
+  else if (value < 45) direction = 'bearish';
 
   return {
-    score: result.strength,
+    score,
     direction,
     available: true,
     confidence: result.confidence || 50,
@@ -104,13 +105,10 @@ function scoreVolatility(candles, tf, ctx) {
     return { score: null, direction: null, available: false, reason: `No volatility data for ${ctx.analyzerTf}` };
   }
 
-  let score;
-  if (volVal === 'Low') score = 85;
-  else if (volVal === 'Medium') score = 50;
-  else score = 15;
-
+  // Volatility has no direction. It stays a reported component but always votes
+  // neutral so that calm markets are not read as bullish or volatile ones as bearish.
   return {
-    score,
+    score: 50,
     direction: null,
     available: true,
     confidence: analysis.confidence ? analysis.confidence[ctx.analyzerTf] || 50 : 50,

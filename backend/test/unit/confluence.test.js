@@ -152,10 +152,10 @@ test('[production] Confluence returns a bounded scored response with real Struct
 test('[aggregation] characterizes a strong bullish market golden response', () => {
   const result = createEngine().calculate(fresh(bullishCandles, 40), '1h');
   assertGolden(result, {
-    score: 79,
+    score: 76,
     bias: 'Bullish',
     confidence: 80,
-    components: expectedComponents({ trend: 93, structure: 80, momentum: 80, rsi: 80, volatility: 50 }),
+    components: expectedComponents({ trend: 93, structure: 80, momentum: 80, rsi: 60, volatility: 50 }),
   });
 });
 
@@ -171,11 +171,11 @@ test('[aggregation] characterizes a strong bearish market golden response', () =
     rsiResult: { ready: true, strength: 20, value: 40, state: 'Neutral', confidence: 80 },
   }).calculate(fresh(bearishCandles, 40), '1h');
   assertGolden(result, {
-    score: 21,
+    score: 24,
     bias: 'Bearish',
     confidence: 80,
     components: expectedComponents(
-      { trend: 7, structure: 20, momentum: 20, rsi: 20, volatility: 50 },
+      { trend: 7, structure: 20, momentum: 20, rsi: 40, volatility: 50 },
       { trend: 'bearish', structure: 'bearish', momentum: 'bearish', rsi: 'bearish' },
     ),
   });
@@ -203,7 +203,7 @@ test('[aggregation] characterizes a neutral ranging market golden response', () 
   });
 });
 
-test('[aggregation] characterizes high-volatility scoring behavior', () => {
+test('[aggregation] high volatility is non-directional and does not bias the score', () => {
   const result = createEngine({
     analysis: {
       trend: { '1H': 'Bullish' },
@@ -213,14 +213,14 @@ test('[aggregation] characterizes high-volatility scoring behavior', () => {
     },
   }).calculate(fresh(bullishCandles, 40), '1h');
   assertGolden(result, {
-    score: 74,
+    score: 76,
     bias: 'Bullish',
     confidence: 80,
-    components: expectedComponents({ trend: 93, structure: 80, momentum: 80, rsi: 80, volatility: 15 }),
+    components: expectedComponents({ trend: 93, structure: 80, momentum: 80, rsi: 60, volatility: 50 }),
   });
 });
 
-test('[aggregation] characterizes low-volatility scoring behavior', () => {
+test('[aggregation] low volatility is non-directional and does not bias the score', () => {
   const result = createEngine({
     analysis: {
       trend: { '1H': 'Bullish' },
@@ -230,10 +230,10 @@ test('[aggregation] characterizes low-volatility scoring behavior', () => {
     },
   }).calculate(fresh(bullishCandles, 40), '1h');
   assertGolden(result, {
-    score: 85,
+    score: 76,
     bias: 'Bullish',
     confidence: 80,
-    components: expectedComponents({ trend: 93, structure: 80, momentum: 80, rsi: 80, volatility: 85 }),
+    components: expectedComponents({ trend: 93, structure: 80, momentum: 80, rsi: 60, volatility: 50 }),
   });
 });
 
@@ -280,7 +280,7 @@ test('[aggregation] characterizes component error isolation', () => {
   const result = createEngine({ componentError: 'structure' }).calculate(fresh(bullishCandles, 40), '1h');
 
   assertResponseShape(result);
-  assert.equal(result.score, 79);
+  assert.equal(result.score, 75);
   assert.equal(result.bias, 'Bullish');
   assert.equal(result.confidence, 64);
   assert.deepEqual(result.missing, [{ name: 'structure', reason: 'structure failed' }]);
@@ -301,7 +301,7 @@ test('[aggregation][safety] invalid component scores are unavailable and exclude
   const result = engine.calculate(fresh(bullishCandles, 40), '1h');
 
   assert.ok(Number.isFinite(result.score));
-  assert.equal(result.score, 79);
+  assert.equal(result.score, 75);
   assert.equal(result.bias, 'Bullish');
   assert.equal(result.confidence, 64);
   assert.deepEqual(result.components.structure, {
@@ -515,4 +515,43 @@ test('[validation] observes raw results while preserving the public response and
     { code: 'RESULT_DIRECTION_MISSING', severity: 'INFO', field: 'direction', name: 'legacy' },
     { code: 'RESULT_CONFIDENCE_MISSING', severity: 'INFO', field: 'confidence', name: 'legacy' },
   ]);
+});
+
+test('[aggregation] a fully neutral market scores exactly neutral', () => {
+  const result = createEngine({
+    analysis: {
+      trend: { '1H': 'Sideways' },
+      confidence: { '1H': 80 },
+      momentum: { '1H': 50 },
+      volatility: { '1H': 'High' },
+    },
+    structureResult: { ready: true, score: 50, direction: 'neutral', confidence: 80 },
+    rsiResult: { ready: true, strength: 0, value: 50, state: 'Neutral', confidence: 80 },
+  }).calculate(fresh(rangingCandles, 40), '1h');
+  assert.equal(result.score, 50);
+  assert.equal(result.bias, 'Neutral');
+});
+
+test('[aggregation] mirrored bullish and bearish inputs produce mirrored scores', () => {
+  const bull = createEngine({
+    analysis: { trend: { '1H': 'Bullish' }, confidence: { '1H': 60 }, momentum: { '1H': 65 }, volatility: { '1H': 'Medium' } },
+    structureResult: { ready: true, score: 70, direction: 'bullish', confidence: 80 },
+    rsiResult: { ready: true, strength: 20, value: 60, state: 'Neutral', confidence: 80 },
+  }).calculate(fresh(bullishCandles, 40), '1h');
+  const bear = createEngine({
+    analysis: { trend: { '1H': 'Bearish' }, confidence: { '1H': 60 }, momentum: { '1H': 35 }, volatility: { '1H': 'Medium' } },
+    structureResult: { ready: true, score: 30, direction: 'bearish', confidence: 80 },
+    rsiResult: { ready: true, strength: 20, value: 40, state: 'Neutral', confidence: 80 },
+  }).calculate(fresh(bearishCandles, 40), '1h');
+  assert.equal(bull.score + bear.score, 100);
+});
+
+test('[aggregation] 1m confluence reads the nearest analyzer window instead of dropping components', () => {
+  const engine = createEngine({
+    analysis: { trend: { '5M': 'Bullish' }, confidence: { '5M': 60 }, momentum: { '5M': 60 }, volatility: { '5M': 'Medium' } },
+  });
+  const result = engine.calculate(fresh(bullishCandles, 40), '1m');
+  assert.equal(result.components.trend.available, true);
+  assert.equal(result.components.momentum.available, true);
+  assert.equal(result.components.volatility.available, true);
 });

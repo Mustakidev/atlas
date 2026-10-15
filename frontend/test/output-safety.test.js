@@ -266,3 +266,32 @@ test('empty paper and performance states preserve their visible text', async () 
   assert.equal(performanceEmpty.textContent, 'No trade history');
   assertNoMarkupNodes(performanceEmpty);
 });
+
+test('log panel keeps updating after the 100-entry window starts sliding', async () => {
+  const entries = start => Array.from({ length: 100 }, (_, index) => ({
+    level: 'INFO', timestamp: '2024-01-01T00:00:00.000Z', message: `entry-${start + index}`,
+  }));
+  let responseLogs = entries(0);
+  const environment = createEnvironment({ get logs() { return responseLogs; } });
+  await environment.renderers.fetchLogs();
+  responseLogs = entries(50);
+  await environment.renderers.fetchLogs();
+  const logBody = environment.document.getElementById('logBody');
+  assert.equal(logBody.children.length, 100);
+  assert.match(logBody.textContent, /entry-149/);
+  assert.doesNotMatch(logBody.textContent, /entry-49\b/);
+});
+
+test('open paper trades render a text-only Close control', async () => {
+  const environment = createEnvironment({
+    stats: { totalTrades: 1, openTrades: 1, closedTrades: 0, winRate: 0 },
+    performance: {},
+    open: [{ tradeId: 'PT-1', direction: 'BUY', status: 'OPEN', entryPrice: 100, stopLoss: 95, takeProfit: 110 }],
+    closed: [],
+  });
+  await environment.renderers.fetchPaperTrades();
+  const buttons = findNodes(environment.document.getElementById('paperTrades'), 'button');
+  assert.equal(buttons.length, 1);
+  assert.equal(buttons[0].textContent, 'Close');
+  assert.equal(typeof buttons[0].listeners.click, 'function');
+});

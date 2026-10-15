@@ -457,6 +457,7 @@ test('risk policy is copied through public policy APIs without runtime state', (
     maxDailyDrawdownPct: 12,
     maxConsecutiveLosses: 5,
     cooldownMs: 1234,
+    maxLeverage: 1,
     sessionMultipliers: { ASIAN: 1.5, LONDON: 1, NEW_YORK: 1 },
   });
   assert.equal(bundle.advanceRiskEngine.getDailyPnL(), 0);

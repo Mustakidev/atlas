@@ -389,6 +389,7 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     cwd: BACKEND,
     env: {
       ...process.env,
+      MARKET_DATA_PROVIDER: 'coingecko',
       PORT: String(port),
       API_KEY,
       ATLAS_OPERATOR_PASSWORD_HASH: OPERATOR_HASH,
@@ -625,6 +626,7 @@ require.cache[fetchPath] = {
     cwd: BACKEND,
     env: {
       ...process.env,
+      MARKET_DATA_PROVIDER: 'coingecko',
       PORT: String(port),
       API_KEY,
       ATLAS_OPERATOR_PASSWORD_HASH: OPERATOR_HASH,
@@ -713,6 +715,7 @@ require.cache[fetchPath] = { id: fetchPath, filename: fetchPath, loaded: true, e
     cwd: BACKEND,
     env: {
       ...process.env,
+      MARKET_DATA_PROVIDER: 'coingecko',
       PORT: String(port),
       API_KEY,
       ATLAS_OPERATOR_PASSWORD_HASH: OPERATOR_HASH,

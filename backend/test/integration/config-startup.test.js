@@ -48,6 +48,7 @@ async function runInvalidConfiguration(overrides) {
   const statePath = path.join(tempDir, 'live-execution-state.json');
   const env = {
     ...process.env,
+    MARKET_DATA_PROVIDER: 'coingecko',
     PORT: String(port),
     API_KEY,
     ATLAS_OPERATOR_PASSWORD_HASH: OPERATOR_HASH,

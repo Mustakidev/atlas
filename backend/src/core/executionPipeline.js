@@ -12,6 +12,16 @@ const EXECUTABLE_REGIMES = new Set([
 ]);
 
 const SIGNAL_COOLDOWN_MS = 60000;
+const DEFAULT_MAX_OPEN_POSITIONS = 1;
+
+function resolveMaxOpenPositions(config) {
+  const value = config?.get?.('MAX_OPEN_POSITIONS');
+  if (value === undefined || value === null) return DEFAULT_MAX_OPEN_POSITIONS;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new TypeError('MAX_OPEN_POSITIONS must be a positive integer');
+  }
+  return value;
+}
 
 function regimeOutputFailure(result) {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return 'REGIME_INVALID';
@@ -72,14 +82,28 @@ function validateRunOptions(options) {
   }
 
   for (const key of Reflect.ownKeys(options)) {
-    if (key !== 'lifecycleCandle') {
+    if (key !== 'lifecycleCandle' && key !== 'lifecycleCandles') {
       throw new TypeError(`executionPipeline.run() received unknown option: ${String(key)}`);
     }
   }
 
+  if (Object.hasOwn(options, 'lifecycleCandle') && Object.hasOwn(options, 'lifecycleCandles')) {
+    throw new TypeError('executionPipeline.run() accepts lifecycleCandle or lifecycleCandles, not both');
+  }
   if (Object.hasOwn(options, 'lifecycleCandle')
     && !isValidExplicitLifecycleCandle(options.lifecycleCandle)) {
     throw new TypeError('executionPipeline.run() lifecycleCandle must be a valid candle object');
+  }
+  if (Object.hasOwn(options, 'lifecycleCandles')) {
+    const candles = options.lifecycleCandles;
+    if (!Array.isArray(candles) || !candles.every(isValidExplicitLifecycleCandle)) {
+      throw new TypeError('executionPipeline.run() lifecycleCandles must be an array of valid candles');
+    }
+    for (let index = 1; index < candles.length; index++) {
+      if (!(candles[index].openTime > candles[index - 1].openTime)) {
+        throw new TypeError('executionPipeline.run() lifecycleCandles must be strictly chronological');
+      }
+    }
   }
 
   return options;
@@ -119,6 +143,7 @@ function createExecutionPipeline({
       symbol,
     });
   const time = resolveClock(clock);
+  const maxOpenPositions = resolveMaxOpenPositions(config);
   let lastSignalTime = 0;
   let pipelineCycleCount = 0;
   let lastDecision = null;
@@ -147,6 +172,49 @@ function createExecutionPipeline({
 
   function markCriticalFailure(cycle, code, engine, error) {
     if (!cycle.criticalFailure) cycle.criticalFailure = { code, engine, error };
+  }
+
+  function applyCandleLifecycle(candle, context, cycle, label) {
+    const candleResult = safeExecute('PaperTrading', () => paperTradeEngine.onCandle(candle, context), null, cycle, {
+      critical: true,
+      failureCode: 'LIFECYCLE_ENGINE_FAILURE',
+    });
+    if (!candleResult || typeof candleResult !== 'object' || !Array.isArray(candleResult.closed)) {
+      markCriticalFailure(cycle, 'LIFECYCLE_ENGINE_FAILURE', 'PaperTrading', 'onCandle returned an invalid result');
+      return;
+    }
+    for (const t of candleResult.closed) {
+      safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl, context), undefined, cycle, {
+        critical: true,
+        failureCode: 'RISK_STATE_SYNC_FAILURE',
+      });
+      console.log(`  Trade Closed (${label}): ${t.tradeId} | ${t.exitReason} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
+    }
+  }
+
+  // Exchange-bar mode: closed bars are older than the current price, so they are
+  // applied first, in order, and the current price is checked last.
+  function processBarLifecycle(price, bars, cycle) {
+    const context = Object.freeze({ nowMs: cycle.nowMs });
+    for (const bar of bars) {
+      applyCandleLifecycle(bar, context, cycle, 'bar');
+      if (cycle.criticalFailure) return;
+    }
+    const closed = safeExecute('PaperTrading', () => paperTradeEngine.evaluateTrades(price, context), [], cycle, {
+      critical: true,
+      failureCode: 'LIFECYCLE_ENGINE_FAILURE',
+    });
+    if (!Array.isArray(closed)) {
+      markCriticalFailure(cycle, 'LIFECYCLE_ENGINE_FAILURE', 'PaperTrading', 'evaluateTrades returned an invalid result');
+      return;
+    }
+    for (const t of closed) {
+      safeExecute('AdvanceRisk', () => advanceRiskEngine.onTradeClosed(t.pnl, context), undefined, cycle, {
+        critical: true,
+        failureCode: 'RISK_STATE_SYNC_FAILURE',
+      });
+      console.log(`  Trade Closed: ${t.tradeId} | ${t.exitReason} | Entry=$${t.entryPrice} → Exit=$${t.exitPrice} | PnL=$${t.pnl} (${t.pnlPercent}%)`);
+    }
   }
 
   function processTradeLifecycle(price, activeCandle, cycle) {
@@ -258,11 +326,15 @@ function createExecutionPipeline({
       return;
     }
 
-    const activeCandle = candleEngine.getActive(tf);
-    const lifecycleCandle = validatedOptions && Object.hasOwn(validatedOptions, 'lifecycleCandle')
-      ? validatedOptions.lifecycleCandle
-      : activeCandle;
-    processTradeLifecycle(price, lifecycleCandle, cycle);
+    if (validatedOptions && Object.hasOwn(validatedOptions, 'lifecycleCandles')) {
+      processBarLifecycle(price, validatedOptions.lifecycleCandles, cycle);
+    } else {
+      const activeCandle = candleEngine.getActive(tf);
+      const lifecycleCandle = validatedOptions && Object.hasOwn(validatedOptions, 'lifecycleCandle')
+        ? validatedOptions.lifecycleCandle
+        : activeCandle;
+      processTradeLifecycle(price, lifecycleCandle, cycle);
+    }
     if (cycle.criticalFailure) {
       failClosed(cycle.criticalFailure.code, 'lifecycle');
       return;
@@ -520,6 +592,18 @@ function createExecutionPipeline({
       return;
     }
 
+    // Exposure cap: a persistent signal must not stack new positions every cooldown
+    // window. Trades closed by this cycle's lifecycle step no longer count.
+    const openPositions = paperTradeEngine.open().length;
+    if (openPositions >= maxOpenPositions) {
+      decision.verdict.rejectionReason = `Max open positions reached (${openPositions}/${maxOpenPositions})`;
+      lastDecision = decision;
+      console.log(`  Execution Triggered: NO`);
+      console.log(`  Reason: ${decision.verdict.rejectionReason}`);
+      console.log(divider);
+      return;
+    }
+
     const now = cycle.nowMs;
     if (now - lastSignalTime < SIGNAL_COOLDOWN_MS) {
       const waitSec = Math.ceil((SIGNAL_COOLDOWN_MS - (now - lastSignalTime)) / 1000);
@@ -617,7 +701,7 @@ function createExecutionPipeline({
   }
 
   function getPolicy() {
-    return { signalCooldownMs: SIGNAL_COOLDOWN_MS };
+    return { signalCooldownMs: SIGNAL_COOLDOWN_MS, maxOpenPositions };
   }
 
   function restoreDurableState(state) {
@@ -650,4 +734,4 @@ function createExecutionPipeline({
   };
 }
 
-module.exports = { SIGNAL_COOLDOWN_MS, createExecutionPipeline };
+module.exports = { DEFAULT_MAX_OPEN_POSITIONS, SIGNAL_COOLDOWN_MS, createExecutionPipeline };

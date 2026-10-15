@@ -561,6 +561,17 @@ function normalizeFingerprintContext(context) {
       aggressive: requiredContextValue(mtf.aggressive, 'mtf.aggressive'),
     },
   };
+  if (context.trading !== undefined) {
+    const trading = context.trading;
+    if (!isPlainObject(trading)) throw new TypeError('Fingerprint trading policy must be an object');
+    normalized.trading = {
+      strategyRevision: finiteContextNumber(requiredContextValue(trading.strategyRevision, 'trading.strategyRevision'), 'trading.strategyRevision'),
+      feePct: finiteContextNumber(requiredContextValue(trading.feePct, 'trading.feePct'), 'trading.feePct'),
+      slippagePct: finiteContextNumber(requiredContextValue(trading.slippagePct, 'trading.slippagePct'), 'trading.slippagePct'),
+      maxOpenPositions: finiteContextNumber(requiredContextValue(trading.maxOpenPositions, 'trading.maxOpenPositions'), 'trading.maxOpenPositions'),
+      maxLeverage: finiteContextNumber(requiredContextValue(trading.maxLeverage, 'trading.maxLeverage'), 'trading.maxLeverage'),
+    };
+  }
   if (typeof normalized.symbol !== 'string' || normalized.symbol.length === 0) throw new TypeError('Invalid fingerprint context value: symbol');
   if (typeof normalized.mtf.aggressive !== 'boolean') throw new TypeError('Invalid fingerprint context value: mtf.aggressive');
   return normalized;

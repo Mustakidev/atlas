@@ -37,7 +37,15 @@ const DEFAULTS = {
   SESSION_MULT_NEWYORK: 1,
   MIN_CONFIDENCE: 30,
   MAX_VOLATILITY_PCT: 5,
+  MAX_LEVERAGE: 1,
 };
+
+function resolveMaxLeverage(config) {
+  const value = config?.get?.('MAX_LEVERAGE');
+  if (value === undefined || value === null) return DEFAULTS.MAX_LEVERAGE;
+  if (!isFiniteNumber(value) || value <= 0) throw new TypeError('MAX_LEVERAGE must be a positive finite number');
+  return value;
+}
 
 class AdvanceRiskEngine {
   constructor({ logger, symbol, paperTradeEngine, config, clock }) {
@@ -60,6 +68,7 @@ class AdvanceRiskEngine {
     this._maxDailyDrawdownPct = DEFAULTS.MAX_DAILY_DRAWDOWN_PCT;
     this._maxConsecutiveLosses = DEFAULTS.MAX_CONSECUTIVE_LOSSES;
     this._cooldownMs = DEFAULTS.CONSECUTIVE_COOLDOWN_MS;
+    this._maxLeverage = resolveMaxLeverage(config);
     this._sessionMultipliers = {
       ASIAN: DEFAULTS.SESSION_MULT_ASIAN,
       LONDON: DEFAULTS.SESSION_MULT_LONDON,
@@ -165,17 +174,26 @@ class AdvanceRiskEngine {
     const rewardPerUnit = Math.abs(takeProfit - entryPrice);
     const riskReward = riskPerUnit > 0 ? this._round(rewardPerUnit / riskPerUnit) : 0;
 
-    const dollarRisk = this._accountBalance * (effectiveRiskPct / 100);
-    let positionSize = riskPerUnit > 0 ? this._round(dollarRisk / riskPerUnit) : 0;
+    // Size from current equity so losses shrink and gains grow the next position.
+    const equity = this._currentEquity();
+    const dollarRisk = equity * (effectiveRiskPct / 100);
+    let positionSize = riskPerUnit > 0 ? this._floorSize(dollarRisk / riskPerUnit) : 0;
 
-    const maxPositionRisk = this._accountBalance * (this._riskPerTradePct / 100);
+    const maxPositionRisk = equity * (this._riskPerTradePct / 100);
     const actualPositionRisk = positionSize * riskPerUnit;
     if (actualPositionRisk > maxPositionRisk) {
-      positionSize = this._round(maxPositionRisk / riskPerUnit);
+      positionSize = this._floorSize(maxPositionRisk / riskPerUnit);
     }
 
     if (breakoutRegime) {
-      positionSize = this._round(positionSize * 0.5);
+      positionSize = this._floorSize(positionSize * 0.5);
+    }
+
+    // Notional cap: a tight stop must not turn 1% risk into leverage the account
+    // cannot carry. With MAX_LEVERAGE=1 the position never exceeds equity (spot).
+    const maxNotional = equity * this._maxLeverage;
+    if (positionSize * entryPrice > maxNotional) {
+      positionSize = this._floorSize(maxNotional / entryPrice);
     }
 
     const roundedEntryPrice = this._round(entryPrice);
@@ -202,6 +220,11 @@ class AdvanceRiskEngine {
         'Risk levels must be finite and greater than zero', nowMs);
     }
 
+    if (!(positionSize > 0)) {
+      return this._calculationRejected(start, symbol, timeframe, entryPrice, direction,
+        'Position size rounds to zero for current equity', nowMs);
+    }
+
     this.calculationTime = elapsedMs(this.clock, start);
     this.lastUpdated = formatTimestamp(nowMs);
 
@@ -218,6 +241,9 @@ class AdvanceRiskEngine {
       positionSize,
       dollarRisk: roundedDollarRisk,
       accountBalance: this._accountBalance,
+      equity: this._round(equity),
+      notional: this._round(positionSize * entryPrice),
+      maxLeverage: this._maxLeverage,
       riskPerTradePct: effectiveRiskPct,
       atrUsed: atrValue,
       atrMultiplier: atrMult,
@@ -382,8 +408,20 @@ class AdvanceRiskEngine {
       maxDailyDrawdownPct: this._maxDailyDrawdownPct,
       maxConsecutiveLosses: this._maxConsecutiveLosses,
       cooldownMs: this._cooldownMs,
+      maxLeverage: this._maxLeverage,
       sessionMultipliers: { ...this._sessionMultipliers },
     };
+  }
+
+  _currentEquity() {
+    const balance = this.paperTradeEngine?.getBalance?.();
+    return isFiniteNumber(balance) && balance > 0 ? balance : this._accountBalance;
+  }
+
+  // Sizes are floored (never rounded up) to 6 decimals so risk and notional
+  // limits are never exceeded by rounding.
+  _floorSize(value) {
+    return Math.floor(value * 1e6) / 1e6;
   }
 
   setAccountBalance(val) { if (isFiniteNumber(val) && val > 0) this._accountBalance = val; }
@@ -401,6 +439,7 @@ class AdvanceRiskEngine {
   setAtrMultRanging(val) { if (isFiniteNumber(val) && val > 0) this._atrMultRanging = val; }
   setRrTrending(val) { if (isFiniteNumber(val) && val > 0) this._rrTrending = val; }
   setRrRanging(val) { if (isFiniteNumber(val) && val > 0) this._rrRanging = val; }
+  setMaxLeverage(val) { if (isFiniteNumber(val) && val > 0 && val <= 10) this._maxLeverage = val; }
   enableTrading() { this._tradingEnabled = true; }
   disableTrading() { this._tradingEnabled = false; }
   resetDaily(nowMs) {

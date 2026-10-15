@@ -116,7 +116,9 @@ function createRouter(deps) {
   });
 
   router.get('/market', (req, res) => {
-    const snapshot = history.latest();
+    // Prefer the latest provider snapshot (current price); analyzer history only
+    // advances on closed bars.
+    const snapshot = (typeof cache?.has === 'function' && cache.has() ? cache.get() : null) || history.latest();
     if (!snapshot) {
       return res.json({
         connected: false,
@@ -945,16 +947,17 @@ function createRouter(deps) {
     const valid = candleEngine.getAllTimeframes();
     if (valid.includes(tf) && atrEngine) atr = atrEngine.calculate(tf);
     if (analyzer) trend = analyzer.getAnalysis();
+    // Same finalized-candle inputs as the live execution pipeline.
     if (structureEngine && candleEngine) {
-      const c = candleEngine.getCandles(tf, 100);
+      const c = getFinalizedCandles(candleEngine, tf, 100);
       if (c.length > 0) structure = structureEngine.calculate(c);
     }
     if (confluenceEngine && candleEngine) {
-      const c = candleEngine.getCandles(tf, 100);
+      const c = getFinalizedCandles(candleEngine, tf, 100);
       if (c.length > 0) confluence = confluenceEngine.calculate(c, tf);
     }
     if (regimeEngine && candleEngine) {
-      const c = candleEngine.getCandles(tf, 500);
+      const c = getFinalizedCandles(candleEngine, tf, 500);
       if (c.length > 0) {
         const r = regimeEngine.calculate(c, tf);
         regime = r.regime;

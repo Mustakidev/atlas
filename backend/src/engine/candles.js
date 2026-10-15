@@ -11,6 +11,7 @@ const TIMEFRAMES = {
 
 const MAX_CANDLES = 500;
 const MIN_HISTORICAL_OPEN_TIME_MS = 100000000000;
+const BAR_DURATION_MS = 60_000;
 
 class CandleEngine {
   constructor(config, logger, symbol) {
@@ -25,12 +26,19 @@ class CandleEngine {
         candles: [],
       };
     }
+    this._lastBarOpenTime = null;
+    this._formingBar = null;
   }
 
+  /**
+   * Legacy tick ingestion (price polling). Providers such as CoinGecko report a
+   * rolling 24h volume per tick, which is not interval volume, so tick-built
+   * candles carry zero volume rather than a misleading figure.
+   */
   ingest(snapshot) {
     const ts = new Date(snapshot.timestamp).getTime();
     const price = snapshot.price;
-    const volume = snapshot.volume || 0;
+    const volume = 0;
     const finalized = Object.fromEntries(
       Object.keys(TIMEFRAMES).map(tf => [tf, null]),
     );
@@ -53,6 +61,112 @@ class CandleEngine {
     }
 
     return Object.freeze({ finalized: Object.freeze(finalized) });
+  }
+
+  /**
+   * Ingests one closed exchange 1-minute bar and aggregates it exactly into every
+   * timeframe. Bars at or before the last ingested bar are ignored, so callers can
+   * safely re-deliver overlapping batches.
+   */
+  ingestBar(bar) {
+    const normalized = this._validateHistoricalCandle(bar);
+    if (normalized.openTime % BAR_DURATION_MS !== 0) {
+      throw new TypeError('Exchange bar openTime must be aligned to one minute');
+    }
+    const finalized = Object.fromEntries(Object.keys(TIMEFRAMES).map(tf => [tf, null]));
+    if (this._lastBarOpenTime !== null && normalized.openTime <= this._lastBarOpenTime) {
+      return Object.freeze({ ingested: false, finalized: Object.freeze(finalized) });
+    }
+
+    for (const [tf, durationSec] of Object.entries(TIMEFRAMES)) {
+      const durationMs = durationSec * 1000;
+      const bucketStart = Math.floor(normalized.openTime / durationMs) * durationMs;
+      const bucket = this.buckets[tf];
+      if (bucket.active && bucket.active.openTime === bucketStart) {
+        const active = bucket.active;
+        if (normalized.high > active.high) active.high = normalized.high;
+        if (normalized.low < active.low) active.low = normalized.low;
+        active.close = normalized.close;
+        active.volume += normalized.volume;
+      } else {
+        if (bucket.active) {
+          finalized[tf] = bucket.active;
+          this._finalizeCandle(bucket);
+        }
+        bucket.active = {
+          open: normalized.open,
+          high: normalized.high,
+          low: normalized.low,
+          close: normalized.close,
+          volume: normalized.volume,
+          openTime: bucketStart,
+          timestamp: new Date(bucketStart).toISOString(),
+        };
+      }
+    }
+
+    // A one-minute bucket is complete as soon as its bar closes.
+    const minute = this.buckets['1m'];
+    if (minute.active && minute.active.openTime === normalized.openTime) {
+      finalized['1m'] = minute.active;
+      this._finalizeCandle(minute);
+    }
+
+    this._lastBarOpenTime = normalized.openTime;
+    if (this._formingBar && this._formingBar.openTime <= normalized.openTime) this._formingBar = null;
+    return Object.freeze({
+      ingested: true,
+      bar: Object.freeze({ ...normalized }),
+      finalized: Object.freeze(finalized),
+    });
+  }
+
+  /** Records the exchange bar still forming; it is shown in active candles but never finalized. */
+  setFormingBar(bar) {
+    if (bar === null || bar === undefined) {
+      this._formingBar = null;
+      return;
+    }
+    const normalized = this._validateHistoricalCandle(bar);
+    if (this._lastBarOpenTime !== null && normalized.openTime <= this._lastBarOpenTime) return;
+    this._formingBar = Object.freeze(normalized);
+  }
+
+  /**
+   * Replaces a timeframe with exchange history. `forming` is the exchange candle
+   * still open for that timeframe; for 1m it becomes the forming-bar overlay.
+   */
+  seedTimeframe(timeframe, closedCandles, forming = null) {
+    const tf = String(timeframe || '').toLowerCase();
+    if (!TIMEFRAMES[tf]) throw new TypeError(`Invalid seed timeframe: ${timeframe}`);
+    if (!Array.isArray(closedCandles)) throw new TypeError('Seed candles must be an array');
+    const durationMs = TIMEFRAMES[tf] * 1000;
+    const normalized = closedCandles.map(candle => Object.freeze(this._validateHistoricalCandle(candle)));
+    for (let index = 0; index < normalized.length; index++) {
+      if (normalized[index].openTime % durationMs !== 0) {
+        throw new TypeError(`Seed candle is not aligned to ${tf}`);
+      }
+      if (index > 0 && normalized[index].openTime <= normalized[index - 1].openTime) {
+        throw new TypeError('Seed candles must be strictly chronological');
+      }
+    }
+    const bucket = this.buckets[tf];
+    bucket.candles = normalized.slice(-this.maxCandles);
+    bucket.active = null;
+
+    if (tf === '1m') {
+      const last = normalized[normalized.length - 1];
+      if (last) this._lastBarOpenTime = last.openTime;
+      this.setFormingBar(forming);
+    } else if (forming) {
+      const active = this._validateHistoricalCandle(forming);
+      if (active.openTime % durationMs !== 0) throw new TypeError(`Forming seed candle is not aligned to ${tf}`);
+      bucket.active = { ...active };
+    }
+  }
+
+  getLastBarOpenTime() {
+    return this._lastBarOpenTime;
   }
 
   ingestHistoricalCandle(timeframe, candle) {
@@ -79,8 +193,9 @@ class CandleEngine {
     if (!bucket) return [];
 
     const result = [...bucket.candles];
-    if (bucket.active) {
-      result.push(bucket.active);
+    const active = this.getActive(tf);
+    if (active) {
+      result.push(active);
     }
 
     if (limit && limit > 0) {
@@ -92,7 +207,34 @@ class CandleEngine {
   getActive(timeframe) {
     const tf = timeframe.toLowerCase();
     const bucket = this.buckets[tf];
-    return bucket ? bucket.active : null;
+    if (!bucket) return null;
+    const forming = this._formingBar;
+    if (!forming) return bucket.active;
+
+    const durationMs = TIMEFRAMES[tf] * 1000;
+    const formingBucket = Math.floor(forming.openTime / durationMs) * durationMs;
+    const base = bucket.active;
+    if (base && base.openTime === formingBucket) {
+      return {
+        ...base,
+        high: Math.max(base.high, forming.high),
+        low: Math.min(base.low, forming.low),
+        close: forming.close,
+        volume: base.volume + forming.volume,
+      };
+    }
+    if (!base) {
+      return {
+        open: forming.open,
+        high: forming.high,
+        low: forming.low,
+        close: forming.close,
+        volume: forming.volume,
+        openTime: formingBucket,
+        timestamp: new Date(formingBucket).toISOString(),
+      };
+    }
+    return base;
   }
 
   getAllTimeframes() {
@@ -234,4 +376,4 @@ function sortHistoricalOhlcRows(rows) {
     .map(({ row }) => row);
 }
 
-module.exports = { CandleEngine, TIMEFRAMES, sortHistoricalOhlcRows };
+module.exports = { BAR_DURATION_MS, CandleEngine, TIMEFRAMES, sortHistoricalOhlcRows };

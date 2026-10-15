@@ -58,7 +58,8 @@ function openTrade(paperTradeEngine, direction = 'BUY') {
   const plan = direction === 'BUY'
     ? { stopLoss: 96, takeProfit: 106, positionSize: 25, riskReward: 2.5 }
     : { stopLoss: 104, takeProfit: 96, positionSize: 25, riskReward: 2 };
-  const trade = paperTradeEngine.signal(makeSignalEngines(direction), 100, '1h', direction, plan);
+  // Existing trades are opened at epoch 0 so every fixture candle starts after entry.
+  const trade = paperTradeEngine.signal(makeSignalEngines(direction), 100, '1h', direction, plan, { nowMs: 0 });
   assert.ok(trade);
   return trade;
 }

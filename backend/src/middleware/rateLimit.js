@@ -79,9 +79,17 @@ function createLoginLimiter(config, logger) {
   });
 }
 
+// Express routes are case-insensitive and ignore a trailing slash, so limits must
+// match the same normalized form or /api/BACKTEST/ would bypass them.
+function normalizeRequestPath(url) {
+  const path = String(url || '').split('?')[0].toLowerCase().replace(/\/+$/, '');
+  return path === '' ? '/' : path;
+}
+
 function createConditionalExpensive(expensiveLimiter) {
   return (req, res, next) => {
-    if (EXPENSIVE_PATHS.some(p => req.originalUrl.startsWith(p))) {
+    const path = normalizeRequestPath(req.originalUrl);
+    if (EXPENSIVE_PATHS.some(p => path === p || path.startsWith(`${p}/`))) {
       return expensiveLimiter(req, res, next);
     }
     next();
@@ -93,4 +101,5 @@ module.exports = {
   createExpensiveLimiter,
   createConditionalExpensive,
   createLoginLimiter,
+  normalizeRequestPath,
 };

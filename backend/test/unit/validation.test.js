@@ -127,3 +127,16 @@ test('failed forced validation execution preserves the previous successful cache
   assert.notStrictEqual(retry, successful);
   assert.equal(factoryCalls, 3);
 });
+
+test('a single failing validation test makes its engine and the overall report FAIL', () => {
+  const { ValidationEngine: Engine } = require('../../src/engine/validation');
+  const { createValidationDependencies } = require('../../src/engine/validationDependencies');
+  const config = { get: key => ({ CONFLUENCE_BULLISH_THRESHOLD: 65, CONFLUENCE_BEARISH_THRESHOLD: 35 })[key] };
+  const factory = () => createValidationDependencies({ config, symbol: 'BTCUSDT' });
+  const engine = new Engine({ ...factory(), dependencyFactory: factory });
+  engine._validateRSI = () => ({ tests: [{ name: 'forced', status: 'FAIL', reason: 'forced' }], executionTime: 0 });
+
+  const report = engine.runAll(true);
+  assert.equal(report.engines.rsi.status, 'FAIL');
+  assert.equal(report.overall, 'FAIL');
+});

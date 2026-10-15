@@ -31,6 +31,10 @@ const TF_MAP = {
   '30M': '30m', '15M': '15m', '5M': '5m',
 };
 
+// The MarketAnalyzer has no 1-minute window, so 1m confluence reads the nearest
+// analyzer window instead of silently dropping trend, momentum, and volatility.
+const ANALYZER_FALLBACK_TF = { '1m': '5M' };
+
 class ConfluenceEngine {
   constructor({ analyzer, indicatorRegistry, structureEngine, candleEngine, logger, config, symbol }) {
     this.analyzer = analyzer;
@@ -187,6 +191,7 @@ class ConfluenceEngine {
   // ---------------------------------------------------------------------------
 
   _reverseTf(lowerTf) {
+    if (Object.hasOwn(ANALYZER_FALLBACK_TF, lowerTf)) return ANALYZER_FALLBACK_TF[lowerTf];
     for (const [upper, lower] of Object.entries(TF_MAP)) {
       if (lower === lowerTf) return upper;
     }

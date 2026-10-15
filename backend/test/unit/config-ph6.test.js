@@ -104,9 +104,9 @@ test('missing optional configuration uses defaults while explicit empty input re
     const config = new ConfigManager();
     assert.equal(config.get('API_URL'), 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_vol=true&include_24hr_change=true');
     assert.equal(config.get('SYMBOL'), 'BTCUSDT');
-    assert.equal(config.get('REFRESH_INTERVAL'), 2000);
+    assert.equal(config.get('REFRESH_INTERVAL'), 5000);
     assert.equal(config.get('CACHE_TTL'), 30000);
-    assert.equal(config.get('MAX_HISTORY'), 500);
+    assert.equal(config.get('MAX_HISTORY'), 1500);
   });
 
   withEnvironment('API_URL', '', () => {
@@ -288,4 +288,20 @@ test('RetryHandler enforces the per-operation budget without real waits', async 
     throw new Error('once');
   }), { message: 'once' });
   assert.equal(attempts, 1);
+});
+
+test('trading safety and market data defaults are conservative and validated', () => {
+  withMissingEnvironment(['MAX_OPEN_POSITIONS', 'MAX_LEVERAGE', 'PAPER_FEE_PCT', 'PAPER_SLIPPAGE_PCT', 'MARKET_DATA_PROVIDER'], () => {
+    const config = new ConfigManager();
+    assert.equal(config.get('MAX_OPEN_POSITIONS'), 1);
+    assert.equal(config.get('MAX_LEVERAGE'), 1);
+    assert.equal(config.get('PAPER_FEE_PCT'), 0.1);
+    assert.equal(config.get('PAPER_SLIPPAGE_PCT'), 0.05);
+    assert.equal(config.get('MARKET_DATA_PROVIDER'), 'binance');
+  });
+  assertInvalid({ MAX_OPEN_POSITIONS: '0' }, 'MAX_OPEN_POSITIONS');
+  assertInvalid({ MAX_LEVERAGE: '11' }, 'MAX_LEVERAGE');
+  assertInvalid({ PAPER_FEE_PCT: '-1' }, 'PAPER_FEE_PCT');
+  assertInvalid({ MARKET_DATA_PROVIDER: 'kraken' }, 'MARKET_DATA_PROVIDER');
+  assertInvalid({ BINANCE_BASE_URL: 'http://data-api.binance.vision' }, 'BINANCE_BASE_URL');
 });

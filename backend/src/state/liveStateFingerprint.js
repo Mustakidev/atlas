@@ -1,4 +1,9 @@
 const { createConfigFingerprint } = require('./liveExecutionStateSchema');
+
+// Bump when decision or simulation semantics change in a way that makes saved
+// paper results incomparable. Revision 2: neutral RSI/volatility scoring,
+// post-entry candle checks, adverse SL/TP resolution, costs, and exposure caps.
+const STRATEGY_REVISION = 2;
 const { DEFAULTS } = require('../engine/advanceRisk');
 const {
   RISK_PER_TRADE_PCT,
@@ -65,7 +70,14 @@ function createCanonicalLiveStateFingerprint({
     mtf: {
       aggressive: mtfConfirmation.isAggressive(),
     },
+    trading: {
+      strategyRevision: STRATEGY_REVISION,
+      feePct: paperInfo.feePct ?? 0,
+      slippagePct: paperInfo.slippagePct ?? 0,
+      maxOpenPositions: executionPolicy.maxOpenPositions ?? 1,
+      maxLeverage: riskPolicy.maxLeverage ?? 1,
+    },
   });
 }
 
-module.exports = { createCanonicalLiveStateFingerprint };
+module.exports = { STRATEGY_REVISION, createCanonicalLiveStateFingerprint };

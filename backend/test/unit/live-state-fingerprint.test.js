@@ -71,3 +71,17 @@ test('changes when a durable policy input changes', () => {
 
   assert.notEqual(first, changed);
 });
+
+test('changes when the trading strategy revision or cost policy changes', () => {
+  const base = createCanonicalLiveStateFingerprint(dependencies());
+  const withCosts = createCanonicalLiveStateFingerprint(dependencies({
+    paperTrading: { getInfo: () => ({ initialBalance: 10000, maxTrades: 500, feePct: 0.1, slippagePct: 0.05 }) },
+  }));
+  const withPositions = createCanonicalLiveStateFingerprint(dependencies({
+    executionPipeline: { getPolicy: () => ({ signalCooldownMs: 60000, maxOpenPositions: 3 }) },
+  }));
+
+  assert.notEqual(base, withCosts);
+  assert.notEqual(base, withPositions);
+  assert.notEqual(withCosts, withPositions);
+});

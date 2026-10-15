@@ -40,7 +40,8 @@ function openTrade(engine, direction = 'BUY') {
     100,
     '1h',
     direction,
-    direction === 'BUY' ? BUY_PLAN : SELL_PLAN
+    direction === 'BUY' ? BUY_PLAN : SELL_PLAN,
+    { nowMs: Date.parse('2024-01-01T00:00:00.000Z') },
   );
   assert.ok(trade);
   return trade;

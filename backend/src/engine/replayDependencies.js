@@ -25,7 +25,15 @@ const SNAPSHOTTED_CONFIG_KEYS = Object.freeze([
   'CONFLUENCE_BULLISH_THRESHOLD',
   'CONFLUENCE_BEARISH_THRESHOLD',
   'MAX_HISTORY',
+  'MAX_OPEN_POSITIONS',
+  'MAX_LEVERAGE',
+  'PAPER_FEE_PCT',
+  'PAPER_SLIPPAGE_PCT',
 ]);
+
+function optionalPercent(value) {
+  return Number.isFinite(value) ? value : 0;
+}
 
 const SESSION_NAMES = Object.freeze(['ASIAN', 'LONDON', 'NEW_YORK']);
 
@@ -41,6 +49,8 @@ const RISK_POLICY_VALIDATORS = Object.freeze({
   maxConsecutiveLosses: value => Number.isFinite(value) && value > 0,
   cooldownMs: value => Number.isFinite(value) && value > 0,
 });
+
+const DEFAULT_MAX_LEVERAGE = 1;
 
 function assertObject(value, name) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -226,6 +236,10 @@ function readRiskPolicy(riskPolicySource) {
     throw new TypeError('riskPolicySource.getPolicy() must return an object');
   }
   for (const key of Object.keys(RISK_POLICY_VALIDATORS)) assertRiskPolicyValue(policy, key);
+  const maxLeverage = policy.maxLeverage === undefined ? DEFAULT_MAX_LEVERAGE : policy.maxLeverage;
+  if (!Number.isFinite(maxLeverage) || maxLeverage <= 0 || maxLeverage > 10) {
+    throw new TypeError('riskPolicySource.getPolicy() returned invalid maxLeverage');
+  }
 
   return {
     accountBalance: policy.accountBalance,
@@ -238,6 +252,7 @@ function readRiskPolicy(riskPolicySource) {
     maxDailyDrawdownPct: policy.maxDailyDrawdownPct,
     maxConsecutiveLosses: policy.maxConsecutiveLosses,
     cooldownMs: policy.cooldownMs,
+    maxLeverage,
     sessionMultipliers: copySessionMultipliers(policy),
   };
 }
@@ -255,6 +270,7 @@ function applyRiskPolicy(engine, policy) {
   engine.setMaxDailyDrawdownPct(policy.maxDailyDrawdownPct);
   engine.setMaxConsecutiveLosses(policy.maxConsecutiveLosses);
   engine.setConsecutiveCooldownMs(policy.cooldownMs);
+  engine.setMaxLeverage(policy.maxLeverage);
 
   for (const [session, multiplier] of Object.entries(policy.sessionMultipliers || {})) {
     engine.setSessionMultiplier(session, multiplier);
@@ -360,6 +376,8 @@ function createReplayDependencies({
     logger: replayLogger,
     symbol,
     clock: replayClock,
+    feePct: optionalPercent(replayConfig.get('PAPER_FEE_PCT')),
+    slippagePct: optionalPercent(replayConfig.get('PAPER_SLIPPAGE_PCT')),
   });
   const advanceRiskEngine = new AdvanceRiskEngine({
     logger: replayLogger,

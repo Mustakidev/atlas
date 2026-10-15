@@ -272,11 +272,10 @@ class DurableLogStore {
       });
     }
     if (this.queueDepth >= this.maxQueueDepth) {
-      if (critical) {
-        this._setHealth(HEALTH_STATES.UNSAFE);
-        await this._writeUnsafeMarker('LOG_QUEUE_FULL');
-      }
-      else this._setHealth(HEALTH_STATES.DEGRADED);
+      // Back-pressure is not storage uncertainty: nothing was written, so the caller
+      // is refused (critical operations fail closed) without latching UNSAFE. A
+      // permanent UNSAFE marker here would lock the operator out after a burst.
+      this._setHealth(HEALTH_STATES.DEGRADED);
       throw new DurableLogStoreError('LOG_QUEUE_FULL', 'Durable log queue is full', { critical });
     }
 

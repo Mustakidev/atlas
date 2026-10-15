@@ -33,6 +33,8 @@ const MAX_DATE_MS = 8640000000000000;
 const logger = { info() {}, warn() {}, error() {}, system() {} };
 const config = {
   get(key) {
+    // These scenarios stack positions deliberately to exercise overflow and ordering paths.
+    if (key === 'MAX_OPEN_POSITIONS') return 1000;
     if (key === 'CONFLUENCE_BULLISH_THRESHOLD') return 65;
     if (key === 'CONFLUENCE_BEARISH_THRESHOLD') return 35;
     if (key === 'MAX_HISTORY') return 500;

@@ -129,3 +129,25 @@ test('generated response over budget is rejected without publishing the result',
   });
   assert.equal(admission.getStatus().responseBudgetRejects, 1);
 });
+
+test('analytical admission and expensive limits cannot be bypassed with case or trailing slashes', async () => {
+  const express = require('express');
+  const { createResourceAdmission: create } = require('../../src/core/resourceAdmission');
+  const { createConditionalExpensive } = require('../../src/middleware/rateLimit');
+  let limited = 0;
+  const app = express();
+  const router = express.Router();
+  router.get('/backtest', (req, res) => res.json({ admitted: Boolean(req.resourceAdmission) }));
+  app.use('/api', createConditionalExpensive((req, res, next) => { limited += 1; next(); }), create().middleware(), router);
+  const server = app.listen(0);
+  try {
+    const port = server.address().port;
+    for (const path of ['/api/backtest', '/api/BACKTEST', '/api/Backtest/', '/api/backtest?limit=10']) {
+      const body = await (await fetch(`http://127.0.0.1:${port}${path}`)).json();
+      assert.equal(body.admitted, true, path);
+    }
+    assert.equal(limited, 4);
+  } finally {
+    server.close();
+  }
+});

@@ -9,6 +9,9 @@ const AUDIT_QUEUE_FULL = 'AUDIT_QUEUE_FULL';
 const AUDIT_INTENT_FAILED = 'AUDIT_INTENT_FAILED';
 const AUDIT_COMPLETION_FAILED = 'AUDIT_COMPLETION_FAILED';
 const MAX_QUEUE_DEPTH = 5;
+// Committed reads are cheap and must never take mutation capacity: dashboard
+// polling should not be able to push a live market snapshot out of the queue.
+const MAX_READ_QUEUE_DEPTH = 64;
 
 class LiveStateCommitError extends Error {
   constructor(code, message, { cause = null, operation = null, phase = null } = {}) {
@@ -123,6 +126,8 @@ function createLiveStateCommitCoordinator({ aggregate, stateStore, logger = null
   let durabilityHealthy = true;
   let queue = Promise.resolve();
   let queueDepth = 0;
+  let mutationDepth = 0;
+  let readDepth = 0;
   let inFlight = null;
   let commitQueueRejects = 0;
 
@@ -153,7 +158,7 @@ function createLiveStateCommitCoordinator({ aggregate, stateStore, logger = null
           code: STATE_QUEUE_FULL,
           operation: typeof operation === 'string' ? operation : 'unknown',
           queueDepth,
-          capacity: MAX_QUEUE_DEPTH,
+          capacity: kind === 'read' ? MAX_READ_QUEUE_DEPTH : MAX_QUEUE_DEPTH,
         },
       })).catch(() => {});
     }
@@ -166,9 +171,14 @@ function createLiveStateCommitCoordinator({ aggregate, stateStore, logger = null
 
   function enqueue(name, kind, work) {
     if (!durabilityHealthy) return Promise.reject(unavailable(name));
-    if (queueDepth >= MAX_QUEUE_DEPTH) return Promise.reject(queueFull(name, kind));
+    const isRead = kind === 'read';
+    if (isRead ? readDepth >= MAX_READ_QUEUE_DEPTH : mutationDepth >= MAX_QUEUE_DEPTH) {
+      return Promise.reject(queueFull(name, kind));
+    }
 
     queueDepth++;
+    if (isRead) readDepth++;
+    else mutationDepth++;
     const operation = queue.then(async () => {
       if (!durabilityHealthy) throw unavailable(name);
       inFlight = { name, kind };
@@ -177,6 +187,8 @@ function createLiveStateCommitCoordinator({ aggregate, stateStore, logger = null
       } finally {
         inFlight = null;
         queueDepth--;
+        if (isRead) readDepth--;
+        else mutationDepth--;
       }
     });
     queue = operation.catch(() => {});
@@ -304,6 +316,8 @@ function createLiveStateCommitCoordinator({ aggregate, stateStore, logger = null
     return Object.freeze({
       durabilityHealthy,
       queueDepth,
+      mutationDepth,
+      readDepth,
       commitQueueRejects,
       inFlight: inFlight ? Object.freeze({ ...inFlight }) : null,
     });
@@ -325,6 +339,7 @@ module.exports = {
   AUDIT_QUEUE_FULL,
   AUDIT_UNSAFE,
   MAX_QUEUE_DEPTH,
+  MAX_READ_QUEUE_DEPTH,
   MUTATION_UNCERTIFIED,
   STATE_QUEUE_FULL,
   LiveStateCommitError,
