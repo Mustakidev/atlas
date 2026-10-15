@@ -23,3 +23,6 @@ verification-reports/
 
 # Runtime durable state (generated)
 backend/runtime-data/
+
+# Research data cache (generated)
+backend/research/.cache/
